@@ -1,0 +1,24 @@
+# Secrets and local credentials
+配置文件.txt
+.env
+.env.*
+!.env.example
+
+# Local runtime data
+data/*.sqlite
+data/*.sqlite3
+data/logs/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Frontend dependencies and local tooling
+frontend/node_modules/
+frontend/.vite/
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
