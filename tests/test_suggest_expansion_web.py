@@ -33,6 +33,11 @@ class SuggestExpansionWebTests(unittest.TestCase):
         document = APP_FILE.read_text(encoding="utf-8")
         self.assertIn('disabled={busy || !run || reviewedCount !== run.result.keywords.length}', document)
 
+    def test_react_exposes_a_keyword_library_csv_export(self) -> None:
+        document = APP_FILE.read_text(encoding="utf-8")
+        self.assertIn('id="export-keyword-library"', document)
+        self.assertIn("exportKeywordLibrary", document)
+
     def test_browser_script_uses_the_suggest_expansion_api(self) -> None:
         script = APP_FILE.read_text(encoding="utf-8") + (PROJECT_ROOT / "frontend" / "src" / "api.ts").read_text(encoding="utf-8")
         self.assertIn("/api/suggest-expansions", script)
