@@ -29,6 +29,10 @@ class SuggestExpansionWebTests(unittest.TestCase):
         self.assertIn('id="calculate-keyword-score"', document)
         self.assertIn('id="keyword-score-result"', document)
 
+    def test_react_disables_library_save_until_all_keywords_are_reviewed(self) -> None:
+        document = APP_FILE.read_text(encoding="utf-8")
+        self.assertIn('disabled={busy || !run || reviewedCount !== run.result.keywords.length}', document)
+
     def test_browser_script_uses_the_suggest_expansion_api(self) -> None:
         script = APP_FILE.read_text(encoding="utf-8") + (PROJECT_ROOT / "frontend" / "src" / "api.ts").read_text(encoding="utf-8")
         self.assertIn("/api/suggest-expansions", script)

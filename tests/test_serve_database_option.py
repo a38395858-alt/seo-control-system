@@ -28,7 +28,7 @@ class ServeDatabaseOptionTests(unittest.TestCase):
         arguments = build_parser().parse_args(["serve"])
 
         self.assertEqual("serve", arguments.command)
-        self.assertEqual("data/seo-control.sqlite3", arguments.database)
+        self.assertEqual(PROJECT_ROOT / "data" / "seo-control.sqlite3", arguments.database)
 
 
 if __name__ == "__main__":
