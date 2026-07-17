@@ -307,6 +307,18 @@ _MIGRATIONS: tuple[Migration, ...] = (
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_one_selected_title_per_keyword ON keyword_title_candidates(keyword_id) WHERE status='selected' AND deleted_at IS NULL",
         ),
     ),
+    (
+        5,
+        "content system MVP",
+        (
+            """CREATE TABLE IF NOT EXISTS content_assets (id INTEGER PRIMARY KEY, project_id INTEGER NOT NULL, keyword_id INTEGER NOT NULL, selected_title_candidate_id INTEGER NOT NULL, title_snapshot TEXT NOT NULL, locale TEXT NOT NULL DEFAULT 'en-US', country_code TEXT NOT NULL DEFAULT 'US', content_type TEXT NOT NULL DEFAULT 'guide', status TEXT NOT NULL DEFAULT 'planned' CHECK(status IN ('planned','briefing','outlining','drafting','in_review','needs_revision','approved','ready_to_publish','blocked','archived')), current_brief_id INTEGER, current_outline_id INTEGER, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, deleted_at TEXT, FOREIGN KEY(project_id) REFERENCES projects(id), FOREIGN KEY(keyword_id) REFERENCES keywords(id), FOREIGN KEY(selected_title_candidate_id) REFERENCES keyword_title_candidates(id))""",
+            """CREATE TABLE IF NOT EXISTS content_briefs (id INTEGER PRIMARY KEY, content_asset_id INTEGER NOT NULL, target_audience TEXT NOT NULL, business_goal TEXT NOT NULL, target_length INTEGER NOT NULL, sources_json TEXT NOT NULL DEFAULT '[]', brief_json TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL DEFAULT 'current', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(content_asset_id) REFERENCES content_assets(id) ON DELETE CASCADE)""",
+            """CREATE TABLE IF NOT EXISTS content_outlines (id INTEGER PRIMARY KEY, content_asset_id INTEGER NOT NULL, brief_id INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'draft', created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(content_asset_id) REFERENCES content_assets(id) ON DELETE CASCADE, FOREIGN KEY(brief_id) REFERENCES content_briefs(id))""",
+            """CREATE TABLE IF NOT EXISTS content_outline_sections (id INTEGER PRIMARY KEY, outline_id INTEGER NOT NULL, position INTEGER NOT NULL, heading TEXT NOT NULL, purpose TEXT NOT NULL, word_budget INTEGER NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, FOREIGN KEY(outline_id) REFERENCES content_outlines(id) ON DELETE CASCADE)""",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_content_asset_selected_title ON content_assets(project_id, selected_title_candidate_id) WHERE deleted_at IS NULL",
+            "CREATE INDEX IF NOT EXISTS idx_content_assets_project ON content_assets(project_id, deleted_at, updated_at DESC)",
+        ),
+    ),
 )
 
 

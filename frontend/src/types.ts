@@ -50,3 +50,7 @@ export type TitleGenerationJob = {
 };
 
 export type SerpTitle = { rank: number; title: string; source: string | null };
+
+export type ContentAsset = { id: number; project_id: number; keyword_id: number; selected_title_candidate_id: number; title_snapshot: string; keyword?: string; locale: string; country_code: string; content_type: string; status: string; current_brief_id: number | null; current_outline_id: number | null; };
+export type ContentBrief = { id: number; target_audience: string; business_goal: string; target_length: number; sources: unknown[]; brief: Record<string, unknown> };
+export type ContentOutline = { id: number; status: string; sections: Array<{ id: number; heading: string; purpose: string; word_budget: number }> };

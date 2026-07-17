@@ -80,3 +80,17 @@ class TitleGenerationWebTests(unittest.TestCase):
         self.assertIn("最近入库标题", self.app)
         self.assertIn("生成后会自动写入标题库", self.app)
         self.assertIn("RecentTitleLibrary", self.app)
+
+    def test_selected_title_library_entry_can_enter_content_generation(self) -> None:
+        self.assertIn("加入内容生成", self.app)
+        self.assertIn("createContentFromTitle", self.app)
+        self.assertIn("onCreateContent", self.app)
+
+    def test_title_library_can_select_a_candidate_before_content_creation(self) -> None:
+        self.assertIn("选定标题", self.app)
+        self.assertIn("selectLibraryTitle", self.app)
+        self.assertIn("onSelectTitle", self.app)
+
+    def test_content_page_does_not_offer_duplicate_asset_creation(self) -> None:
+        self.assertIn("createdByTitle", self.app)
+        self.assertIn("asset ?", self.app)

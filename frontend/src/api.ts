@@ -1,4 +1,4 @@
-import type { ExpansionResult, LibraryKeyword, Review, Score, SerpTitle, TitleCandidate, TitleGenerationJob } from "./types";
+import type { ContentAsset, ContentBrief, ContentOutline, ExpansionResult, LibraryKeyword, Review, Score, SerpTitle, TitleCandidate, TitleGenerationJob } from "./types";
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, options);
@@ -30,4 +30,9 @@ export const api = {
   selectTitleCandidate: (candidateId: number, body: object) => request<TitleCandidate>(`/api/title-candidates/${candidateId}/select`, json(body)),
   createTitleCandidate: (body: object) => request<TitleCandidate>("/api/title-candidates", json(body)),
   deleteTitleCandidate: (candidateId: number, body: object) => request<{ deleted: number }>(`/api/title-candidates/${candidateId}`, { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+  listContentAssets: (projectId: number) => request<ContentAsset[]>(`/api/content-assets?project_id=${projectId}`),
+  createContentAsset: (body: object) => request<ContentAsset>("/api/content-assets", json(body)),
+  getContentAsset: (assetId: number, projectId: number) => request<ContentAsset & { brief: ContentBrief | null; outline: ContentOutline | null }>(`/api/content-assets/${assetId}?project_id=${projectId}`),
+  createContentBrief: (assetId: number, body: object) => request<ContentBrief>(`/api/content-assets/${assetId}/briefs`, json(body)),
+  createContentOutline: (assetId: number, body: object) => request<ContentOutline>(`/api/content-assets/${assetId}/outlines`, json(body)),
 };

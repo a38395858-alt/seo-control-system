@@ -58,9 +58,13 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             self._get_ai_settings()
         elif path == "/api/title-library":
             self._list_title_library()
+        elif path == "/api/content-assets":
+            self._list_content_assets()
+        elif self._content_asset_path(path) is not None:
+            self._get_content_asset(self._content_asset_path(path) or 0)
         elif self._keyword_title_candidates_path(path) is not None:
             self._list_title_candidates(self._keyword_title_candidates_path(path) or 0)
-        elif path in {"", "/", "/research", "/keywords", "/titles", "/title-library", "/scoring", "/settings"}:
+        elif path in {"", "/", "/research", "/keywords", "/titles", "/title-library", "/content", "/scoring", "/settings"}:
             self._serve_index()
         else:
             super().do_GET()
@@ -68,7 +72,8 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
     def do_POST(self) -> None:
         path = urlsplit(self.path).path
         candidate_id = self._title_candidate_action_path(path, "select")
-        if path not in {"/api/projects", "/api/keyword-imports", "/api/suggest-expansions", "/api/keyword-opportunity-scores", "/api/expanded-keywords", "/api/ai-keyword-reviews", "/api/serp-title-research", "/api/browser-serp-title-research", "/api/title-generation-jobs", "/api/multi-provider-title-generation-jobs", "/api/title-candidates", "/api/settings/ai", "/api/settings/ai/test"} and candidate_id is None:
+        content_action = self._content_asset_action_path(path)
+        if path not in {"/api/projects", "/api/keyword-imports", "/api/suggest-expansions", "/api/keyword-opportunity-scores", "/api/expanded-keywords", "/api/ai-keyword-reviews", "/api/serp-title-research", "/api/browser-serp-title-research", "/api/title-generation-jobs", "/api/multi-provider-title-generation-jobs", "/api/title-candidates", "/api/content-assets", "/api/settings/ai", "/api/settings/ai/test"} and candidate_id is None and content_action is None:
             self._json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
             return
         payload = self._read_json()
@@ -94,6 +99,12 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             self._create_multi_provider_title_job(payload)
         elif path == "/api/title-candidates":
             self._create_manual_title_candidate(payload)
+        elif path == "/api/content-assets":
+            self._create_content_asset(payload)
+        elif content_action is not None:
+            asset_id, action = content_action
+            if action == "briefs": self._create_content_brief(asset_id, payload)
+            else: self._create_content_outline(asset_id, payload)
         elif path == "/api/settings/ai":
             self._save_ai_settings(payload)
         elif path == "/api/settings/ai/test":
@@ -126,6 +137,80 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         self.send_header("Content-Length", str(len(content)))
         self.end_headers()
         self.wfile.write(content)
+
+    def _create_content_asset(self, payload: Mapping[str, Any]) -> None:
+        project_id, title_id = self._integer(payload, "project_id"), self._integer(payload, "selected_title_candidate_id")
+        if project_id is None or title_id is None: return
+        try:
+            with self._database() as connection:
+                title = connection.execute("SELECT * FROM keyword_title_candidates WHERE id=? AND project_id=? AND status='selected' AND deleted_at IS NULL", (title_id, project_id)).fetchone()
+                if title is None: raise ValueError("an active selected title is required to create content")
+                keyword = self._title_keyword(connection, project_id, title["keyword_id"], require_approved=True)
+                existing = connection.execute("SELECT * FROM content_assets WHERE project_id=? AND selected_title_candidate_id=? AND deleted_at IS NULL", (project_id, title_id)).fetchone()
+                if existing is not None:
+                    self._json(HTTPStatus.OK, self._content_asset_payload(existing))
+                    return
+                with connection:
+                    cursor = connection.execute("INSERT INTO content_assets(project_id,keyword_id,selected_title_candidate_id,title_snapshot,locale,country_code,content_type) VALUES(?,?,?,?,?,?,?)", (project_id, keyword["id"], title_id, title["title"], f"{keyword['language_code']}-{keyword['country_code']}", keyword["country_code"], self._optional_text(payload, "content_type") or "guide"))
+                row = connection.execute("SELECT * FROM content_assets WHERE id=?", (cursor.lastrowid,)).fetchone()
+        except (sqlite3.Error, ValueError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)}); return
+        self._json(HTTPStatus.CREATED, self._content_asset_payload(row))
+
+    def _list_content_assets(self) -> None:
+        values = parse_qs(urlsplit(self.path).query).get("project_id", [])
+        if len(values) != 1: self._json(HTTPStatus.BAD_REQUEST, {"error": "project_id is required."}); return
+        with self._database() as connection:
+            rows = connection.execute("SELECT assets.*, keywords.keyword FROM content_assets assets JOIN keywords ON keywords.id=assets.keyword_id WHERE assets.project_id=? AND assets.deleted_at IS NULL ORDER BY assets.updated_at DESC, assets.id DESC", (int(values[0]),)).fetchall()
+        self._json(HTTPStatus.OK, [self._content_asset_payload(row) for row in rows])
+
+    def _get_content_asset(self, asset_id: int) -> None:
+        values = parse_qs(urlsplit(self.path).query).get("project_id", [])
+        if len(values) != 1: self._json(HTTPStatus.BAD_REQUEST, {"error": "project_id is required."}); return
+        with self._database() as connection:
+            row = self._content_asset(connection, int(values[0]), asset_id)
+            payload = self._content_asset_payload(row)
+            brief = connection.execute("SELECT * FROM content_briefs WHERE content_asset_id=? AND status='current' ORDER BY id DESC LIMIT 1", (asset_id,)).fetchone()
+            outline = connection.execute("SELECT * FROM content_outlines WHERE content_asset_id=? ORDER BY id DESC LIMIT 1", (asset_id,)).fetchone()
+            payload["brief"] = self._content_brief_payload(brief) if brief else None
+            payload["outline"] = self._content_outline_payload(connection, outline) if outline else None
+        self._json(HTTPStatus.OK, payload)
+
+    def _create_content_brief(self, asset_id: int, payload: Mapping[str, Any]) -> None:
+        project_id = self._integer(payload, "project_id")
+        audience, goal = self._text(payload, "target_audience"), self._text(payload, "business_goal")
+        target = self._integer(payload, "target_length")
+        sources = payload.get("sources", [])
+        if project_id is None or target is None or not isinstance(sources, list): return
+        try:
+            with self._database() as connection:
+                self._content_asset(connection, project_id, asset_id)
+                with connection:
+                    connection.execute("UPDATE content_briefs SET status='superseded' WHERE content_asset_id=? AND status='current'", (asset_id,))
+                    cursor = connection.execute("INSERT INTO content_briefs(content_asset_id,target_audience,business_goal,target_length,sources_json,brief_json) VALUES(?,?,?,?,?,?)", (asset_id, audience, goal, target, json.dumps(sources, ensure_ascii=False), json.dumps({"source_policy": "unavailable sources must be marked [VERIFY]"})))
+                    connection.execute("UPDATE content_assets SET status='briefing',current_brief_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (cursor.lastrowid, asset_id))
+                    row = connection.execute("SELECT * FROM content_briefs WHERE id=?", (cursor.lastrowid,)).fetchone()
+        except (sqlite3.Error, ValueError) as error: self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)}); return
+        self._json(HTTPStatus.CREATED, self._content_brief_payload(row))
+
+    def _create_content_outline(self, asset_id: int, payload: Mapping[str, Any]) -> None:
+        project_id, sections = self._integer(payload, "project_id"), payload.get("sections")
+        if project_id is None or not isinstance(sections, list) or not sections: self._json(HTTPStatus.BAD_REQUEST, {"error": "sections are required."}); return
+        try:
+            with self._database() as connection:
+                asset = self._content_asset(connection, project_id, asset_id)
+                brief_id = asset["current_brief_id"]
+                if brief_id is None: raise ValueError("a content brief is required before creating an outline")
+                with connection:
+                    cursor = connection.execute("INSERT INTO content_outlines(content_asset_id,brief_id) VALUES(?,?)", (asset_id, brief_id))
+                    for position, section in enumerate(sections, 1):
+                        if not isinstance(section, Mapping) or not all(isinstance(section.get(key), str) and section[key].strip() for key in ("heading", "purpose")) or not isinstance(section.get("word_budget"), int): raise ValueError("each outline section needs heading, purpose, and word_budget")
+                        connection.execute("INSERT INTO content_outline_sections(outline_id,position,heading,purpose,word_budget) VALUES(?,?,?,?,?)", (cursor.lastrowid, position, section["heading"].strip(), section["purpose"].strip(), section["word_budget"]))
+                    connection.execute("UPDATE content_assets SET status='outlining',current_outline_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (cursor.lastrowid, asset_id))
+                    row = connection.execute("SELECT * FROM content_outlines WHERE id=?", (cursor.lastrowid,)).fetchone()
+                    result = self._content_outline_payload(connection, row)
+        except (sqlite3.Error, ValueError) as error: self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)}); return
+        self._json(HTTPStatus.CREATED, result)
 
     def _create_project(self, payload: Mapping[str, Any]) -> None:
         name = self._text(payload, "name")
@@ -748,6 +833,37 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             return int(parts[2])
         except ValueError:
             return None
+
+    @staticmethod
+    def _content_asset_path(path: str) -> int | None:
+        parts = path.strip("/").split("/")
+        if len(parts) != 3 or parts[:2] != ["api", "content-assets"]: return None
+        try: return int(parts[2])
+        except ValueError: return None
+
+    @staticmethod
+    def _content_asset_action_path(path: str) -> tuple[int, str] | None:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4 or parts[:2] != ["api", "content-assets"] or parts[3] not in {"briefs", "outlines"}: return None
+        try: return int(parts[2]), parts[3]
+        except ValueError: return None
+
+    @staticmethod
+    def _content_asset(connection: sqlite3.Connection, project_id: int, asset_id: int) -> sqlite3.Row:
+        row = connection.execute("SELECT assets.*, keywords.keyword FROM content_assets assets JOIN keywords ON keywords.id=assets.keyword_id WHERE assets.id=? AND assets.project_id=? AND assets.deleted_at IS NULL", (asset_id, project_id)).fetchone()
+        if row is None: raise ValueError("content asset does not exist in this project")
+        return row
+
+    @staticmethod
+    def _content_asset_payload(row: sqlite3.Row) -> dict[str, Any]: return dict(row)
+
+    @staticmethod
+    def _content_brief_payload(row: sqlite3.Row) -> dict[str, Any]:
+        value = dict(row); value["sources"] = json.loads(value.pop("sources_json") or "[]"); value["brief"] = json.loads(value.pop("brief_json") or "{}"); return value
+
+    @staticmethod
+    def _content_outline_payload(connection: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+        value = dict(row); value["sections"] = [dict(item) for item in connection.execute("SELECT * FROM content_outline_sections WHERE outline_id=? ORDER BY position,id", (row["id"],)).fetchall()]; return value
 
     @staticmethod
     def _title_candidates_from_response(raw: Any, requested_count: int) -> list[dict[str, str | bool | None]]:
