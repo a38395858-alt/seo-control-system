@@ -234,6 +234,79 @@ _MIGRATIONS: tuple[Migration, ...] = (
             "CREATE INDEX IF NOT EXISTS idx_keyword_reviews_keyword ON keyword_reviews(keyword_id, id DESC)",
         ),
     ),
+    (
+        4,
+        "SEO title generation and selection",
+        (
+            """
+            CREATE TABLE IF NOT EXISTS title_generation_jobs (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                keyword_id INTEGER NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('queued', 'running', 'succeeded', 'failed', 'cancelled')),
+                request_json TEXT NOT NULL DEFAULT '{}',
+                provider TEXT NOT NULL DEFAULT 'rule',
+                model TEXT,
+                prompt_version TEXT NOT NULL DEFAULT 'seo_title_us_v1',
+                requested_count INTEGER NOT NULL DEFAULT 8,
+                generated_count INTEGER NOT NULL DEFAULT 0,
+                error_code TEXT,
+                error_summary TEXT,
+                idempotency_key TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                started_at TEXT,
+                completed_at TEXT,
+                FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY (keyword_id) REFERENCES keywords(id) ON DELETE CASCADE,
+                UNIQUE(project_id, idempotency_key)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS keyword_title_candidates (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                keyword_id INTEGER NOT NULL,
+                generation_job_id INTEGER,
+                title TEXT NOT NULL,
+                normalized_title TEXT NOT NULL,
+                title_type TEXT,
+                search_intent TEXT,
+                reason TEXT,
+                source_type TEXT NOT NULL CHECK(source_type IN ('ai', 'manual')),
+                quality_score INTEGER NOT NULL DEFAULT 0,
+                quality_details_json TEXT NOT NULL DEFAULT '{}',
+                rule_version TEXT NOT NULL DEFAULT 'seo_title_us_v1',
+                status TEXT NOT NULL DEFAULT 'candidate' CHECK(status IN ('candidate', 'selected', 'not_selected', 'archived')),
+                selected_at TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                deleted_at TEXT,
+                FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY (keyword_id) REFERENCES keywords(id) ON DELETE CASCADE,
+                FOREIGN KEY (generation_job_id) REFERENCES title_generation_jobs(id) ON DELETE SET NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS keyword_title_selection_events (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                keyword_id INTEGER NOT NULL,
+                previous_candidate_id INTEGER,
+                selected_candidate_id INTEGER,
+                action TEXT NOT NULL CHECK(action IN ('selected', 'replaced', 'unselected')),
+                reason TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY (keyword_id) REFERENCES keywords(id) ON DELETE CASCADE,
+                FOREIGN KEY (previous_candidate_id) REFERENCES keyword_title_candidates(id) ON DELETE SET NULL,
+                FOREIGN KEY (selected_candidate_id) REFERENCES keyword_title_candidates(id) ON DELETE SET NULL
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_title_jobs_keyword ON title_generation_jobs(project_id, keyword_id, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_title_candidates_keyword ON keyword_title_candidates(project_id, keyword_id, created_at DESC)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_one_selected_title_per_keyword ON keyword_title_candidates(keyword_id) WHERE status='selected' AND deleted_at IS NULL",
+        ),
+    ),
 )
 
 

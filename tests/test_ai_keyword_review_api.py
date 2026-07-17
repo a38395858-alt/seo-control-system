@@ -47,6 +47,11 @@ class FakeReviewer:
         }
 
 
+class InvalidJsonReviewer:
+    def review(self, **_request: object) -> object:
+        raise ValueError("AI keyword review returned invalid JSON.")
+
+
 class AiKeywordReviewApiTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tempdir = TemporaryDirectory()
@@ -111,6 +116,44 @@ class AiKeywordReviewApiTests(unittest.TestCase):
             ],
             self.reviewer.calls,
         )
+
+    def test_fast_mode_uses_local_rules_without_calling_ai(self) -> None:
+        payload = json.dumps({"seed_keyword": "seo tools", "keyword": "best seo tools", "language": "en", "mode": "fast"}).encode("utf-8")
+        connection = HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=5)
+        connection.request("POST", "/api/ai-keyword-reviews", body=payload, headers={"Content-Type": "application/json"})
+        response = connection.getresponse()
+        body = json.loads(response.read().decode("utf-8"))
+        connection.close()
+        self.assertEqual(200, response.status)
+        self.assertEqual([], self.reviewer.calls)
+        self.assertEqual("rule", body["provider"])
+        self.assertEqual("fast", body["mode"])
+        self.assertIn("Local rule", body["review"]["reason"])
+
+    def test_hybrid_mode_skips_ai_for_an_obviously_unrelated_keyword(self) -> None:
+        payload = json.dumps({"seed_keyword": "seo tools", "keyword": "easy dinner recipes", "language": "en", "mode": "hybrid"}).encode("utf-8")
+        connection = HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=5)
+        connection.request("POST", "/api/ai-keyword-reviews", body=payload, headers={"Content-Type": "application/json"})
+        response = connection.getresponse()
+        body = json.loads(response.read().decode("utf-8"))
+        connection.close()
+        self.assertEqual(200, response.status)
+        self.assertEqual([], self.reviewer.calls)
+        self.assertFalse(body["review"]["same_topic_as_seed"])
+
+    def test_hybrid_mode_falls_back_to_rules_when_ai_returns_invalid_json(self) -> None:
+        self.server.keyword_reviewer = InvalidJsonReviewer()
+        payload = json.dumps({"seed_keyword": "seo tools", "keyword": "best seo tools", "language": "en", "mode": "hybrid"}).encode("utf-8")
+        connection = HTTPConnection("127.0.0.1", self.server.server_address[1], timeout=5)
+        connection.request("POST", "/api/ai-keyword-reviews", body=payload, headers={"Content-Type": "application/json"})
+        response = connection.getresponse()
+        body = json.loads(response.read().decode("utf-8"))
+        connection.close()
+        self.assertEqual(200, response.status)
+        self.assertEqual("rule_fallback", body["provider"])
+        self.assertEqual("hybrid", body["mode"])
+        self.assertIn("AI", body["warning"])
+        self.assertIn("Local rule", body["review"]["reason"])
 
 
 if __name__ == "__main__":

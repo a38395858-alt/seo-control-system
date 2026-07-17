@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from datetime import date
 import json
 import os
+import re
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -15,6 +16,8 @@ from urllib.parse import parse_qs, urlsplit
 
 from seo_control.application.csv_keyword_import import parse_keyword_csv
 from seo_control.application.ai_keyword_reviewer import OpenAICompatibleKeywordReviewer, RuleBasedKeywordReviewer
+from seo_control.application.ai_title_generator import OpenAICompatibleTitleGenerator, RuleBasedTitleGenerator, TitleGenerationProtocolError
+from seo_control.application.browser_serp_title_client import BrowserSerpTitleClient, GoogleSerpProtocolError, GoogleSerpVerificationRequired
 from seo_control.application.google_suggest_client import GoogleSuggestClient, GoogleSuggestProtocolError
 from seo_control.application.keyword_expansion_service import KeywordExpansionService
 from seo_control.application.keyword_import_service import KeywordImportService
@@ -24,12 +27,19 @@ from seo_control.infrastructure.database import initialize_database
 
 
 WEB_ROOT = Path(__file__).resolve().parents[2] / "web"
+LOCAL_CONFIGURATION_FILE = Path(__file__).resolve().parents[2] / "配置文件.txt"
+AI_SETTINGS_FILE = Path(__file__).resolve().parents[2] / "data" / "ai-settings.json"
+AI_PROVIDERS = ("openai", "gemini", "deepseek")
+DEFAULT_AI_ASSIGNMENTS = {"keyword_review": "openai", "title_generation": "openai"}
 
 
 class KeywordDiscoveryServer(ThreadingHTTPServer):
     database_path: str | Path
     suggest_client: Any
     keyword_reviewer: Any | None
+    title_generator: Any
+    serp_title_client: Any
+    ai_settings_path: Path
 
 
 class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
@@ -42,14 +52,23 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         path = urlsplit(self.path).path
         if path == "/api/keywords":
             self._list_keywords()
-        elif path in {"", "/"}:
+        elif path == "/api/projects":
+            self._list_projects()
+        elif path == "/api/settings/ai":
+            self._get_ai_settings()
+        elif path == "/api/title-library":
+            self._list_title_library()
+        elif self._keyword_title_candidates_path(path) is not None:
+            self._list_title_candidates(self._keyword_title_candidates_path(path) or 0)
+        elif path in {"", "/", "/research", "/keywords", "/titles", "/title-library", "/scoring", "/settings"}:
             self._serve_index()
         else:
             super().do_GET()
 
     def do_POST(self) -> None:
         path = urlsplit(self.path).path
-        if path not in {"/api/projects", "/api/keyword-imports", "/api/suggest-expansions", "/api/keyword-opportunity-scores", "/api/expanded-keywords", "/api/ai-keyword-reviews"}:
+        candidate_id = self._title_candidate_action_path(path, "select")
+        if path not in {"/api/projects", "/api/keyword-imports", "/api/suggest-expansions", "/api/keyword-opportunity-scores", "/api/expanded-keywords", "/api/ai-keyword-reviews", "/api/serp-title-research", "/api/browser-serp-title-research", "/api/title-generation-jobs", "/api/multi-provider-title-generation-jobs", "/api/title-candidates", "/api/settings/ai", "/api/settings/ai/test"} and candidate_id is None:
             self._json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
             return
         payload = self._read_json()
@@ -65,15 +84,35 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             self._save_expanded_keywords(payload)
         elif path == "/api/ai-keyword-reviews":
             self._review_keyword(payload)
+        elif path == "/api/serp-title-research":
+            self._research_serp_titles(payload)
+        elif path == "/api/browser-serp-title-research":
+            self._research_browser_serp_titles(payload)
+        elif path == "/api/title-generation-jobs":
+            self._create_title_generation_job(payload)
+        elif path == "/api/multi-provider-title-generation-jobs":
+            self._create_multi_provider_title_job(payload)
+        elif path == "/api/title-candidates":
+            self._create_manual_title_candidate(payload)
+        elif path == "/api/settings/ai":
+            self._save_ai_settings(payload)
+        elif path == "/api/settings/ai/test":
+            self._test_ai_settings(payload)
+        elif candidate_id is not None:
+            self._select_title_candidate(candidate_id, payload)
         else:
             self._expand_suggestions(payload)
 
     def do_DELETE(self) -> None:
-        if urlsplit(self.path).path != "/api/keywords":
+        path = urlsplit(self.path).path
+        candidate_id = self._title_candidate_path(path)
+        if path != "/api/keywords" and candidate_id is None:
             self._json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
             return
         payload = self._read_json()
-        if payload is not None:
+        if payload is not None and candidate_id is not None:
+            self._delete_title_candidate(candidate_id, payload)
+        elif payload is not None:
             self._delete_keywords(payload)
 
     def _serve_index(self) -> None:
@@ -101,6 +140,135 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
             return
         self._json(HTTPStatus.CREATED, {"id": project_id})
+
+    def _list_projects(self) -> None:
+        with self._database() as connection:
+            rows = connection.execute(
+                "SELECT id,name,site_url,default_country,default_language,created_at FROM projects ORDER BY id DESC"
+            ).fetchall()
+        self._json(HTTPStatus.OK, [dict(row) for row in rows])
+
+    def _get_ai_settings(self) -> None:
+        assignments = _ai_assignments(self.server.ai_settings_path)
+        configuration = _ai_configuration(self.server.ai_settings_path, purpose="keyword_review")
+        providers = _public_ai_profiles(self.server.ai_settings_path)
+        if configuration is None:
+            self._json(HTTPStatus.OK, {"configured": False, "base_url": None, "model": None, "provider": None, "providers": providers, "assignments": assignments})
+            return
+        _key, base_url, model = configuration
+        provider = assignments["keyword_review"]
+        self._json(HTTPStatus.OK, {"configured": True, "base_url": base_url, "model": model, "provider": provider, "providers": providers, "assignments": assignments})
+
+    def _save_ai_settings(self, payload: Mapping[str, Any]) -> None:
+        if "providers" in payload:
+            self._save_ai_provider_profiles(payload)
+            return
+        api_key = self._text(payload, "api_key")
+        base_url = self._text(payload, "base_url")
+        model = self._text(payload, "model")
+        if None in {api_key, base_url, model}:
+            return
+        if not base_url.startswith(("https://", "http://")):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "base_url must start with http:// or https://."})
+            return
+        try:
+            self.server.ai_settings_path.parent.mkdir(parents=True, exist_ok=True)
+            provider = self._optional_text(payload, "provider") or _provider_for_base_url(base_url)
+            if provider not in AI_PROVIDERS:
+                provider = "openai"
+            assignments = _ai_assignments(self.server.ai_settings_path)
+            assignments.update({"keyword_review": provider, "title_generation": provider})
+            document = {"providers": {provider: {"api_key": api_key, "base_url": base_url.rstrip("/"), "model": model}}, "assignments": assignments}
+            self.server.ai_settings_path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+            self.server.keyword_reviewer = _default_keyword_reviewer(self.server.ai_settings_path)
+            self.server.title_generator = _default_title_generator(self.server.ai_settings_path)
+        except OSError as error:
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(error)})
+            return
+        self._get_ai_settings()
+
+    def _save_ai_provider_profiles(self, payload: Mapping[str, Any]) -> None:
+        raw_profiles = payload.get("providers")
+        raw_assignments = payload.get("assignments")
+        if not isinstance(raw_profiles, Mapping) or not isinstance(raw_assignments, Mapping):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "providers and assignments are required."})
+            return
+        assignments = _normalize_ai_assignments(raw_assignments)
+        if assignments is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "Invalid AI feature assignment."})
+            return
+        # A provider card may be saved on its own. Start with all existing
+        # profiles, then replace only the profiles included by the request.
+        # This avoids erasing a different provider's saved key.
+        profiles: dict[str, dict[str, str]] = {}
+        for provider in AI_PROVIDERS:
+            raw = raw_profiles.get(provider)
+            current = _provider_configuration(self.server.ai_settings_path, provider)
+            if raw is None:
+                if current is not None:
+                    profiles[provider] = {"api_key": current[0], "base_url": current[1], "model": current[2]}
+                continue
+            if not isinstance(raw, Mapping):
+                self._json(HTTPStatus.BAD_REQUEST, {"error": f"providers.{provider} must be an object."})
+                return
+            requested_key = raw.get("api_key") if isinstance(raw.get("api_key"), str) else ""
+            requested_base_url = raw.get("base_url") if isinstance(raw.get("base_url"), str) else ""
+            requested_model = raw.get("model") if isinstance(raw.get("model"), str) else ""
+            api_key = requested_key or (current[0] if current else "")
+            base_url = requested_base_url or (current[1] if current else "")
+            model = requested_model or (current[2] if current else "")
+            api_key, base_url, model = api_key.strip(), _normalize_ai_base_url(base_url), model.strip()
+            if not api_key and current is None:
+                continue
+            if not any((api_key, base_url, model)):
+                continue
+            if not all((api_key, base_url, model)) or not base_url.startswith(("https://", "http://")):
+                self._json(HTTPStatus.BAD_REQUEST, {"error": f"Complete API Key, endpoint and model for {provider}."})
+                return
+            profiles[provider] = {"api_key": api_key, "base_url": base_url, "model": model}
+        self.server.ai_settings_path.parent.mkdir(parents=True, exist_ok=True)
+        self.server.ai_settings_path.write_text(json.dumps({"providers": profiles, "assignments": assignments}, ensure_ascii=False), encoding="utf-8")
+        self.server.keyword_reviewer = _default_keyword_reviewer(self.server.ai_settings_path)
+        self.server.title_generator = _default_title_generator(self.server.ai_settings_path)
+        self._get_ai_settings()
+
+    def _test_ai_settings(self, payload: Mapping[str, Any]) -> None:
+        provider = self._optional_text(payload, "provider")
+        raw_config = payload.get("config")
+        configuration = self._temporary_ai_configuration(raw_config) if isinstance(raw_config, Mapping) else (_provider_configuration(self.server.ai_settings_path, provider) if provider in AI_PROVIDERS else _ai_configuration(self.server.ai_settings_path, purpose="title_generation"))
+        if configuration is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "请先保存 API Key、接口地址和模型名称。"})
+            return
+        _key, base_url, model = configuration
+        try:
+            generator = OpenAICompatibleTitleGenerator(*configuration) if provider in AI_PROVIDERS else self.server.title_generator
+            result = generator.generate(
+                keyword="SEO tools",
+                locale="en-US",
+                count=1,
+                search_intent="informational",
+                category="connection test",
+                title_type="tutorial",
+                competitor_titles=[],
+            )
+            self._title_candidates_from_response(result, 1)
+        except Exception:
+            self._json(HTTPStatus.BAD_GATEWAY, {"error": "AI 连接测试失败，请检查接口地址、模型名称和 API Key。"})
+            return
+        active_provider = provider if provider in AI_PROVIDERS else _ai_assignments(self.server.ai_settings_path)["title_generation"]
+        self._json(HTTPStatus.OK, {"status": "connected", "provider": active_provider, "model": model})
+
+    @staticmethod
+    def _temporary_ai_configuration(value: Mapping[str, Any]) -> tuple[str, str, str] | None:
+        api_key = value.get("apiKey") if isinstance(value.get("apiKey"), str) else value.get("api_key")
+        base_url = value.get("baseUrl") if isinstance(value.get("baseUrl"), str) else value.get("base_url")
+        model = value.get("model")
+        if not all(isinstance(item, str) and item.strip() for item in (api_key, base_url, model)):
+            return None
+        normalized_base_url = _normalize_ai_base_url(base_url)
+        if not normalized_base_url.startswith(("https://", "http://")):
+            return None
+        return api_key.strip(), normalized_base_url, model.strip()
 
     def _expand_suggestions(self, payload: Mapping[str, Any]) -> None:
         seeds = payload.get("seed_keywords")
@@ -198,20 +366,273 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         language = self._text(payload, "language")
         if None in {seed_keyword, keyword, language}:
             return
+        mode = self._optional_text(payload, "mode") or "hybrid"
+        if mode not in {"fast", "hybrid"}:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "mode must be fast or hybrid."})
+            return
         reviewer = self.server.keyword_reviewer
         if reviewer is None:
             self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "AI keyword reviewer is not configured."})
             return
+        local_review = RuleBasedKeywordReviewer().review(seed_keyword=seed_keyword, keyword=keyword, language=language)
+        if mode == "fast" or not (local_review.is_seo_content_fit and local_review.same_topic_as_seed):
+            response: dict[str, Any] = {"review": local_review.as_dict(), "provider": "rule", "mode": mode}
+            if mode == "hybrid":
+                response["warning"] = "本地规则判定为低相关，已跳过 AI 请求。"
+            self._json(HTTPStatus.OK, response)
+            return
+        fallback_warning = None
         try:
             review = reviewer.review(seed_keyword=seed_keyword, keyword=keyword, language=language)
             if hasattr(review, "as_dict"):
                 review = review.as_dict()
             if not isinstance(review, Mapping):
                 raise ValueError("AI reviewer must return an object.")
-        except Exception as error:
-            self._json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
+        except Exception:
+            review = RuleBasedKeywordReviewer().review(seed_keyword=seed_keyword, keyword=keyword, language=language).as_dict()
+            fallback_warning = "AI 返回异常，已用本地规则完成本词初筛。"
+        response: dict[str, Any] = {"review": dict(review), "provider": "ai" if fallback_warning is None else "rule_fallback", "mode": mode}
+        if fallback_warning:
+            response["warning"] = fallback_warning
+        self._json(HTTPStatus.OK, response)
+
+    def _create_title_generation_job(self, payload: Mapping[str, Any]) -> None:
+        project_id = self._integer(payload, "project_id")
+        keyword_id = self._integer(payload, "keyword_id")
+        locale = self._optional_text(payload, "locale") or "en-US"
+        count = payload.get("count", 8)
+        if project_id is None or keyword_id is None:
             return
-        self._json(HTTPStatus.OK, {"review": dict(review)})
+        if not isinstance(count, int) or isinstance(count, bool) or not 1 <= count <= 20:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "count must be an integer from 1 to 20."})
+            return
+        title_type = self._optional_text(payload, "title_type")
+        raw_competitor_titles = payload.get("competitor_titles", [])
+        if not isinstance(raw_competitor_titles, list) or any(not isinstance(title, str) for title in raw_competitor_titles):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "competitor_titles must be a string list."})
+            return
+        competitor_titles = [" ".join(title.split()) for title in raw_competitor_titles if title.strip()][:20]
+        try:
+            with self._database() as connection:
+                keyword = self._title_keyword(connection, project_id, keyword_id, require_approved=True)
+                intent = connection.execute("SELECT search_intent FROM keyword_reviews WHERE keyword_id=? ORDER BY id DESC LIMIT 1", (keyword_id,)).fetchone()
+                category = connection.execute("SELECT categories.name FROM keyword_category_assignments assignments JOIN keyword_categories categories ON categories.id=assignments.category_id WHERE assignments.keyword_id=? ORDER BY assignments.created_at DESC LIMIT 1", (keyword_id,)).fetchone()
+                request_data = {"keyword": keyword["keyword"], "locale": locale, "count": count, "search_intent": intent[0] if intent else None, "category": category[0] if category else None, "title_type": title_type, "competitor_titles": competitor_titles}
+                provider = "ai" if isinstance(self.server.title_generator, OpenAICompatibleTitleGenerator) else "rule"
+                with connection:
+                    cursor = connection.execute(
+                        """INSERT INTO title_generation_jobs(project_id,keyword_id,status,request_json,provider,requested_count,started_at)
+                           VALUES(?,?, 'running', ?,?,?, CURRENT_TIMESTAMP)""",
+                        (project_id, keyword_id, json.dumps(request_data, ensure_ascii=False), provider, count),
+                    )
+                    job_id = int(cursor.lastrowid)
+                    raw = self.server.title_generator.generate(**request_data)
+                    candidates = self._title_candidates_from_response(raw, count)
+                    for candidate in candidates:
+                        self._insert_title_candidate(connection, project_id, keyword_id, candidate, source_type="ai", generation_job_id=job_id)
+                    connection.execute("UPDATE title_generation_jobs SET status='succeeded',generated_count=?,completed_at=CURRENT_TIMESTAMP WHERE id=?", (len(candidates), job_id))
+                row = connection.execute("SELECT * FROM title_generation_jobs WHERE id=?", (job_id,)).fetchone()
+        except (sqlite3.Error, ValueError, TypeError, TitleGenerationProtocolError, json.JSONDecodeError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error) or "Title generation failed."})
+            return
+        self._json(HTTPStatus.CREATED, self._title_job_payload(row))
+
+    def _create_multi_provider_title_job(self, payload: Mapping[str, Any]) -> None:
+        project_id, keyword_id = self._integer(payload, "project_id"), self._integer(payload, "keyword_id")
+        locale = self._optional_text(payload, "locale") or "en-US"
+        raw_titles = payload.get("competitor_titles", [])
+        if project_id is None or keyword_id is None or not isinstance(raw_titles, list) or any(not isinstance(item, str) for item in raw_titles):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "project_id, keyword_id and competitor_titles are required."})
+            return
+        references = [" ".join(item.split()) for item in raw_titles if item.strip()][:20]
+        labels = {"openai": "ChatGPT", "gemini": "Gemini", "deepseek": "DeepSeek"}
+        angles = {
+            "openai": "Use a decision-framework or comparison angle for a US searcher. Do not reuse a headline structure from the references.",
+            "gemini": "Use a practical use-case, local-service, or reader-scenario angle for a US searcher. Do not reuse another provider's angle.",
+            "deepseek": "Use a cost, process, risk, or problem-solving angle for a US searcher. Do not reuse another provider's angle.",
+        }
+        failures: list[str] = []
+        try:
+            with self._database() as connection:
+                keyword = self._title_keyword(connection, project_id, keyword_id, require_approved=True)
+                intent = connection.execute("SELECT search_intent FROM keyword_reviews WHERE keyword_id=? ORDER BY id DESC LIMIT 1", (keyword_id,)).fetchone()
+                request_data = {"keyword": keyword["keyword"], "locale": locale, "count": 3, "search_intent": intent[0] if intent else None, "title_type": self._optional_text(payload, "title_type"), "competitor_titles": references}
+                with connection:
+                    cursor = connection.execute("INSERT INTO title_generation_jobs(project_id,keyword_id,status,request_json,provider,requested_count,started_at) VALUES(?,?, 'running', ?,?,?, CURRENT_TIMESTAMP)", (project_id, keyword_id, json.dumps(request_data, ensure_ascii=False), "multi_provider", 9))
+                    job_id = int(cursor.lastrowid)
+                    generated = 0
+                    seen_titles = {row[0] for row in connection.execute("SELECT normalized_title FROM keyword_title_candidates WHERE project_id=? AND keyword_id=? AND deleted_at IS NULL", (project_id, keyword_id)).fetchall()}
+                    for provider, label in labels.items():
+                        generator = getattr(self.server, "title_generators", {}).get(provider) if isinstance(getattr(self.server, "title_generators", {}), Mapping) else None
+                        if generator is None:
+                            configuration = _provider_configuration(self.server.ai_settings_path, provider)
+                            generator = OpenAICompatibleTitleGenerator(*configuration) if configuration else None
+                        if generator is None:
+                            failures.append(f"{label} 未配置")
+                            continue
+                        try:
+                            provider_request = {**request_data, "provider_generation_angle": angles[provider], "diversity_requirement": "Generate titles that differ in angle and structure from the Google references and other providers. Never copy a reference title."}
+                            candidates = self._title_candidates_from_response(generator.generate(**provider_request), 3)
+                            for candidate in candidates:
+                                normalized = normalize_keyword(str(candidate["title"]))
+                                if normalized in seen_titles:
+                                    continue
+                                seen_titles.add(normalized)
+                                candidate["reason"] = f"[{label}] {candidate.get('reason') or '学习 Google 标题的搜索意图与结构，未复制原题。'}"
+                                self._insert_title_candidate(connection, project_id, keyword_id, candidate, source_type="ai", generation_job_id=job_id)
+                                generated += 1
+                        except (TitleGenerationProtocolError, ValueError, TypeError, json.JSONDecodeError):
+                            failures.append(f"{label} 生成失败")
+                    connection.execute("UPDATE title_generation_jobs SET status=?,generated_count=?,completed_at=CURRENT_TIMESTAMP WHERE id=?", ("succeeded" if generated else "failed", generated, job_id))
+                row = connection.execute("SELECT * FROM title_generation_jobs WHERE id=?", (job_id,)).fetchone()
+        except (sqlite3.Error, ValueError, TypeError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error) or "Multi-provider title generation failed."})
+            return
+        response = self._title_job_payload(row)
+        response["failures"] = failures
+        self._json(HTTPStatus.CREATED, response)
+
+    def _research_serp_titles(self, payload: Mapping[str, Any]) -> None:
+        project_id = self._integer(payload, "project_id")
+        keyword_id = self._integer(payload, "keyword_id")
+        locale = self._optional_text(payload, "locale") or "en-US"
+        if project_id is None or keyword_id is None:
+            return
+        researcher = getattr(self.server.title_generator, "research_serp_titles", None)
+        if not callable(researcher):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "请先为标题生成配置支持联网搜索的 AI。"})
+            return
+        try:
+            with self._database() as connection:
+                keyword = self._title_keyword(connection, project_id, keyword_id, require_approved=True)["keyword"]
+            raw = researcher(keyword=keyword, locale=locale)
+            titles, warning = self._serp_titles_from_response(raw)
+        except (sqlite3.Error, ValueError, TypeError, TitleGenerationProtocolError, json.JSONDecodeError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error) or "AI SERP 标题抓取失败。"})
+            return
+        response: dict[str, Any] = {"keyword": keyword, "titles": titles}
+        if warning:
+            response["warning"] = warning
+        self._json(HTTPStatus.OK, response)
+
+    def _research_browser_serp_titles(self, payload: Mapping[str, Any]) -> None:
+        project_id = self._integer(payload, "project_id")
+        keyword_id = self._integer(payload, "keyword_id")
+        locale = self._optional_text(payload, "locale") or "en-US"
+        if project_id is None or keyword_id is None:
+            return
+        try:
+            with self._database() as connection:
+                keyword = self._title_keyword(connection, project_id, keyword_id, require_approved=True)["keyword"]
+            titles = self.server.serp_title_client.fetch_titles(keyword=keyword, locale=locale, max_count=20)
+        except GoogleSerpVerificationRequired as error:
+            self._json(HTTPStatus.OK, {"keyword": keyword if "keyword" in locals() else "", "titles": [], "source_type": "browser", "verification_required": True, "verification_image": error.image_base64})
+            return
+        except (sqlite3.Error, ValueError, TypeError, GoogleSerpProtocolError) as error:
+            self._json(HTTPStatus.BAD_GATEWAY, {"error": str(error) or "浏览器 Google 标题抓取失败。"})
+            return
+        self._json(HTTPStatus.OK, {"keyword": keyword, "titles": titles, "source_type": "browser"})
+
+    def _create_manual_title_candidate(self, payload: Mapping[str, Any]) -> None:
+        project_id = self._integer(payload, "project_id")
+        keyword_id = self._integer(payload, "keyword_id")
+        title = self._text(payload, "title")
+        if None in {project_id, keyword_id, title}:
+            return
+        candidate = {"title": title, "title_type": self._optional_text(payload, "title_type"), "search_intent": self._optional_text(payload, "search_intent"), "reason": self._optional_text(payload, "reason") or "Manually added title candidate."}
+        try:
+            with self._database() as connection:
+                self._title_keyword(connection, project_id, keyword_id, require_approved=True)
+                with connection:
+                    candidate_id = self._insert_title_candidate(connection, project_id, keyword_id, candidate, source_type="manual")
+                row = connection.execute("SELECT * FROM keyword_title_candidates WHERE id=?", (candidate_id,)).fetchone()
+        except (sqlite3.Error, ValueError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        self._json(HTTPStatus.CREATED, self._title_candidate_payload(row))
+
+    def _list_title_candidates(self, keyword_id: int) -> None:
+        values = parse_qs(urlsplit(self.path).query).get("project_id", [])
+        if len(values) != 1:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "project_id is required."})
+            return
+        try:
+            project_id = int(values[0])
+        except ValueError:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "project_id must be an integer."})
+            return
+        with self._database() as connection:
+            self._title_keyword(connection, project_id, keyword_id, require_approved=False)
+            rows = connection.execute("SELECT * FROM keyword_title_candidates WHERE project_id=? AND keyword_id=? AND deleted_at IS NULL ORDER BY CASE status WHEN 'selected' THEN 0 ELSE 1 END, quality_score DESC, id DESC", (project_id, keyword_id)).fetchall()
+        candidates = [self._title_candidate_payload(row) for row in rows]
+        self._json(HTTPStatus.OK, {"candidates": candidates, "selected_title": next((candidate for candidate in candidates if candidate["status"] == "selected"), None)})
+
+    def _list_title_library(self) -> None:
+        values = parse_qs(urlsplit(self.path).query).get("project_id", [])
+        if len(values) != 1:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "project_id is required."})
+            return
+        try:
+            project_id = int(values[0])
+        except ValueError:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "project_id must be an integer."})
+            return
+        with self._database() as connection:
+            rows = connection.execute(
+                """SELECT candidates.*,keywords.keyword
+                   FROM keyword_title_candidates AS candidates
+                   JOIN keywords ON keywords.id=candidates.keyword_id
+                   WHERE candidates.project_id=? AND candidates.deleted_at IS NULL AND keywords.deleted_at IS NULL
+                   ORDER BY CASE candidates.status WHEN 'selected' THEN 0 ELSE 1 END,candidates.created_at DESC,candidates.id DESC""",
+                (project_id,),
+            ).fetchall()
+        self._json(HTTPStatus.OK, [self._title_candidate_payload(row) for row in rows])
+
+    def _select_title_candidate(self, candidate_id: int, payload: Mapping[str, Any]) -> None:
+        project_id = self._integer(payload, "project_id")
+        if project_id is None:
+            return
+        confirm_replace = payload.get("confirm_replace") is True
+        try:
+            with self._database() as connection:
+                candidate = connection.execute("SELECT * FROM keyword_title_candidates WHERE id=? AND project_id=? AND deleted_at IS NULL", (candidate_id, project_id)).fetchone()
+                if candidate is None:
+                    raise ValueError("title candidate does not exist")
+                existing = connection.execute("SELECT id FROM keyword_title_candidates WHERE keyword_id=? AND status='selected' AND deleted_at IS NULL", (candidate["keyword_id"],)).fetchone()
+                if existing is not None and existing[0] != candidate_id and not confirm_replace:
+                    self._json(HTTPStatus.CONFLICT, {"error": "A title is already selected. Confirm replace before selecting another."})
+                    return
+                with connection:
+                    previous_id = int(existing[0]) if existing is not None and existing[0] != candidate_id else None
+                    if previous_id is not None:
+                        connection.execute("UPDATE keyword_title_candidates SET status='not_selected',selected_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?", (previous_id,))
+                    connection.execute("UPDATE keyword_title_candidates SET status='selected',selected_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?", (candidate_id,))
+                    action = "replaced" if previous_id is not None else "selected"
+                    connection.execute("INSERT INTO keyword_title_selection_events(project_id,keyword_id,previous_candidate_id,selected_candidate_id,action,reason) VALUES(?,?,?,?,?,?)", (project_id, candidate["keyword_id"], previous_id, candidate_id, action, self._optional_text(payload, "reason")))
+                row = connection.execute("SELECT * FROM keyword_title_candidates WHERE id=?", (candidate_id,)).fetchone()
+        except sqlite3.Error as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        except ValueError as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        self._json(HTTPStatus.OK, self._title_candidate_payload(row))
+
+    def _delete_title_candidate(self, candidate_id: int, payload: Mapping[str, Any]) -> None:
+        project_id = self._integer(payload, "project_id")
+        if project_id is None:
+            return
+        with self._database() as connection:
+            row = connection.execute("SELECT status FROM keyword_title_candidates WHERE id=? AND project_id=? AND deleted_at IS NULL", (candidate_id, project_id)).fetchone()
+            if row is None:
+                self._json(HTTPStatus.NOT_FOUND, {"error": "title candidate does not exist"})
+                return
+            if row[0] == "selected":
+                self._json(HTTPStatus.CONFLICT, {"error": "The selected title cannot be deleted. Replace it first."})
+                return
+            with connection:
+                connection.execute("UPDATE keyword_title_candidates SET deleted_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?", (candidate_id,))
+        self._json(HTTPStatus.OK, {"deleted": 1})
 
     def _delete_keywords(self, payload: Mapping[str, Any]) -> None:
         project_id = self._integer(payload, "project_id")
@@ -285,6 +706,10 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                       WHERE reviews.keyword_id=keywords.id ORDER BY reviews.id DESC LIMIT 1) AS search_intent,
                    (SELECT reviews.is_seo_content_fit FROM keyword_reviews AS reviews
                       WHERE reviews.keyword_id=keywords.id ORDER BY reviews.id DESC LIMIT 1) AS is_seo_content_fit
+                   ,(SELECT candidates.title FROM keyword_title_candidates AS candidates
+                      WHERE candidates.keyword_id=keywords.id AND candidates.status='selected' AND candidates.deleted_at IS NULL LIMIT 1) AS selected_title
+                   ,(SELECT COUNT(*) FROM keyword_title_candidates AS candidates
+                      WHERE candidates.keyword_id=keywords.id AND candidates.deleted_at IS NULL) AS title_candidate_count
                    FROM keywords
                    LEFT JOIN keyword_metric_snapshots AS metrics ON metrics.id=(
                      SELECT latest.id FROM keyword_metric_snapshots AS latest WHERE latest.keyword_id=keywords.id
@@ -293,6 +718,151 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 (project_id,),
             ).fetchall()
         self._json(HTTPStatus.OK, [dict(row) for row in rows])
+
+    @staticmethod
+    def _keyword_title_candidates_path(path: str) -> int | None:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4 or parts[:2] != ["api", "keywords"] or parts[3] != "title-candidates":
+            return None
+        try:
+            return int(parts[2])
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _title_candidate_path(path: str) -> int | None:
+        parts = path.strip("/").split("/")
+        if len(parts) != 3 or parts[:2] != ["api", "title-candidates"]:
+            return None
+        try:
+            return int(parts[2])
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _title_candidate_action_path(path: str, action: str) -> int | None:
+        parts = path.strip("/").split("/")
+        if len(parts) != 4 or parts[:2] != ["api", "title-candidates"] or parts[3] != action:
+            return None
+        try:
+            return int(parts[2])
+        except ValueError:
+            return None
+
+    @staticmethod
+    def _title_candidates_from_response(raw: Any, requested_count: int) -> list[dict[str, str | bool | None]]:
+        value = KeywordDiscoveryRequestHandler._ai_json_object(raw)
+        if not isinstance(value, Mapping) or not isinstance(value.get("candidates"), list):
+            raise ValueError("AI title generator must return a JSON object with candidates.")
+        candidates: list[dict[str, str | bool | None]] = []
+        seen: set[str] = set()
+        for item in value["candidates"]:
+            if not isinstance(item, Mapping):
+                continue
+            title = item.get("title")
+            if not isinstance(title, str) or not title.strip():
+                continue
+            title = " ".join(title.split())
+            normalized = normalize_keyword(title)
+            if normalized in seen:
+                continue
+            seen.add(normalized)
+            candidates.append({
+                "title": title,
+                "title_type": item.get("title_type") if isinstance(item.get("title_type"), str) else None,
+                "search_intent": item.get("search_intent") if isinstance(item.get("search_intent"), str) else None,
+                "reason": item.get("reason") if isinstance(item.get("reason"), str) else "AI-generated SEO title candidate.",
+                "primary_keyword_included": item.get("primary_keyword_included") is True,
+            })
+            if len(candidates) >= requested_count:
+                break
+        if not candidates:
+            raise ValueError("AI title generator returned no valid title candidates.")
+        return candidates
+
+    @staticmethod
+    def _serp_titles_from_response(raw: Any) -> tuple[list[dict[str, str | int | None]], str | None]:
+        if isinstance(raw, str) and not raw.strip():
+            return [], "AI 未返回可用内容；请改用支持联网搜索的模型或配置 SERP 数据服务。"
+        value = KeywordDiscoveryRequestHandler._ai_json_object(raw)
+        if not isinstance(value, Mapping) or not isinstance(value.get("titles"), list):
+            raise ValueError("AI SERP research must return a JSON object with titles.")
+        titles: list[dict[str, str | int | None]] = []
+        seen: set[str] = set()
+        for index, item in enumerate(value["titles"]):
+            if not isinstance(item, Mapping) or not isinstance(item.get("title"), str):
+                continue
+            title = " ".join(item["title"].split())
+            normalized = normalize_keyword(title)
+            if not title or normalized in seen:
+                continue
+            seen.add(normalized)
+            rank = item.get("rank")
+            titles.append({
+                "rank": rank if isinstance(rank, int) and rank > 0 else len(titles) + 1,
+                "title": title,
+                "source": item.get("source") if isinstance(item.get("source"), str) and item.get("source").strip() else None,
+            })
+            if len(titles) >= 20:
+                break
+        warning = value.get("warning") if isinstance(value.get("warning"), str) and value.get("warning").strip() else None
+        return titles, warning
+
+    @staticmethod
+    def _ai_json_object(raw: Any) -> Mapping[str, Any]:
+        if isinstance(raw, Mapping):
+            return raw
+        if not isinstance(raw, str):
+            raise ValueError("AI response must be a JSON object.")
+        text = raw.strip()
+        fenced = re.search(r"```(?:json)?\s*(\{.*\})\s*```", text, flags=re.IGNORECASE | re.DOTALL)
+        if fenced:
+            text = fenced.group(1)
+        elif not text.startswith("{"):
+            start, end = text.find("{"), text.rfind("}")
+            if start >= 0 and end > start:
+                text = text[start : end + 1]
+        value = json.loads(text)
+        if not isinstance(value, Mapping):
+            raise ValueError("AI response must contain a JSON object.")
+        return value
+
+    def _insert_title_candidate(self, connection: sqlite3.Connection, project_id: int, keyword_id: int, candidate: Mapping[str, Any], *, source_type: str, generation_job_id: int | None = None) -> int:
+        title = str(candidate["title"]).strip()
+        keyword = self._title_keyword(connection, project_id, keyword_id, require_approved=False)["keyword"]
+        normalized = normalize_keyword(title)
+        keyword_normalized = normalize_keyword(keyword)
+        included = keyword_normalized in normalized
+        length_ok = 18 <= len(title) <= 75
+        score = (35 if included else 0) + (20 if length_ok else 8) + 25 + 10 + 10
+        details = {"keyword_coverage": included, "length_ok": length_ok, "locale": "en-US", "score_rule": "seo_title_us_v1"}
+        cursor = connection.execute(
+            """INSERT INTO keyword_title_candidates(project_id,keyword_id,generation_job_id,title,normalized_title,title_type,search_intent,reason,source_type,quality_score,quality_details_json)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (project_id, keyword_id, generation_job_id, title, normalized, candidate.get("title_type"), candidate.get("search_intent"), candidate.get("reason"), source_type, score, json.dumps(details, ensure_ascii=False)),
+        )
+        return int(cursor.lastrowid)
+
+    @staticmethod
+    def _title_candidate_payload(row: sqlite3.Row) -> dict[str, Any]:
+        payload = dict(row)
+        payload["quality_details"] = json.loads(payload.pop("quality_details_json") or "{}")
+        return payload
+
+    @staticmethod
+    def _title_job_payload(row: sqlite3.Row) -> dict[str, Any]:
+        payload = dict(row)
+        payload["request"] = json.loads(payload.pop("request_json") or "{}")
+        return payload
+
+    @staticmethod
+    def _title_keyword(connection: sqlite3.Connection, project_id: int, keyword_id: int, *, require_approved: bool) -> sqlite3.Row:
+        row = connection.execute("SELECT * FROM keywords WHERE id=? AND project_id=? AND deleted_at IS NULL", (keyword_id, project_id)).fetchone()
+        if row is None:
+            raise ValueError("keyword does not exist in this project")
+        if require_approved and row["status"] != "approved":
+            raise ValueError("only an approved keyword can generate or receive titles")
+        return row
 
     def _upsert_expanded_keyword(self, connection: sqlite3.Connection, project_id: int, keyword: str, country: str, language: str, seed_keyword: str, item: Mapping[str, Any]) -> tuple[int, bool]:
         normalized = normalize_keyword(keyword)
@@ -467,18 +1037,155 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         self.send_response(status); self.send_header("Content-Type", "application/json; charset=utf-8"); self.send_header("Content-Length", str(len(content))); self.end_headers(); self.wfile.write(content)
 
 
-def create_server(host: str = "127.0.0.1", port: int = 0, database_path: str | Path = ":memory:", suggest_client: Any | None = None, keyword_reviewer: Any | None = None) -> KeywordDiscoveryServer:
+def create_server(host: str = "127.0.0.1", port: int = 0, database_path: str | Path = ":memory:", suggest_client: Any | None = None, keyword_reviewer: Any | None = None, title_generator: Any | None = None, serp_title_client: Any | None = None, ai_settings_path: Path | None = None) -> KeywordDiscoveryServer:
     server = KeywordDiscoveryServer((host, port), KeywordDiscoveryRequestHandler)
     server.database_path = database_path
+    server.ai_settings_path = ai_settings_path or AI_SETTINGS_FILE
     server.suggest_client = suggest_client or GoogleSuggestClient()
-    server.keyword_reviewer = keyword_reviewer or _default_keyword_reviewer()
+    server.keyword_reviewer = keyword_reviewer or _default_keyword_reviewer(server.ai_settings_path)
+    server.title_generator = title_generator or _default_title_generator(server.ai_settings_path)
+    server.serp_title_client = serp_title_client or BrowserSerpTitleClient()
     return server
 
 
-def _default_keyword_reviewer() -> Any:
-    api_key = os.getenv("SEO_AI_API_KEY")
-    base_url = os.getenv("SEO_AI_BASE_URL")
-    model = os.getenv("SEO_AI_MODEL")
-    if api_key and base_url and model:
+def _default_keyword_reviewer(ai_settings_path: Path = AI_SETTINGS_FILE) -> Any:
+    configuration = _ai_configuration(ai_settings_path, purpose="keyword_review")
+    if configuration is not None:
+        api_key, base_url, model = configuration
         return OpenAICompatibleKeywordReviewer(api_key, base_url, model)
     return RuleBasedKeywordReviewer()
+
+
+def _default_title_generator(ai_settings_path: Path = AI_SETTINGS_FILE) -> Any:
+    configuration = _ai_configuration(ai_settings_path, purpose="title_generation")
+    if configuration is not None:
+        api_key, base_url, model = configuration
+        return OpenAICompatibleTitleGenerator(api_key, base_url, model)
+    return RuleBasedTitleGenerator()
+
+
+def _ai_configuration(ai_settings_path: Path = AI_SETTINGS_FILE, *, purpose: str = "keyword_review") -> tuple[str, str, str] | None:
+    provider = _ai_assignments(ai_settings_path).get(purpose, "openai")
+    return _provider_configuration(ai_settings_path, provider)
+
+
+def _provider_configuration(ai_settings_path: Path, provider: str | None) -> tuple[str, str, str] | None:
+    if provider not in AI_PROVIDERS:
+        return None
+    document = _ai_settings_document(ai_settings_path)
+    raw_profiles = document.get("providers")
+    raw = raw_profiles.get(provider) if isinstance(raw_profiles, Mapping) else None
+    if isinstance(raw, Mapping):
+        api_key, base_url, model = raw.get("api_key"), raw.get("base_url"), raw.get("model")
+        if all(isinstance(item, str) and item.strip() for item in (api_key, base_url, model)):
+            return api_key.strip(), _normalize_ai_base_url(base_url), model.strip()
+    if document.get("provider") == provider:
+        saved = _saved_ai_settings(ai_settings_path)
+        if saved is not None:
+            return saved
+    if provider == "openai":
+        api_key = _configured_value("SEO_AI_API_KEY") or _configured_value("Chatgpt_API_KEY")
+        base_url = _configured_value("SEO_AI_BASE_URL") or _configured_value("Chatgpt_BASE_URL")
+        model = _configured_value("SEO_AI_MODEL") or _configured_value("Chatgpt_MODEL") or "gpt-5.5"
+        return (api_key, _normalize_ai_base_url(base_url), model) if api_key and base_url else None
+    if provider == "gemini":
+        api_key = _configured_value("GEMINI_API_KEY")
+        base_url = _configured_value("GEMINI_BASE_URL") or "https://generativelanguage.googleapis.com/v1beta/openai"
+        model = _configured_value("GEMINI_MODEL") or "gemini-2.5-flash"
+        return (api_key, _normalize_ai_base_url(base_url), model) if api_key else None
+    api_key = _configured_value("DEEPSEEK_API_KEY")
+    base_url = _configured_value("DEEPSEEK_BASE_URL")
+    model = _configured_value("DEEPSEEK_MODEL") or "deepseek-v4-pro"
+    return (api_key, _normalize_ai_base_url(base_url), model) if api_key and base_url else None
+
+
+def _ai_settings_document(path: Path) -> Mapping[str, Any]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, Mapping) else {}
+
+
+def _ai_assignments(path: Path) -> dict[str, str]:
+    document = _ai_settings_document(path)
+    assignments = _normalize_ai_assignments(document.get("assignments"))
+    if assignments is not None:
+        return assignments
+    legacy_provider = document.get("provider")
+    if legacy_provider in AI_PROVIDERS:
+        return {"keyword_review": legacy_provider, "title_generation": legacy_provider}
+    return dict(DEFAULT_AI_ASSIGNMENTS)
+
+
+def _normalize_ai_assignments(value: object) -> dict[str, str] | None:
+    if not isinstance(value, Mapping):
+        return None
+    result = {key: value.get(key) for key in DEFAULT_AI_ASSIGNMENTS}
+    if any(provider not in AI_PROVIDERS for provider in result.values()):
+        return None
+    return {key: str(provider) for key, provider in result.items()}
+
+
+def _public_ai_profiles(path: Path) -> dict[str, dict[str, object]]:
+    profiles: dict[str, dict[str, object]] = {}
+    for provider in AI_PROVIDERS:
+        configuration = _provider_configuration(path, provider)
+        profiles[provider] = {"configured": configuration is not None, "base_url": configuration[1] if configuration else None, "model": configuration[2] if configuration else None}
+    return profiles
+
+
+def _saved_ai_settings(path: Path) -> tuple[str, str, str] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, Mapping):
+        return None
+    api_key, base_url, model = value.get("api_key"), value.get("base_url"), value.get("model")
+    if all(isinstance(item, str) and item.strip() for item in (api_key, base_url, model)):
+        return api_key.strip(), _normalize_ai_base_url(base_url), model.strip()
+    return None
+
+
+def _normalize_ai_base_url(value: str) -> str:
+    """Accept either an API base URL or a copied chat-completions endpoint."""
+    normalized = value.strip().rstrip("/")
+    suffix = "/chat/completions"
+    if normalized.casefold().endswith(suffix):
+        return normalized[: -len(suffix)]
+    return normalized
+
+
+def _saved_ai_provider(path: Path) -> str | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+    provider = value.get("provider") if isinstance(value, Mapping) else None
+    return provider.strip() if isinstance(provider, str) and provider.strip() else None
+
+
+def _provider_for_base_url(base_url: str) -> str:
+    value = base_url.casefold()
+    if "generativelanguage.googleapis.com" in value:
+        return "gemini"
+    if "deepseek" in value:
+        return "deepseek"
+    if "openai.com" in value:
+        return "openai"
+    return "openai_compatible"
+
+
+def _configured_value(name: str) -> str | None:
+    """Read a permitted local PowerShell environment assignment without executing it."""
+
+    environment_value = os.getenv(name)
+    if environment_value:
+        return environment_value
+    try:
+        content = LOCAL_CONFIGURATION_FILE.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    match = re.search(rf"^\s*\$env:{re.escape(name)}\s*=\s*(['\"])(.*?)\1\s*$", content, flags=re.MULTILINE)
+    return match.group(2).strip() if match and match.group(2).strip() else None

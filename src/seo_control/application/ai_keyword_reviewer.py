@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import json
+import re
 from collections.abc import Callable, Mapping
 from typing import Any
 from urllib.request import Request, urlopen
@@ -44,11 +45,12 @@ class OpenAICompatibleKeywordReviewer:
         payload: dict[str, object] = {
             "model": self._model,
             "stream": False,
+            "max_tokens": 600,
             "response_format": {"type": "json_object"},
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are an SEO keyword reviewer. Return JSON only with: is_seo_content_fit, same_topic_as_seed, search_intent, recommended_action, reason, confidence.",
+                    "content": "You are an SEO keyword reviewer. Return one JSON object only, without Markdown fences, reasoning, or extra text. Required fields: is_seo_content_fit, same_topic_as_seed, search_intent, recommended_action, reason, confidence.",
                 },
                 {
                     "role": "user",
@@ -56,6 +58,8 @@ class OpenAICompatibleKeywordReviewer:
                 },
             ],
         }
+        if "deepseek" in self._base_url.casefold():
+            payload["thinking"] = {"type": "disabled"}
         try:
             response = self._transport(
                 f"{self._base_url}/chat/completions",
@@ -78,7 +82,7 @@ class OpenAICompatibleKeywordReviewer:
     def _parse(response: object) -> KeywordReview:
         try:
             content = response["choices"][0]["message"]["content"]  # type: ignore[index]
-            data = json.loads(content) if isinstance(content, str) else content
+            data = OpenAICompatibleKeywordReviewer._json_object(content) if isinstance(content, str) else content
             if not isinstance(data, dict):
                 raise TypeError("review content is not an object")
             result = KeywordReview(
@@ -96,9 +100,11 @@ class OpenAICompatibleKeywordReviewer:
     @staticmethod
     def _boolean(data: Mapping[str, object], key: str) -> bool:
         value = data.get(key)
-        if not isinstance(value, bool):
-            raise ValueError(f"{key} must be boolean")
-        return value
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str) and value.casefold().strip() in {"true", "false"}:
+            return value.casefold().strip() == "true"
+        raise ValueError(f"{key} must be boolean")
 
     @staticmethod
     def _text(data: Mapping[str, object], key: str) -> str:
@@ -110,9 +116,31 @@ class OpenAICompatibleKeywordReviewer:
     @staticmethod
     def _confidence(data: Mapping[str, object]) -> float:
         value = data.get("confidence")
-        if not isinstance(value, (int, float)) or isinstance(value, bool) or not 0 <= float(value) <= 1:
+        if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+            raise ValueError("confidence must be numeric")
+        try:
+            confidence = float(value.strip() if isinstance(value, str) else value)
+        except ValueError as error:
+            raise ValueError("confidence must be numeric") from error
+        if 1 < confidence <= 100:
+            confidence /= 100
+        if not 0 <= confidence <= 1:
             raise ValueError("confidence must be from 0 to 1")
-        return float(value)
+        return confidence
+
+    @staticmethod
+    def _json_object(content: str) -> object:
+        """Extract one JSON object from common Markdown or reasoning wrappers."""
+
+        cleaned = re.sub(r"^\s*```(?:json)?\s*|\s*```\s*$", "", content.strip(), flags=re.IGNORECASE)
+        try:
+            return json.loads(cleaned)
+        except json.JSONDecodeError:
+            start = cleaned.find("{")
+            if start < 0:
+                raise
+            value, _end = json.JSONDecoder().raw_decode(cleaned[start:])
+            return value
 
 
 class RuleBasedKeywordReviewer:

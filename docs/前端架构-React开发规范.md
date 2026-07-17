@@ -12,7 +12,7 @@
 | 服务端 | Python 标准库 HTTP 服务 | 业务 API、数据处理与静态构建产物托管 |
 | 数据库 | SQLite | 当前本地关键词数据、审核、分类与指标 |
 
-当前不引入大型 UI 组件库。待多页面、复杂筛选和权限系统完善后，统一评估引入 Ant Design；不得在不同页面混用多个 UI 体系。
+当前不引入大型 UI 组件库。页面路由统一使用 **React Router**，侧边栏页面为 `/research`（关键词挖掘）、`/keywords`（关键词库）、`/titles`（SEO 标题）和 `/scoring`（SEO 评分）；Python 静态服务必须为这些前端路由返回 `index.html`，确保刷新或直达链接可用。待复杂筛选和权限系统完善后，统一评估引入 Ant Design；不得在不同页面混用多个 UI 体系。
 
 ## 2. 目录约定
 
@@ -65,9 +65,8 @@ python -m unittest discover -s tests
 
 ## 6. 后续演进
 
-当页面增加项目切换、权限、任务队列、图表和多模块路由时，引入：
+当页面增加项目切换、权限、任务队列和图表时，引入：
 
-- React Router：模块路由与深链接。
 - TanStack Query：请求缓存、轮询、失效刷新。
 - Zustand：跨页面的项目与筛选状态。
 - ECharts：VOL、KD、排名、GSC 趋势图表。

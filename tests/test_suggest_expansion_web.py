@@ -29,9 +29,11 @@ class SuggestExpansionWebTests(unittest.TestCase):
         self.assertIn('id="calculate-keyword-score"', document)
         self.assertIn('id="keyword-score-result"', document)
 
-    def test_react_disables_library_save_until_all_keywords_are_reviewed(self) -> None:
+    def test_react_automatically_saves_approved_keywords_after_review(self) -> None:
         document = APP_FILE.read_text(encoding="utf-8")
-        self.assertIn('disabled={busy || !run || reviewedCount !== run.result.keywords.length}', document)
+        self.assertIn('await persistReviewedKeywords(run, next);', document)
+        self.assertIn('id="review-expanded-keywords"', document)
+        self.assertNotIn('审核后加入关键词库', document)
 
     def test_react_exposes_a_keyword_library_csv_export(self) -> None:
         document = APP_FILE.read_text(encoding="utf-8")
