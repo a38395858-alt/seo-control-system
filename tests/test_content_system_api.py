@@ -76,3 +76,29 @@ class ContentSystemApiTests(unittest.TestCase):
         status, second = self.request("POST", "/api/content-assets", {"project_id": project_id, "selected_title_candidate_id": title_id})
         self.assertEqual(200, status)
         self.assertEqual(first["id"], second["id"])  # type: ignore[index]
+
+    def test_manual_brief_uses_an_internal_default_when_the_ui_omits_target_length(self) -> None:
+        """字数不是用户配置项；旧的手工保存入口也必须能正常保存。"""
+        project_id, title_id = self.selected_title()
+        status, asset = self.request("POST", "/api/content-assets", {"project_id": project_id, "selected_title_candidate_id": title_id})
+        self.assertEqual(201, status)
+        status, brief = self.request(
+            "POST",
+            f"/api/content-assets/{asset['id']}/briefs",  # type: ignore[index]
+            {"project_id": project_id, "target_audience": "US buyers", "business_goal": "commercial", "sources": []},
+        )
+        self.assertEqual(201, status)
+        self.assertEqual(1400, brief["target_length"])  # type: ignore[index]
+
+    def test_unfinished_assets_are_excluded_from_content_library_but_the_reader_route_loads(self) -> None:
+        project_id, title_id = self.selected_title()
+        status, asset = self.request("POST", "/api/content-assets", {"project_id": project_id, "selected_title_candidate_id": title_id})
+        self.assertEqual(201, status)
+
+        status, library = self.request("GET", f"/api/content-library?project_id={project_id}")
+        self.assertEqual(200, status)
+        self.assertEqual([], library)
+
+        with urlopen(Request(f"{self.base_url}/content-library/{asset['id']}")) as response:  # type: ignore[index]
+            self.assertEqual(200, response.status)
+            self.assertIn("text/html", response.headers["Content-Type"])

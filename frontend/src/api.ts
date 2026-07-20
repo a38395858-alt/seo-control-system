@@ -1,4 +1,4 @@
-import type { ContentAsset, ContentBrief, ContentOutline, ExpansionResult, LibraryKeyword, Review, Score, SerpTitle, TitleCandidate, TitleGenerationJob } from "./types";
+import type { ContentAsset, ContentAssetDetail, ContentBrief, ContentGenerationResult, ContentOutline, ExpansionResult, LibraryKeyword, Review, Score, SerpTitle, TitleCandidate, TitleGenerationJob } from "./types";
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, options);
@@ -30,9 +30,16 @@ export const api = {
   selectTitleCandidate: (candidateId: number, body: object) => request<TitleCandidate>(`/api/title-candidates/${candidateId}/select`, json(body)),
   createTitleCandidate: (body: object) => request<TitleCandidate>("/api/title-candidates", json(body)),
   deleteTitleCandidate: (candidateId: number, body: object) => request<{ deleted: number }>(`/api/title-candidates/${candidateId}`, { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+  deleteTitleCandidates: (body: object) => request<{ deleted: number }>("/api/title-candidates", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
   listContentAssets: (projectId: number) => request<ContentAsset[]>(`/api/content-assets?project_id=${projectId}`),
+  listContentLibrary: (projectId: number) => request<ContentAsset[]>(`/api/content-library?project_id=${projectId}`),
   createContentAsset: (body: object) => request<ContentAsset>("/api/content-assets", json(body)),
-  getContentAsset: (assetId: number, projectId: number) => request<ContentAsset & { brief: ContentBrief | null; outline: ContentOutline | null }>(`/api/content-assets/${assetId}?project_id=${projectId}`),
+  deleteContentAssets: (body: object) => request<{ deleted: number }>("/api/content-assets", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+  getContentAsset: (assetId: number, projectId: number) => request<ContentAssetDetail>(`/api/content-assets/${assetId}?project_id=${projectId}`),
   createContentBrief: (assetId: number, body: object) => request<ContentBrief>(`/api/content-assets/${assetId}/briefs`, json(body)),
   createContentOutline: (assetId: number, body: object) => request<ContentOutline>(`/api/content-assets/${assetId}/outlines`, json(body)),
+  generateContentBrief: (assetId: number, body: object) => request<ContentGenerationResult>(`/api/content-assets/${assetId}/generate-brief`, json(body)),
+  generateContentOutline: (assetId: number, body: object) => request<ContentGenerationResult>(`/api/content-assets/${assetId}/generate-outline`, json(body)),
+  generateContentDraft: (assetId: number, body: object) => request<ContentGenerationResult>(`/api/content-assets/${assetId}/generate-draft`, json(body)),
+  generateContent: (assetId: number, body: object) => request<ContentGenerationResult>(`/api/content-assets/${assetId}/generate`, json(body)),
 };

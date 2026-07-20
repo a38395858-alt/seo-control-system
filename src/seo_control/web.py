@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, urlsplit
 from seo_control.application.csv_keyword_import import parse_keyword_csv
 from seo_control.application.ai_keyword_reviewer import OpenAICompatibleKeywordReviewer, RuleBasedKeywordReviewer
 from seo_control.application.ai_title_generator import OpenAICompatibleTitleGenerator, RuleBasedTitleGenerator, TitleGenerationProtocolError
+from seo_control.application.content_generator import ContentGenerationProtocolError, OpenAICompatibleContentGenerator, PROMPT_VERSION
 from seo_control.application.browser_serp_title_client import BrowserSerpTitleClient, GoogleSerpProtocolError, GoogleSerpVerificationRequired
 from seo_control.application.google_suggest_client import GoogleSuggestClient, GoogleSuggestProtocolError
 from seo_control.application.keyword_expansion_service import KeywordExpansionService
@@ -30,7 +31,8 @@ WEB_ROOT = Path(__file__).resolve().parents[2] / "web"
 LOCAL_CONFIGURATION_FILE = Path(__file__).resolve().parents[2] / "配置文件.txt"
 AI_SETTINGS_FILE = Path(__file__).resolve().parents[2] / "data" / "ai-settings.json"
 AI_PROVIDERS = ("openai", "gemini", "deepseek")
-DEFAULT_AI_ASSIGNMENTS = {"keyword_review": "openai", "title_generation": "openai"}
+DEFAULT_AI_ASSIGNMENTS = {"keyword_review": "openai", "title_generation": "openai", "content_generation": "openai"}
+CONTENT_PROVIDER_LABELS = {"openai": "ChatGPT", "gemini": "Gemini", "deepseek": "DeepSeek"}
 
 
 class KeywordDiscoveryServer(ThreadingHTTPServer):
@@ -40,6 +42,7 @@ class KeywordDiscoveryServer(ThreadingHTTPServer):
     title_generator: Any
     serp_title_client: Any
     ai_settings_path: Path
+    content_generator: Any | None
 
 
 class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
@@ -60,11 +63,13 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             self._list_title_library()
         elif path == "/api/content-assets":
             self._list_content_assets()
+        elif path == "/api/content-library":
+            self._list_content_library()
         elif self._content_asset_path(path) is not None:
             self._get_content_asset(self._content_asset_path(path) or 0)
         elif self._keyword_title_candidates_path(path) is not None:
             self._list_title_candidates(self._keyword_title_candidates_path(path) or 0)
-        elif path in {"", "/", "/research", "/keywords", "/titles", "/title-library", "/content", "/scoring", "/settings"}:
+        elif path in {"", "/", "/research", "/keywords", "/titles", "/title-library", "/content", "/content-library", "/scoring", "/settings"} or re.fullmatch(r"/content-library/\d+", path):
             self._serve_index()
         else:
             super().do_GET()
@@ -104,7 +109,8 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         elif content_action is not None:
             asset_id, action = content_action
             if action == "briefs": self._create_content_brief(asset_id, payload)
-            else: self._create_content_outline(asset_id, payload)
+            elif action == "outlines": self._create_content_outline(asset_id, payload)
+            else: self._generate_content(asset_id, action, payload)
         elif path == "/api/settings/ai":
             self._save_ai_settings(payload)
         elif path == "/api/settings/ai/test":
@@ -117,12 +123,19 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
     def do_DELETE(self) -> None:
         path = urlsplit(self.path).path
         candidate_id = self._title_candidate_path(path)
-        if path != "/api/keywords" and candidate_id is None:
+        content_asset_id = self._content_asset_path(path)
+        if path not in {"/api/keywords", "/api/content-assets", "/api/title-candidates"} and candidate_id is None and content_asset_id is None:
             self._json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
             return
         payload = self._read_json()
         if payload is not None and candidate_id is not None:
             self._delete_title_candidate(candidate_id, payload)
+        elif payload is not None and path == "/api/title-candidates":
+            self._delete_title_candidates(payload)
+        elif payload is not None and content_asset_id is not None:
+            self._delete_content_assets(payload, asset_id=content_asset_id)
+        elif payload is not None and path == "/api/content-assets":
+            self._delete_content_assets(payload)
         elif payload is not None:
             self._delete_keywords(payload)
 
@@ -164,22 +177,38 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             rows = connection.execute("SELECT assets.*, keywords.keyword FROM content_assets assets JOIN keywords ON keywords.id=assets.keyword_id WHERE assets.project_id=? AND assets.deleted_at IS NULL ORDER BY assets.updated_at DESC, assets.id DESC", (int(values[0]),)).fetchall()
         self._json(HTTPStatus.OK, [self._content_asset_payload(row) for row in rows])
 
+    def _list_content_library(self) -> None:
+        values = parse_qs(urlsplit(self.path).query).get("project_id", [])
+        if len(values) != 1:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "project_id is required."}); return
+        try:
+            project_id = int(values[0])
+        except ValueError:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "project_id must be an integer."}); return
+        with self._database() as connection:
+            rows = connection.execute(
+                """SELECT assets.*, keywords.keyword, drafts.version AS current_draft_version,
+                          drafts.meta_description, drafts.qa_status, drafts.provider, drafts.model
+                   FROM content_assets AS assets
+                   JOIN keywords ON keywords.id=assets.keyword_id
+                   JOIN content_drafts AS drafts ON drafts.id=assets.current_draft_id
+                   WHERE assets.project_id=? AND assets.deleted_at IS NULL AND assets.current_draft_id IS NOT NULL
+                   ORDER BY assets.updated_at DESC, assets.id DESC""",
+                (project_id,),
+            ).fetchall()
+        self._json(HTTPStatus.OK, [self._content_asset_payload(row) for row in rows])
+
     def _get_content_asset(self, asset_id: int) -> None:
         values = parse_qs(urlsplit(self.path).query).get("project_id", [])
         if len(values) != 1: self._json(HTTPStatus.BAD_REQUEST, {"error": "project_id is required."}); return
         with self._database() as connection:
-            row = self._content_asset(connection, int(values[0]), asset_id)
-            payload = self._content_asset_payload(row)
-            brief = connection.execute("SELECT * FROM content_briefs WHERE content_asset_id=? AND status='current' ORDER BY id DESC LIMIT 1", (asset_id,)).fetchone()
-            outline = connection.execute("SELECT * FROM content_outlines WHERE content_asset_id=? ORDER BY id DESC LIMIT 1", (asset_id,)).fetchone()
-            payload["brief"] = self._content_brief_payload(brief) if brief else None
-            payload["outline"] = self._content_outline_payload(connection, outline) if outline else None
+            payload = self._content_asset_detail(connection, int(values[0]), asset_id)
         self._json(HTTPStatus.OK, payload)
 
     def _create_content_brief(self, asset_id: int, payload: Mapping[str, Any]) -> None:
         project_id = self._integer(payload, "project_id")
         audience, goal = self._text(payload, "target_audience"), self._text(payload, "business_goal")
-        target = self._integer(payload, "target_length")
+        target = 0 if "target_length" not in payload else self._integer(payload, "target_length")
         sources = payload.get("sources", [])
         if project_id is None or target is None or not isinstance(sources, list): return
         try:
@@ -204,13 +233,280 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 with connection:
                     cursor = connection.execute("INSERT INTO content_outlines(content_asset_id,brief_id) VALUES(?,?)", (asset_id, brief_id))
                     for position, section in enumerate(sections, 1):
-                        if not isinstance(section, Mapping) or not all(isinstance(section.get(key), str) and section[key].strip() for key in ("heading", "purpose")) or not isinstance(section.get("word_budget"), int): raise ValueError("each outline section needs heading, purpose, and word_budget")
-                        connection.execute("INSERT INTO content_outline_sections(outline_id,position,heading,purpose,word_budget) VALUES(?,?,?,?,?)", (cursor.lastrowid, position, section["heading"].strip(), section["purpose"].strip(), section["word_budget"]))
+                        if not isinstance(section, Mapping) or not all(isinstance(section.get(key), str) and section[key].strip() for key in ("heading", "purpose")): raise ValueError("each outline section needs heading and purpose")
+                        section_data = self._normalise_outline_section(section, position)
+                        connection.execute("INSERT INTO content_outline_sections(outline_id,position,heading,purpose,word_budget,section_json) VALUES(?,?,?,?,?,?)", (cursor.lastrowid, position, section_data["heading"], section_data["purpose"], 0, json.dumps(section_data, ensure_ascii=False)))
                     connection.execute("UPDATE content_assets SET status='outlining',current_outline_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (cursor.lastrowid, asset_id))
                     row = connection.execute("SELECT * FROM content_outlines WHERE id=?", (cursor.lastrowid,)).fetchone()
                     result = self._content_outline_payload(connection, row)
         except (sqlite3.Error, ValueError) as error: self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)}); return
         self._json(HTTPStatus.CREATED, result)
+
+    def _generate_content(self, asset_id: int, action: str, payload: Mapping[str, Any]) -> None:
+        """Run one or all evidence-grounded synthesis stages and persist every result."""
+        project_id = self._integer(payload, "project_id")
+        if project_id is None:
+            return
+        job_id: int | None = None
+        provider = self._optional_text(payload, "provider") or "openai"
+        model: str | None = None
+        try:
+            with self._database() as connection:
+                asset = self._content_asset(connection, project_id, asset_id)
+                generator, provider, model = self._content_generator(payload)
+                job_id = self._start_content_generation_job(connection, asset, action, provider, model)
+                if generator is None:
+                    job = self._finish_content_generation_job(connection, job_id, status="failed", failed_stage="configuration", error_summary="Selected provider is not configured.")
+                    self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": f"{self._content_provider_label(provider)} configuration 未配置，未切换到其他模型。", "generation_job": job})
+                    return
+                result: dict[str, Any] = {}
+                # A one-click run respects an existing user-approved Brief.  It only
+                # creates a Brief when there is no fact boundary to carry forward.
+                if action == "generate-brief" or (action == "generate" and asset["current_brief_id"] is None):
+                    result["brief"] = self._generate_ai_brief(connection, asset, payload, generator, provider, model, job_id)
+                    asset = self._content_asset(connection, project_id, asset_id)
+                if action in {"generate-outline", "generate"}:
+                    result["outline"] = self._generate_ai_outline(connection, asset, payload, generator, provider, model, job_id)
+                    asset = self._content_asset(connection, project_id, asset_id)
+                if action in {"generate-draft", "generate"}:
+                    result["draft"] = self._generate_ai_draft(connection, asset, payload, generator, provider, model, job_id)
+                result["generation_job"] = self._finish_content_generation_job(connection, job_id, status="completed")
+                refreshed = self._content_asset_detail(connection, project_id, asset_id)
+                result["runs"] = refreshed["generation_runs"]
+        except ContentGenerationProtocolError as error:
+            detail = str(error) or "AI content generation returned invalid JSON."
+            stage = self._content_failed_stage(detail)
+            job = None
+            if job_id is not None:
+                with self._database() as connection:
+                    job = self._finish_content_generation_job(connection, job_id, status="failed", failed_stage=stage, error_summary=detail)
+            self._json(HTTPStatus.BAD_GATEWAY, {"error": f"{self._content_provider_label(provider)} 内容生成在 {self._content_stage_label(stage)} 阶段失败：{detail}。未切换到其他模型，旧正文已保留。", "generation_job": job})
+            return
+        except (sqlite3.Error, ValueError, TypeError, json.JSONDecodeError) as error:
+            job = None
+            if job_id is not None:
+                with self._database() as connection:
+                    job = self._finish_content_generation_job(connection, job_id, status="failed", failed_stage="preparation", error_summary=str(error))
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error), "generation_job": job})
+            return
+        self._json(HTTPStatus.CREATED, result)
+
+    @staticmethod
+    def _content_provider_label(provider: str) -> str:
+        return CONTENT_PROVIDER_LABELS.get(provider, provider)
+
+    @staticmethod
+    def _content_stage_label(stage: str) -> str:
+        return {"semantic": "语义分析", "title": "标题与元信息", "outline": "文章大纲", "section": "章节写作", "assembly": "组装全文", "configuration": "模型配置", "preparation": "任务准备"}.get(stage, stage)
+
+    @staticmethod
+    def _content_failed_stage(error: str) -> str:
+        matched = re.search(r"AI content (semantic|title|outline|section|assembly)", error)
+        return matched.group(1) if matched else "generation"
+
+    @staticmethod
+    def _start_content_generation_job(connection: sqlite3.Connection, asset: sqlite3.Row, action: str, provider: str, model: str | None) -> int:
+        with connection:
+            cursor = connection.execute(
+                "INSERT INTO content_generation_jobs(project_id,content_asset_id,requested_action,provider,model) VALUES(?,?,?,?,?)",
+                (asset["project_id"], asset["id"], action, provider, model),
+            )
+        return int(cursor.lastrowid)
+
+    @staticmethod
+    def _finish_content_generation_job(connection: sqlite3.Connection, job_id: int, *, status: str, failed_stage: str | None = None, error_summary: str | None = None) -> dict[str, Any]:
+        with connection:
+            connection.execute(
+                "UPDATE content_generation_jobs SET status=?,failed_stage=?,error_summary=?,completed_at=CURRENT_TIMESTAMP WHERE id=?",
+                (status, failed_stage, error_summary, job_id),
+            )
+        row = connection.execute("SELECT * FROM content_generation_jobs WHERE id=?", (job_id,)).fetchone()
+        return dict(row)
+
+    def _content_generator(self, payload: Mapping[str, Any]) -> tuple[Any | None, str, str | None]:
+        requested = self._optional_text(payload, "provider")
+        if requested is not None and requested not in AI_PROVIDERS:
+            raise ValueError("provider must be openai, gemini, or deepseek")
+        injected = getattr(self.server, "content_generator", None)
+        if injected is not None:
+            return injected, requested or str(getattr(injected, "provider", "custom")), getattr(injected, "model", None)
+        provider = requested or _ai_assignments(self.server.ai_settings_path).get("content_generation", "openai")
+        if not getattr(self.server, "allow_environment_ai_fallback", True) and not _ai_settings_document(self.server.ai_settings_path).get("providers"):
+            return None, provider, None
+        configuration = _provider_configuration(self.server.ai_settings_path, provider)
+        if configuration is None:
+            return None, provider, None
+        api_key, base_url, model = configuration
+        return OpenAICompatibleContentGenerator(api_key, base_url, model, provider=provider), provider, model
+
+    def _generate_ai_brief(self, connection: sqlite3.Connection, asset: sqlite3.Row, payload: Mapping[str, Any], generator: Any, provider: str, model: str | None, generation_job_id: int) -> dict[str, Any]:
+        audience = self._optional_text(payload, "target_audience") or "US searchers evaluating this topic"
+        goal = self._optional_text(payload, "business_goal") or "informational"
+        sources = self._content_sources(payload.get("sources", []))
+        data = {"topic": asset["title_snapshot"], "primary_keyword": asset["keyword"], "language_market": asset["locale"], "audience": audience, "business_goal": goal, "brand": self._optional_text(payload, "brand") or "", "sources": sources, "constraints": payload.get("constraints", [])}
+        semantic, _run = self._run_content_stage(connection, asset, "semantic", data, generator, provider, model, generation_job_id)
+        brief_json = {"semantic": semantic, "source_policy": "Material facts without a usable source must be marked [VERIFY]."}
+        with connection:
+            connection.execute("UPDATE content_briefs SET status='superseded' WHERE content_asset_id=? AND status='current'", (asset["id"],))
+            cursor = connection.execute("INSERT INTO content_briefs(content_asset_id,target_audience,business_goal,target_length,sources_json,brief_json) VALUES(?,?,?,?,?,?)", (asset["id"], audience, goal, 0, json.dumps(sources, ensure_ascii=False), json.dumps(brief_json, ensure_ascii=False)))
+            connection.execute("UPDATE content_assets SET status='briefing',current_brief_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (cursor.lastrowid, asset["id"]))
+            row = connection.execute("SELECT * FROM content_briefs WHERE id=?", (cursor.lastrowid,)).fetchone()
+        return self._content_brief_payload(row)
+
+    def _generate_ai_outline(self, connection: sqlite3.Connection, asset: sqlite3.Row, payload: Mapping[str, Any], generator: Any, provider: str, model: str | None, generation_job_id: int) -> dict[str, Any]:
+        brief = self._current_content_brief(connection, asset)
+        semantic = self._content_brief_payload(brief)["brief"].get("semantic", {})
+        title_data = {"semantic": semantic, "primary_keyword": asset["keyword"], "title_snapshot": asset["title_snapshot"], "voice": self._optional_text(payload, "voice") or "clear, helpful American English", "year_rule": "none"}
+        metadata, _run = self._run_content_stage(connection, asset, "title", title_data, generator, provider, model, generation_job_id)
+        if not isinstance(metadata.get("selected_title"), str) or not metadata["selected_title"].strip():
+            metadata["selected_title"] = asset["title_snapshot"]
+        metadata["selected_title"] = asset["title_snapshot"]  # The user-approved title is canonical.
+        updated_brief = self._content_brief_payload(brief)["brief"]
+        updated_brief["metadata"] = metadata
+        with connection:
+            connection.execute("UPDATE content_briefs SET brief_json=? WHERE id=?", (json.dumps(updated_brief, ensure_ascii=False), brief["id"]))
+        outline_data = {"semantic": semantic, "metadata": metadata, "cta": self._optional_text(payload, "cta") or "", "sources": self._content_brief_payload(brief)["sources"]}
+        outline_json, _run = self._run_content_stage(connection, asset, "outline", outline_data, generator, provider, model, generation_job_id)
+        sections = outline_json.get("sections")
+        if not isinstance(sections, list) or not sections:
+            raise ContentGenerationProtocolError("AI content outline returned no usable sections.")
+        with connection:
+            cursor = connection.execute("INSERT INTO content_outlines(content_asset_id,brief_id,status) VALUES(?,?,?)", (asset["id"], brief["id"], "approved"))
+            for position, section in enumerate(sections, 1):
+                if not isinstance(section, Mapping) or not isinstance(section.get("heading"), str) or not section["heading"].strip():
+                    raise ContentGenerationProtocolError("AI content outline has an invalid section.")
+                section_data = self._normalise_outline_section(section, position)
+                connection.execute("INSERT INTO content_outline_sections(outline_id,position,heading,purpose,word_budget,section_json) VALUES(?,?,?,?,?,?)", (cursor.lastrowid, position, section_data["heading"], section_data["purpose"], 0, json.dumps(section_data, ensure_ascii=False)))
+            connection.execute("UPDATE content_assets SET status='outlining',current_outline_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (cursor.lastrowid, asset["id"]))
+            row = connection.execute("SELECT * FROM content_outlines WHERE id=?", (cursor.lastrowid,)).fetchone()
+        result = self._content_outline_payload(connection, row)
+        result["blueprint"] = outline_json
+        return result
+
+    def _generate_ai_draft(self, connection: sqlite3.Connection, asset: sqlite3.Row, payload: Mapping[str, Any], generator: Any, provider: str, model: str | None, generation_job_id: int) -> dict[str, Any]:
+        brief = self._current_content_brief(connection, asset)
+        if asset["current_outline_id"] is None:
+            raise ValueError("an AI outline is required before generating a draft")
+        outline = connection.execute("SELECT * FROM content_outlines WHERE id=?", (asset["current_outline_id"],)).fetchone()
+        if outline is None:
+            raise ValueError("current content outline does not exist")
+        brief_data = self._content_brief_payload(brief)
+        semantic = brief_data["brief"].get("semantic", {})
+        metadata = brief_data["brief"].get("metadata", {"selected_title": asset["title_snapshot"], "meta_description": ""})
+        if not isinstance(metadata, Mapping): metadata = {"selected_title": asset["title_snapshot"], "meta_description": ""}
+        outline_payload = self._content_outline_payload(connection, outline)
+        blueprint = {"sections": outline_payload["sections"]}
+        section_drafts: list[dict[str, Any]] = []
+        for section in blueprint["sections"]:
+            section_data = {"topic": asset["title_snapshot"], "audience": brief["target_audience"], "intent": semantic.get("intent", {}), "angle": semantic.get("angle", ""), "title": metadata.get("selected_title", asset["title_snapshot"]), "section": {"id": f"s{section['position']}", **section}, "sources": brief_data["sources"], "voice": self._optional_text(payload, "voice") or "clear, helpful American English", "language": asset["locale"]}
+            drafted, _run = self._run_content_stage(connection, asset, "section", section_data, generator, provider, model, generation_job_id)
+            if not isinstance(drafted.get("markdown"), str):
+                raise ContentGenerationProtocolError("AI content section returned no Markdown.")
+            section_drafts.append(drafted)
+        assembly_data = {"metadata": dict(metadata), "outline": blueprint, "section_drafts": section_drafts, "brand": self._optional_text(payload, "brand") or "", "cta": self._optional_text(payload, "cta") or ""}
+        article, assembly_run = self._run_content_stage(connection, asset, "assembly", assembly_data, generator, provider, model, generation_job_id)
+        if not isinstance(article.get("markdown"), str):
+            raise ContentGenerationProtocolError("AI content assembly returned no Markdown.")
+        markdown = article["markdown"]
+        verification = article.get("verify", []) if isinstance(article.get("verify", []), list) else []
+        compatibility_qa = {"status": "not_run", "checks": [], "unresolved_verify": verification}
+        with connection:
+            version = int(connection.execute("SELECT COALESCE(MAX(version),0)+1 FROM content_drafts WHERE content_asset_id=?", (asset["id"],)).fetchone()[0])
+            cursor = connection.execute("INSERT INTO content_drafts(project_id,content_asset_id,outline_id,generation_run_id,generation_job_id,version,title,meta_description,markdown,sources_used_json,unresolved_verify_json,qa_json,qa_status,provider,model) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (asset["project_id"], asset["id"], outline["id"], assembly_run["id"], generation_job_id, version, str(article.get("title") or metadata.get("selected_title") or asset["title_snapshot"]), str(article.get("meta_description") or metadata.get("meta_description") or ""), markdown, json.dumps(article.get("sources_used", []), ensure_ascii=False), json.dumps(verification, ensure_ascii=False), json.dumps(compatibility_qa, ensure_ascii=False), "not_run", provider, model))
+            connection.execute("UPDATE content_assets SET status='in_review',current_draft_id=?,current_generation_run_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (cursor.lastrowid, assembly_run["id"], asset["id"]))
+            draft = connection.execute("SELECT * FROM content_drafts WHERE id=?", (cursor.lastrowid,)).fetchone()
+        return self._content_draft_payload(draft)
+
+    def _run_content_stage(self, connection: sqlite3.Connection, asset: sqlite3.Row, stage: str, data: Mapping[str, Any], generator: Any, provider: str, model: str | None, generation_job_id: int) -> tuple[dict[str, Any], dict[str, Any]]:
+        with connection:
+            cursor = connection.execute("INSERT INTO content_generation_runs(project_id,content_asset_id,stage,provider,model,generation_job_id,status,input_json,prompt_version) VALUES(?,?,?,?,?,?,'running',?,?)", (asset["project_id"], asset["id"], stage, provider, model, generation_job_id, json.dumps(data, ensure_ascii=False), PROMPT_VERSION))
+            run_id = int(cursor.lastrowid)
+        try:
+            if callable(getattr(generator, "run_stage", None)):
+                raw = generator.run_stage(stage=stage, data=dict(data))
+            elif callable(getattr(generator, "generate", None)):
+                raw = generator.generate(stage=stage, **dict(data))
+            else:
+                raise ContentGenerationProtocolError("configured content generator has no supported stage method")
+            result = json.loads(raw) if isinstance(raw, str) else raw
+            if not isinstance(result, Mapping):
+                raise ContentGenerationProtocolError(f"AI content {stage} returned invalid JSON.")
+            value = dict(result)
+        except Exception as error:
+            with connection:
+                connection.execute("UPDATE content_generation_runs SET status='failed',error_summary=?,completed_at=CURRENT_TIMESTAMP WHERE id=?", (str(error) or f"AI content {stage} failed.", run_id))
+            if isinstance(error, ContentGenerationProtocolError):
+                raise
+            raise ContentGenerationProtocolError(f"AI content {stage} request failed.") from error
+        with connection:
+            connection.execute("UPDATE content_generation_runs SET status='completed',output_json=?,completed_at=CURRENT_TIMESTAMP WHERE id=?", (json.dumps(value, ensure_ascii=False), run_id))
+        return value, {"id": run_id, "stage": stage, "status": "completed"}
+
+    @staticmethod
+    def _normalise_outline_section(section: Mapping[str, Any], position: int) -> dict[str, Any]:
+        heading = section.get("heading")
+        if not isinstance(heading, str) or not heading.strip():
+            raise ContentGenerationProtocolError("AI content outline has an invalid section.")
+        purpose = section.get("purpose") if isinstance(section.get("purpose"), str) and section["purpose"].strip() else "Advance the reader decision."
+        def strings(field: str) -> list[str]:
+            value = section.get(field, [])
+            return [item.strip() for item in value if isinstance(item, str) and item.strip()] if isinstance(value, list) else []
+        level = section.get("level") if section.get("level") in {"h2", "h3"} else "h2"
+        format_value = section.get("format") if section.get("format") in {"paragraphs", "list", "table"} else "paragraphs"
+        return {
+            "id": section.get("id") if isinstance(section.get("id"), str) and section["id"].strip() else f"s{position}",
+            "heading": heading.strip(), "level": level,
+            "reader_question": section.get("reader_question") if isinstance(section.get("reader_question"), str) else "",
+            "purpose": purpose.strip(), "key_points": strings("key_points"), "source_ids": strings("source_ids"),
+            "evidence_gaps": strings("evidence_gaps"), "format": format_value,
+        }
+
+    @staticmethod
+    def _content_sources(value: Any) -> list[dict[str, Any]]:
+        if not isinstance(value, list):
+            raise ValueError("sources must be an array")
+        normalized: list[dict[str, Any]] = []
+        for position, source in enumerate(value, 1):
+            if isinstance(source, str):
+                content = source.strip()
+                if not content:
+                    raise ValueError("source text must not be empty")
+                normalized.append({"source_id": f"source-{position}", "source_type": "note", "content": content, "availability": "available"})
+                continue
+            if not isinstance(source, Mapping):
+                raise ValueError("each source must be a string or structured object")
+            item = dict(source)
+            source_id = item.get("source_id")
+            source_type = item.get("source_type")
+            availability = item.get("availability")
+            if not isinstance(source_id, str) or not source_id.strip():
+                raise ValueError("structured source.source_id is required")
+            if not isinstance(source_type, str) or not source_type.strip():
+                raise ValueError("structured source.source_type is required")
+            if availability not in {"available", "unavailable"}:
+                raise ValueError("structured source.availability must be available or unavailable")
+            if source_type == "url" and availability == "available":
+                url = item.get("url")
+                if not isinstance(url, str) or not url.strip().startswith(("https://", "http://")):
+                    raise ValueError("available URL source.url is required")
+            normalized.append(item)
+        return normalized
+
+    @staticmethod
+    def _integer_or_default(payload: Mapping[str, Any], field: str, default: int) -> int:
+        value = payload.get(field, default)
+        if not isinstance(value, int) or isinstance(value, bool) or value < 100:
+            raise ValueError(f"{field} must be an integer of at least 100")
+        return value
+
+    @staticmethod
+    def _current_content_brief(connection: sqlite3.Connection, asset: sqlite3.Row) -> sqlite3.Row:
+        if asset["current_brief_id"] is None:
+            raise ValueError("an AI content brief is required before generating an outline")
+        brief = connection.execute("SELECT * FROM content_briefs WHERE id=?", (asset["current_brief_id"],)).fetchone()
+        if brief is None:
+            raise ValueError("current content brief does not exist")
+        return brief
 
     def _create_project(self, payload: Mapping[str, Any]) -> None:
         name = self._text(payload, "name")
@@ -664,14 +960,18 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             return
         with self._database() as connection:
             rows = connection.execute(
-                """SELECT candidates.*,keywords.keyword
+                """SELECT candidates.*,keywords.keyword,
+                          assets.id AS content_asset_id, assets.current_outline_id,
+                          assets.current_draft_id, assets.deleted_at AS content_asset_deleted_at
                    FROM keyword_title_candidates AS candidates
                    JOIN keywords ON keywords.id=candidates.keyword_id
+                   LEFT JOIN content_assets AS assets ON assets.project_id=candidates.project_id
+                       AND assets.selected_title_candidate_id=candidates.id AND assets.deleted_at IS NULL
                    WHERE candidates.project_id=? AND candidates.deleted_at IS NULL AND keywords.deleted_at IS NULL
                    ORDER BY CASE candidates.status WHEN 'selected' THEN 0 ELSE 1 END,candidates.created_at DESC,candidates.id DESC""",
                 (project_id,),
             ).fetchall()
-        self._json(HTTPStatus.OK, [self._title_candidate_payload(row) for row in rows])
+        self._json(HTTPStatus.OK, [self._title_candidate_payload(row) | self._workflow_status_payload(row) for row in rows])
 
     def _select_title_candidate(self, candidate_id: int, payload: Mapping[str, Any]) -> None:
         project_id = self._integer(payload, "project_id")
@@ -718,6 +1018,55 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             with connection:
                 connection.execute("UPDATE keyword_title_candidates SET deleted_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?", (candidate_id,))
         self._json(HTTPStatus.OK, {"deleted": 1})
+
+    def _delete_title_candidates(self, payload: Mapping[str, Any]) -> None:
+        project_id = self._integer(payload, "project_id")
+        raw_ids = payload.get("candidate_ids", [])
+        if project_id is None:
+            return
+        if not isinstance(raw_ids, list) or not raw_ids or any(not isinstance(value, int) or isinstance(value, bool) or value < 1 for value in raw_ids):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "candidate_ids must be a non-empty list of positive integers."})
+            return
+        candidate_ids = list(dict.fromkeys(raw_ids))
+        marks = ",".join("?" for _ in candidate_ids)
+        with self._database() as connection:
+            rows = connection.execute(
+                f"SELECT id,status FROM keyword_title_candidates WHERE project_id=? AND deleted_at IS NULL AND id IN ({marks})",
+                (project_id, *candidate_ids),
+            ).fetchall()
+            if any(row["status"] == "selected" for row in rows):
+                self._json(HTTPStatus.CONFLICT, {"error": "The selected title cannot be deleted. Replace it first."})
+                return
+            with connection:
+                cursor = connection.execute(
+                    f"UPDATE keyword_title_candidates SET deleted_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE project_id=? AND deleted_at IS NULL AND id IN ({marks})",
+                    (project_id, *candidate_ids),
+                )
+        self._json(HTTPStatus.OK, {"deleted": cursor.rowcount})
+
+    def _delete_content_assets(self, payload: Mapping[str, Any], *, asset_id: int | None = None) -> None:
+        project_id = self._integer(payload, "project_id")
+        if project_id is None:
+            return
+        if asset_id is not None:
+            asset_ids = [asset_id]
+        else:
+            raw_ids = payload.get("content_asset_ids", [])
+            if not isinstance(raw_ids, list) or not raw_ids or any(not isinstance(value, int) or isinstance(value, bool) or value < 1 for value in raw_ids):
+                self._json(HTTPStatus.BAD_REQUEST, {"error": "content_asset_ids must be a non-empty list of positive integers."})
+                return
+            asset_ids = list(dict.fromkeys(raw_ids))
+        marks = ",".join("?" for _ in asset_ids)
+        with self._database() as connection:
+            with connection:
+                cursor = connection.execute(
+                    f"UPDATE content_assets SET deleted_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE project_id=? AND deleted_at IS NULL AND id IN ({marks})",
+                    (project_id, *asset_ids),
+                )
+        if cursor.rowcount == 0 and asset_id is not None:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "content asset does not exist in this project"})
+            return
+        self._json(HTTPStatus.OK, {"deleted": cursor.rowcount})
 
     def _delete_keywords(self, payload: Mapping[str, Any]) -> None:
         project_id = self._integer(payload, "project_id")
@@ -844,7 +1193,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
     @staticmethod
     def _content_asset_action_path(path: str) -> tuple[int, str] | None:
         parts = path.strip("/").split("/")
-        if len(parts) != 4 or parts[:2] != ["api", "content-assets"] or parts[3] not in {"briefs", "outlines"}: return None
+        if len(parts) != 4 or parts[:2] != ["api", "content-assets"] or parts[3] not in {"briefs", "outlines", "generate", "generate-brief", "generate-outline", "generate-draft"}: return None
         try: return int(parts[2]), parts[3]
         except ValueError: return None
 
@@ -855,7 +1204,38 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         return row
 
     @staticmethod
-    def _content_asset_payload(row: sqlite3.Row) -> dict[str, Any]: return dict(row)
+    def _workflow_status_payload(row: Mapping[str, Any]) -> dict[str, str]:
+        outlined = row["current_outline_id"] is not None
+        completed = row["current_draft_id"] is not None
+        return {
+            "outline_status": "completed" if outlined else "pending",
+            "outline_status_label": "大纲完成" if outlined else "待大纲",
+            "content_status": "completed" if completed else "pending",
+            "content_status_label": "内容完成" if completed else "待生成内容",
+        }
+
+    @classmethod
+    def _content_asset_payload(cls, row: sqlite3.Row) -> dict[str, Any]:
+        return dict(row) | cls._workflow_status_payload(row)
+
+    def _content_asset_detail(self, connection: sqlite3.Connection, project_id: int, asset_id: int) -> dict[str, Any]:
+        row = self._content_asset(connection, project_id, asset_id)
+        payload = self._content_asset_payload(row)
+        brief = connection.execute("SELECT * FROM content_briefs WHERE content_asset_id=? AND status='current' ORDER BY id DESC LIMIT 1", (asset_id,)).fetchone()
+        outline = connection.execute("SELECT * FROM content_outlines WHERE content_asset_id=? ORDER BY id DESC LIMIT 1", (asset_id,)).fetchone()
+        drafts = connection.execute("SELECT * FROM content_drafts WHERE content_asset_id=? ORDER BY version", (asset_id,)).fetchall()
+        runs = connection.execute("SELECT * FROM content_generation_runs WHERE content_asset_id=? ORDER BY id", (asset_id,)).fetchall()
+        jobs = connection.execute("SELECT * FROM content_generation_jobs WHERE content_asset_id=? ORDER BY id", (asset_id,)).fetchall()
+        current_draft = connection.execute("SELECT * FROM content_drafts WHERE id=?", (row["current_draft_id"],)).fetchone() if row["current_draft_id"] is not None else None
+        payload["brief"] = self._content_brief_payload(brief) if brief else None
+        payload["outline"] = self._content_outline_payload(connection, outline) if outline else None
+        payload["drafts"] = [self._content_draft_payload(draft) for draft in drafts]
+        payload["current_draft"] = self._content_draft_payload(current_draft) if current_draft else None
+        payload["generation_runs"] = [self._content_run_payload(run) for run in runs]
+        payload["generation_jobs"] = [dict(job) for job in jobs]
+        # Kept as a compact compatibility alias for the first content-system UI.
+        payload["runs"] = payload["generation_runs"]
+        return payload
 
     @staticmethod
     def _content_brief_payload(row: sqlite3.Row) -> dict[str, Any]:
@@ -863,7 +1243,32 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
 
     @staticmethod
     def _content_outline_payload(connection: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
-        value = dict(row); value["sections"] = [dict(item) for item in connection.execute("SELECT * FROM content_outline_sections WHERE outline_id=? ORDER BY position,id", (row["id"],)).fetchall()]; return value
+        value = dict(row)
+        sections: list[dict[str, Any]] = []
+        for item in connection.execute("SELECT * FROM content_outline_sections WHERE outline_id=? ORDER BY position,id", (row["id"],)).fetchall():
+            section = dict(item)
+            extra = json.loads(section.pop("section_json", "{}") or "{}")
+            if isinstance(extra, Mapping):
+                section.update(extra)
+            sections.append(section)
+        value["sections"] = sections
+        return value
+
+    @staticmethod
+    def _content_draft_payload(row: sqlite3.Row) -> dict[str, Any]:
+        value = dict(row)
+        value["sources_used"] = json.loads(value.pop("sources_used_json") or "[]")
+        value["unresolved_verify"] = json.loads(value.pop("unresolved_verify_json") or "[]")
+        value["qa"] = json.loads(value.pop("qa_json") or "{}")
+        return value
+
+    @staticmethod
+    def _content_run_payload(row: sqlite3.Row) -> dict[str, Any]:
+        value = dict(row)
+        value["input"] = json.loads(value.pop("input_json") or "{}")
+        raw_output = value.pop("output_json")
+        value["output"] = json.loads(raw_output) if raw_output else None
+        return value
 
     @staticmethod
     def _title_candidates_from_response(raw: Any, requested_count: int) -> list[dict[str, str | bool | None]]:
@@ -1153,13 +1558,16 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         self.send_response(status); self.send_header("Content-Type", "application/json; charset=utf-8"); self.send_header("Content-Length", str(len(content))); self.end_headers(); self.wfile.write(content)
 
 
-def create_server(host: str = "127.0.0.1", port: int = 0, database_path: str | Path = ":memory:", suggest_client: Any | None = None, keyword_reviewer: Any | None = None, title_generator: Any | None = None, serp_title_client: Any | None = None, ai_settings_path: Path | None = None) -> KeywordDiscoveryServer:
+def create_server(host: str = "127.0.0.1", port: int = 0, database_path: str | Path = ":memory:", suggest_client: Any | None = None, keyword_reviewer: Any | None = None, title_generator: Any | None = None, serp_title_client: Any | None = None, ai_settings_path: Path | None = None, content_generator: Any | None = None) -> KeywordDiscoveryServer:
     server = KeywordDiscoveryServer((host, port), KeywordDiscoveryRequestHandler)
     server.database_path = database_path
     server.ai_settings_path = ai_settings_path or AI_SETTINGS_FILE
+    server.allow_environment_ai_fallback = ai_settings_path is None
     server.suggest_client = suggest_client or GoogleSuggestClient()
     server.keyword_reviewer = keyword_reviewer or _default_keyword_reviewer(server.ai_settings_path)
     server.title_generator = title_generator or _default_title_generator(server.ai_settings_path)
+    # None means resolve the current saved content-generation provider per request.
+    server.content_generator = content_generator
     server.serp_title_client = serp_title_client or BrowserSerpTitleClient()
     return server
 
@@ -1237,7 +1645,7 @@ def _ai_assignments(path: Path) -> dict[str, str]:
 def _normalize_ai_assignments(value: object) -> dict[str, str] | None:
     if not isinstance(value, Mapping):
         return None
-    result = {key: value.get(key) for key in DEFAULT_AI_ASSIGNMENTS}
+    result = {key: value.get(key, default) for key, default in DEFAULT_AI_ASSIGNMENTS.items()}
     if any(provider not in AI_PROVIDERS for provider in result.values()):
         return None
     return {key: str(provider) for key, provider in result.items()}

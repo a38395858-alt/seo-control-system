@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
-import { BrowserRouter, NavLink, Navigate, Route, Routes, useNavigate } from "react-router-dom";
+import { BrowserRouter, NavLink, Navigate, Route, Routes, useNavigate, useParams } from "react-router-dom";
 import { api } from "./api";
-import type { ContentAsset, ExpansionResult, LibraryKeyword, Review, Score, SerpTitle, TitleCandidate } from "./types";
+import type { ContentAsset, ContentAssetDetail, ContentBrief, ContentDraft, ContentGenerationResult, ContentOutline, ExpansionResult, LibraryKeyword, Review, Score, SerpTitle, TitleCandidate } from "./types";
 
 type RunState = { seeds: string[]; language: string; country: string; result: ExpansionResult } | null;
 type ScoreInputs = Record<"keyword" | "volume" | "authority" | "domains" | "titleMatch" | "authoritySites" | "intent" | "relevance" | "businessValue", string>;
@@ -11,7 +11,169 @@ type AiProvider = "openai" | "gemini" | "deepseek";
 type AiProfile = { baseUrl: string; model: string; apiKey: string };
 type AiAssignments = { keyword_review: AiProvider; title_generation: AiProvider };
 function RecentTitleLibrary({ titles }: { titles: TitleCandidate[] }) { return <section className="recent-title-library"><div><strong>最近入库标题</strong><p>每次生成完成后会自动写入标题库，不会因为刷新或切换页面而丢失。</p></div><NavLink className="primary" to="/title-library">打开标题库（{titles.length} 条）</NavLink>{titles.length ? <div className="recent-title-list">{titles.slice(0, 5).map((title) => <article key={title.id}><ProviderBadge reason={title.reason} /><strong>{title.title}</strong><span>{title.keyword || "—"}</span></article>)}</div> : <p className="empty">暂时还没有标题。生成后会自动写入标题库。</p>}</section>; }
-function ContentAssets({ titles, assets, onCreate }: { titles: TitleCandidate[]; assets: ContentAsset[]; onCreate: (title: TitleCandidate) => void }) { const available = titles.filter((title) => title.status === "selected"); const createdByTitle = new Map(assets.map((asset) => [asset.selected_title_candidate_id, asset])); return <div className="content-assets"><h3>已选标题</h3>{available.length ? available.map((title) => { const asset = createdByTitle.get(title.id); return <article key={title.id}><div><ProviderBadge reason={title.reason} /><strong>{title.title}</strong><p>{title.keyword || "—"}</p></div>{asset ? <span className="tag">已创建</span> : <button className="primary" onClick={() => onCreate(title)}>创建内容</button>}</article>; }) : <p className="empty">请先在标题库选定一个标题。</p>}<h3>内容资产</h3>{assets.length ? assets.map((asset) => <article key={asset.id}><div><strong>{asset.title_snapshot}</strong><p>{asset.keyword || "—"} · {asset.status} · {asset.locale}</p></div><span className="tag">下一步：Brief</span></article>) : <p className="empty">尚未创建内容资产。</p>}</div>; }const aiProviderPresets: Record<AiProvider, { baseUrl: string; model: string }> = {
+function ContentLibrary({ assets, onDelete }: { assets: ContentAsset[]; onDelete: (assetIds: number[]) => Promise<void> }) {
+  const completedAssets = assets.filter((asset) => Boolean(asset.current_draft_id));
+  const [selectedAssetIds, setSelectedAssetIds] = useState<number[]>([]);
+  useEffect(() => setSelectedAssetIds((current) => current.filter((assetId) => completedAssets.some((asset) => asset.id === assetId))), [assets]);
+  const toggleAsset = (assetId: number) => setSelectedAssetIds((current) => current.includes(assetId) ? current.filter((id) => id !== assetId) : [...current, assetId]);
+  const deleteSelected = async () => { if (!selectedAssetIds.length || !window.confirm(`确认删除 ${selectedAssetIds.length} 篇已完成内容及其版本吗？`)) return; await onDelete(selectedAssetIds); setSelectedAssetIds([]); };
+  if (!completedAssets.length) return <div className="content-library-empty"><strong>暂无已完成正文</strong><p>内容资产完成 AI 正文生成后才会显示在这里。可前往“内容系统”继续完成 Brief、大纲和正文。</p><NavLink className="primary" to="/content">前往内容系统</NavLink></div>;
+  return <><div className="content-library-bulk"><label><input type="checkbox" checked={selectedAssetIds.length === completedAssets.length} onChange={(event) => setSelectedAssetIds(event.target.checked ? completedAssets.map((asset) => asset.id) : [])} /> 全选已完成内容</label><button className="danger" disabled={!selectedAssetIds.length} onClick={() => void deleteSelected}>删除已选内容（{selectedAssetIds.length}）</button></div><div className="content-library-grid">{completedAssets.map((asset) => <article className={`content-library-card ${selectedAssetIds.includes(asset.id) ? "is-selected" : ""}`} key={asset.id}><div className="content-library-card-top"><label className="asset-checkbox"><input type="checkbox" checked={selectedAssetIds.includes(asset.id)} onChange={() => toggleAsset(asset.id)} aria-label={`选择 ${asset.title_snapshot}`} /></label><span className="content-completion-chip">✓ {asset.content_status_label || "内容完成"}</span><span className="content-outline-chip">✓ {asset.outline_status_label || "大纲完成"}</span></div><h3>{asset.title_snapshot}</h3><p>{asset.keyword || "—"} · {asset.locale}</p><div className="content-library-card-footer"><span>{asset.status === "completed" ? "已完成" : "已生成"}</span><div className="actions"><button className="link danger" onClick={() => void onDelete([asset.id])}>删除</button><NavLink className="primary" to={`/content-library/${asset.id}`}>阅读全文</NavLink></div></div></article>)}</div></>;
+}
+function ContentReader({ projectId }: { projectId: number | null }) {
+  const { assetId } = useParams();
+  const [detail, setDetail] = useState<ContentAssetDetail | null>(null);
+  const [readerError, setReaderError] = useState("");
+  useEffect(() => { if (projectId && assetId) { setReaderError(""); api.getContentAsset(Number(assetId), projectId).then(setDetail).catch((error: unknown) => setReaderError(error instanceof Error ? error.message : "文章读取失败。")); } }, [assetId, projectId]);
+  if (readerError) return <p className="empty">{readerError}</p>;
+  if (!detail?.current_draft) return <p className="empty">正在加载文章，或该内容尚未生成正文。</p>;
+  const draft = detail.current_draft;
+  return <article className="content-reader"><header className="content-reader-header"><NavLink to="/content-library">← 返回所有内容</NavLink><p className="eyebrow">{draft.provider || "AI"} · v{draft.version} · {draft.qa_status}</p><h1>{draft.title}</h1><p className="content-reader-description">{draft.meta_description}</p></header><article className="markdown-preview" dangerouslySetInnerHTML={{ __html: renderMarkdownPreview(draft.markdown) }} />{draft.unresolved_verify?.length ? <p className="verify-warning">待验证：{draft.unresolved_verify.join("；")}</p> : null}</article>;
+}
+function escapeHtml(value: string) { return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\"/g, "&quot;").replace(/'/g, "&#39;"); }
+function renderInlineMarkdown(value: string) { return escapeHtml(value).replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>").replace(/__(.+?)__/g, "<strong>$1</strong>"); }
+function tableCells(line: string) { return line.trim().replace(/^\|/, "").replace(/\|$/, "").split("|").map((cell) => cell.trim()); }
+function isTableDivider(line: string) { const cells = tableCells(line); return cells.length > 0 && cells.every((cell) => /^:?-{3,}:?$/.test(cell)); }
+function renderMarkdownPreview(markdown: string) {
+  const lines = markdown.replace(/\r\n?/g, "\n").split("\n");
+  const output: string[] = [];
+  const isList = (line: string) => /^[-*+]\s+/.test(line) || /^\d+[.)]\s+/.test(line);
+  const isBlockStart = (index: number) => /^#{1,3}\s+/.test(lines[index]) || isList(lines[index]) || (lines[index].includes("|") && isTableDivider(lines[index + 1] || ""));
+  for (let index = 0; index < lines.length;) {
+    const line = lines[index].trim();
+    if (!line) { index += 1; continue; }
+    const heading = line.match(/^(#{1,3})\s+(.+)$/);
+    if (heading) { const level = heading[1].length === 1 ? 2 : heading[1].length; output.push(`<h${level}>${renderInlineMarkdown(heading[2])}</h${level}>`); index += 1; continue; }
+    if (line.includes("|") && isTableDivider(lines[index + 1] || "")) {
+      const header = tableCells(line); index += 2;
+      const rows: string[][] = [];
+      while (index < lines.length && lines[index].includes("|") && lines[index].trim()) { rows.push(tableCells(lines[index])); index += 1; }
+      output.push(`<table><thead><tr>${header.map((cell) => `<th>${renderInlineMarkdown(cell)}</th>`).join("")}</tr></thead><tbody>${rows.map((row) => `<tr>${header.map((_, column) => `<td>${renderInlineMarkdown(row[column] || "")}</td>`).join("")}</tr>`).join("")}</tbody></table>`); continue;
+    }
+    if (isList(line)) {
+      const ordered = /^\d+[.)]\s+/.test(line); const pattern = ordered ? /^\d+[.)]\s+/ : /^[-*+]\s+/; const items: string[] = [];
+      while (index < lines.length && pattern.test(lines[index].trim())) { items.push(`<li>${renderInlineMarkdown(lines[index].trim().replace(pattern, ""))}</li>`); index += 1; }
+      output.push(ordered ? `<ol>${items.join("")}</ol>` : `<ul>${items.join("")}</ul>`); continue;
+    }
+    const paragraph: string[] = [line]; index += 1;
+    while (index < lines.length && lines[index].trim() && !isBlockStart(index)) { paragraph.push(lines[index].trim()); index += 1; }
+    output.push(`<p>${renderInlineMarkdown(paragraph.join(" "))}</p>`);
+  }
+  return output.join("");
+}
+function contentProviderLabel(provider: AiProvider | string | undefined) { return ({ openai: "ChatGPT", gemini: "Gemini", deepseek: "DeepSeek" } as Record<string, string>)[provider || ""] || provider || "AI"; }
+function contentStageLabel(stage: string | null | undefined) { return ({ semantic: "语义分析", title: "标题与元信息", outline: "文章大纲", section: "章节写作", assembly: "组装全文", configuration: "模型配置", preparation: "任务准备" } as Record<string, string>)[stage || ""] || stage || "生成"; }
+function ContentWorkspace({ titles, assets, projectId, onCreate, onRefresh, onDelete, contentModels }: { titles: TitleCandidate[]; assets: ContentAsset[]; projectId: number | null; onCreate: (title: TitleCandidate) => void; onRefresh: () => Promise<void>; onDelete: (assetIds: number[]) => Promise<void>; contentModels: Record<AiProvider, string> }) {
+  const available = titles.filter((title) => title.status === "selected");
+  const createdByTitle = new Map(assets.map((asset) => [asset.selected_title_candidate_id, asset]));
+  const [selectedAssetId, setSelectedAssetId] = useState<number | null>(assets[0]?.id ?? null);
+  const [selectedAssetIds, setSelectedAssetIds] = useState<number[]>([]);
+  const [detail, setDetail] = useState<ContentAssetDetail | null>(null);
+  const [loadingDetail, setLoadingDetail] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [notice, setNotice] = useState("选择一个内容资产，按 Brief → 大纲 → 正文的顺序推进；每个 H2 独立生成后再组装成长文。");
+  const [audience, setAudience] = useState("US small business owners");
+  const [goal, setGoal] = useState("commercial");
+  const [sourcesText, setSourcesText] = useState("");
+  const [selectedDraftVersion, setSelectedDraftVersion] = useState<number | null>(null);
+  const [draftView, setDraftView] = useState<"markdown" | "html">("html");
+  const [contentProvider, setContentProvider] = useState<AiProvider>("openai");
+  const contentModel = contentModels[contentProvider];
+  const [outlineRows, setOutlineRows] = useState([{ heading: "Introduction: what the reader will decide", purpose: "Answer the search need and set clear decision context", }, { heading: "How to evaluate the options", purpose: "Give practical criteria and explain trade-offs", }, { heading: "Recommended next steps", purpose: "Turn the comparison into an informed action", }]);
+
+  const loadDetail = async (assetId: number) => {
+    if (!projectId) return;
+    setSelectedAssetId(assetId); setLoadingDetail(true);
+    try {
+      const next = await api.getContentAsset(assetId, projectId);
+      setDetail(next);
+      if (next.brief) {
+        setAudience(next.brief.target_audience || ""); setGoal(next.brief.business_goal || "commercial");
+        setSourcesText((next.brief.sources || []).map((source) => typeof source === "string" ? source : JSON.stringify(source)).join("\n\n---\n\n"));
+      }
+      if (next.outline?.sections?.length) setOutlineRows(next.outline.sections.map(({ heading, purpose }) => ({ heading, purpose })));
+    } catch (error) { setNotice(error instanceof Error ? error.message : "读取内容详情失败。"); }
+    finally { setLoadingDetail(false); }
+  };
+
+  useEffect(() => {
+    if (!assets.length) { setSelectedAssetId(null); setDetail(null); return; }
+    if (!selectedAssetId || !assets.some((asset) => asset.id === selectedAssetId)) void loadDetail(assets[0].id);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [assets, projectId]);
+
+  useEffect(() => setSelectedAssetIds((current) => current.filter((assetId) => assets.some((asset) => asset.id === assetId))), [assets]);
+
+  const sourcePack = () => sourcesText.split(/\n\s*---+\s*\n/).map((item) => item.trim()).filter(Boolean).map((content, index) => { const url = content.match(/https?:\/\/[^\s]+/)?.[0] || ""; return { source_id: `source-${index + 1}`, source_type: url ? "url" : "note", url, publisher: "", published_at: "", content, availability: "provided" }; });
+  const toggleAssetSelection = (assetId: number) => setSelectedAssetIds((current) => current.includes(assetId) ? current.filter((id) => id !== assetId) : [...current, assetId]);
+  const deleteSelectedAssets = async () => { if (!selectedAssetIds.length || !window.confirm(`确认删除 ${selectedAssetIds.length} 篇内容资产及所有版本吗？`)) return; await onDelete(selectedAssetIds); setSelectedAssetIds([]); };
+
+  const saveBrief = async () => {
+    if (!detail || !projectId) return;
+    setSaving(true);
+    try {
+      const brief = await api.createContentBrief(detail.id, { project_id: projectId, target_audience: audience.trim(), business_goal: goal, sources: sourcePack() });
+      setDetail((current) => current ? { ...current, brief, current_brief_id: brief.id } : current);
+      setNotice("Brief 已保存。下一步可编辑并保存文章大纲。");
+      await onRefresh();
+    } catch (error) { setNotice(error instanceof Error ? error.message : "保存 Brief 失败。"); }
+    finally { setSaving(false); }
+  };
+
+  const saveOutline = async () => {
+    if (!detail || !projectId) return;
+    const sections = outlineRows.filter((row) => row.heading.trim()).map((row) => ({ heading: row.heading, purpose: row.purpose }));
+    if (!sections.length) { setNotice("至少保留一个大纲章节。"); return; }
+    setSaving(true);
+    try {
+      const outline = await api.createContentOutline(detail.id, { project_id: projectId, sections });
+      setDetail((current) => current ? { ...current, outline, current_outline_id: outline.id } : current);
+      setNotice("文章大纲已保存。正文生成和质量检查会基于此大纲执行。");
+      await onRefresh();
+    } catch (error) { setNotice(error instanceof Error ? error.message : "保存大纲失败。"); }
+    finally { setSaving(false); }
+  };
+
+  const generationPayload = () => ({ project_id: projectId, provider: contentProvider, target_audience: audience.trim(), business_goal: goal, sources: sourcePack() });
+  const applyGenerated = async (result: ContentGenerationResult) => {
+    if (!detail) return;
+    setDetail((current) => current ? { ...current, ...(result.asset || {}), brief: result.brief ?? current.brief, outline: result.outline ?? current.outline, current_draft: result.current_draft ?? result.draft ?? current.current_draft, drafts: result.draft ? [result.draft, ...(current.drafts || []).filter((draft) => draft.id !== result.draft?.id)] : current.drafts, generation_runs: result.generation_runs ?? result.runs ?? current.generation_runs, generation_jobs: result.generation_job ? [...(current.generation_jobs || []), result.generation_job] : current.generation_jobs } : current);
+    await loadDetail(detail.id);
+    await onRefresh();
+  };
+  const generateStage = async (stageName: "brief" | "outline" | "draft" | "all") => {
+    if (!detail || !projectId) return;
+    setSaving(true); setNotice(`${contentProviderLabel(contentProvider)}（${contentModel}）正在严格执行${stageName === "all" ? (detail.brief ? "大纲与全文" : "Brief、大纲与全文") : `内容${stageName === "brief" ? " Brief" : stageName === "outline" ? "大纲" : "正文"}`}；每个 H2 独立写作后再组装，失败不会切换其他模型…`);
+    try {
+      const action = stageName === "brief" ? api.generateContentBrief : stageName === "outline" ? api.generateContentOutline : stageName === "draft" ? api.generateContentDraft : api.generateContent;
+      const result = await action(detail.id, generationPayload());
+      await applyGenerated(result);
+      setNotice(`${contentProviderLabel(contentProvider)} 已完成本次任务并保存；可在执行日志查看每个阶段。`);
+    } catch (error) { setNotice(error instanceof Error ? error.message : `${contentProviderLabel(contentProvider)} 生成失败；未切换其他模型。`); await loadDetail(detail.id); await onRefresh(); }
+    finally { setSaving(false); }
+  };
+
+  const displayedDraft = detail?.drafts?.find((draft) => draft.version === selectedDraftVersion) || detail?.current_draft;
+  const stage = detail?.current_draft ? 3 : detail?.outline ? 2 : detail?.brief ? 1 : 1;
+  const stages = ["内容 Brief", "文章大纲", "正文版本"];
+  return <div className="content-workspace" id="content-workspace">
+    <div className="content-workspace-header"><div><p className="eyebrow">Production Workspace</p><h3>内容工作流</h3><p>保留每一步输入与版本；没有来源支撑的事实在生成时会标记为 <code>[VERIFY]</code>。</p></div><div className="content-workspace-actions"><Select label="内容模型" value={contentProvider} onChange={(value) => setContentProvider(value as AiProvider)} options={[["openai", "ChatGPT"], ["gemini", "Gemini"], ["deepseek", "DeepSeek"]]} /><span className="content-provider-lock">本次严格使用：<strong>{contentProviderLabel(contentProvider)}</strong><small>{contentModel}</small></span><button onClick={() => void onRefresh()}>刷新资产</button><NavLink className="link" to="/title-library">管理标题库</NavLink></div></div>
+    <p className="content-notice">{notice}</p>
+    {assets.length ? <section className="content-workspace-bulk"><div><strong>资产批量操作</strong><span>已选 {selectedAssetIds.length} / {assets.length}</span></div><div className="content-workspace-selection">{assets.map((asset) => <label key={asset.id}><input type="checkbox" checked={selectedAssetIds.includes(asset.id)} onChange={() => toggleAssetSelection(asset.id)} /> <span>{asset.current_draft_id ? "正文完成" : asset.current_outline_id ? "大纲完成" : asset.current_brief_id ? "Brief 完成" : "待开始"}</span>{asset.title_snapshot}</label>)}</div><div className="actions"><button onClick={() => setSelectedAssetIds(selectedAssetIds.length === assets.length ? [] : assets.map((asset) => asset.id))}>{selectedAssetIds.length === assets.length ? "取消全选" : "全选资产"}</button><button className="danger" disabled={!selectedAssetIds.length} onClick={() => void deleteSelectedAssets}>删除已选内容</button></div></section> : null}
+    <div className="content-layout">
+      <aside className="content-asset-list" id="content-asset-list"><div className="content-list-heading"><strong>内容资产</strong><span>{assets.length}</span></div>{assets.length ? assets.map((asset) => <article className={`content-asset-card ${asset.id === selectedAssetId ? "is-active" : ""} ${asset.current_draft_id ? "is-complete" : asset.current_outline_id ? "is-outline-ready" : asset.current_brief_id ? "is-brief-ready" : "is-pending"}`} key={asset.id}><button type="button" className="content-asset-open" onClick={() => void loadDetail(asset.id)}><span className="content-asset-status">{asset.content_status_label || (asset.current_draft_id ? "内容完成" : asset.current_outline_id ? "大纲完成" : asset.current_brief_id ? "Brief 完成" : "待生成")}</span><strong>{asset.title_snapshot}</strong><small>{asset.keyword || "—"} · {asset.locale}</small></button><button type="button" className="content-asset-delete" aria-label={`删除 ${asset.title_snapshot}`} title="删除内容资产" onClick={(event) => { event.stopPropagation(); void onDelete([asset.id]); }}>×</button></article>) : <p className="empty">尚未创建内容资产。</p>}<div className="content-list-divider" /><strong className="content-list-label">已选标题</strong>{available.length ? available.map((title) => { const asset = createdByTitle.get(title.id); return <article className="content-title-entry" key={title.id}><ProviderBadge reason={title.reason} /><strong>{title.title}</strong>{asset ? <button onClick={() => void loadDetail(asset.id)}>打开</button> : <button className="primary" onClick={() => onCreate(title)}>创建</button>}</article>; }) : <p className="empty">请先在标题库选定标题。</p>}</aside>
+      <section className="content-editor-area">{loadingDetail ? <p className="empty">正在读取内容详情…</p> : !detail ? <div className="content-empty-state"><strong>从标题库选择一个标题开始</strong><p>创建内容资产后，所有 Brief、大纲、正文和审核结果都会在这里集中保存。</p></div> : <>
+        <div className="content-hero"><div><span className="content-kicker">{detail.content_type} · {detail.locale}</span><h3>{detail.title_snapshot}</h3><p>核心关键词：<strong>{detail.keyword || "—"}</strong></p></div><span className="tag">{detail.status === "planned" ? "规划中" : detail.status}</span></div>
+        <ol className="content-stage-rail">{stages.map((item, index) => <li className={`content-stage-step ${index + 1 < stage ? "is-complete" : index + 1 === stage ? "is-current" : ""}`} key={item}><span>{index + 1}</span><strong>{item}</strong><small>{index + 1 < stage ? "已保存" : index + 1 === stage ? "当前步骤" : "等待前序"}</small></li>)}</ol>
+        <section className="content-editor-card" id="content-brief"><div className="content-card-heading"><div><span>01</span><div><h4>内容 Brief</h4><p>定义受众、业务目标和可验证资料；它是后续 AI 写作的事实边界。</p></div></div><span className={detail.brief ? "stage-state done" : "stage-state"}>{detail.brief ? "已保存" : "待填写"}</span></div><div className="content-brief-grid"><Input label="目标读者" value={audience} onChange={setAudience} /><Select label="业务目标" value={goal} onChange={setGoal} options={[["informational", "信息型内容"], ["commercial", "商业调研 / 对比"], ["lead-generation", "获客 / 线索"]]} /><label className="content-source-field">多篇文章 / URL / 研究资料（每篇文章之间用 --- 分隔，可粘贴全文）<textarea value={sourcesText} onChange={(event) => setSourcesText(event.target.value)} placeholder="【来源 1：官方文章】&#10;粘贴 URL 或全文…&#10;&#10;【来源 2：同行文章/笔记】&#10;粘贴 URL 或全文…" /></label></div><div className="content-card-footer"><span>{sourcesText.trim() ? "将把资料作为可引用事实来源。" : "未添加资料：正文中的具体事实将标记为 [VERIFY]。"}</span><div className="actions"><button disabled={saving} onClick={() => void saveBrief}>人工保存</button><button className="primary" disabled={saving} onClick={() => void generateStage("brief")}>AI 生成 Brief</button></div></div></section>
+        <section className={`content-editor-card ${!detail.brief ? "is-locked" : ""}`} id="content-outline"><div className="content-card-heading"><div><span>02</span><div><h4>文章大纲</h4><p>每个 H2 只解决一个决策问题；比较类内容在正文阶段需要输出带来源列的表格。</p></div></div><span className={detail.outline ? "stage-state done" : "stage-state"}>{detail.outline ? "已保存" : "待编辑"}</span></div><div className="outline-table"><div className="outline-row outline-head"><span>章节标题</span><span>章节任务</span><span /></div>{outlineRows.map((row, index) => <div className="outline-row" key={`${row.heading}-${index}`}><input aria-label={`章节标题 ${index + 1}`} value={row.heading} onChange={(event) => setOutlineRows((current) => current.map((item, rowIndex) => rowIndex === index ? { ...item, heading: event.target.value } : item))} disabled={!detail.brief} /><input aria-label={`章节任务 ${index + 1}`} value={row.purpose} onChange={(event) => setOutlineRows((current) => current.map((item, rowIndex) => rowIndex === index ? { ...item, purpose: event.target.value } : item))} disabled={!detail.brief} /><button className="link danger" disabled={!detail.brief || outlineRows.length <= 1} onClick={() => setOutlineRows((current) => current.filter((_, rowIndex) => rowIndex !== index))}>移除</button></div>)}</div><div className="content-card-footer"><button disabled={!detail.brief} onClick={() => setOutlineRows((current) => [...current, { heading: "New section", purpose: "Add a distinct reader decision" }])}>添加章节</button><div className="actions"><button disabled={!detail.brief || saving} onClick={() => void saveOutline}>人工保存</button><button className="primary" disabled={!detail.brief || saving} onClick={() => void generateStage("outline")}>AI 生成大纲</button></div></div></section>
+        <section className={`content-editor-card content-future-card ${!detail.outline ? "is-locked" : ""}`} id="content-draft"><div className="content-card-heading"><div><span>03</span><div><h4>正文版本</h4><p>每个 H2 独立写成一篇完整章节，再按大纲组装为一篇长文，并保留可回滚的版本历史。</p></div></div><span className="stage-state">{detail.current_draft ? `版本 v${displayedDraft!.version}` : detail.outline ? "准备生成" : "需先保存大纲"}</span></div>{displayedDraft ? <><div className="draft-switcher"><Select label="版本" value={String(selectedDraftVersion || displayedDraft!.version)} onChange={(value) => setSelectedDraftVersion(Number(value))} options={(detail.drafts || []).slice().reverse().map((draft) => [String(draft.version), `v${draft.version} · ${draft.provider || "AI"}`])} /><div className="actions"><button className={draftView === "markdown" ? "primary" : ""} onClick={() => setDraftView("markdown")}>Markdown 源码</button><button className={draftView === "html" ? "primary" : ""} onClick={() => setDraftView("html")}>HTML 预览</button></div></div><div className="content-draft-preview"><div><strong>{displayedDraft!.title}</strong><p>{displayedDraft!.meta_description}</p></div>{draftView === "markdown" ? <pre>{displayedDraft!.markdown}</pre> : <article className="markdown-preview" dangerouslySetInnerHTML={{ __html: renderMarkdownPreview(displayedDraft!.markdown) }} />}<div className="draft-meta"><span>版本 v{displayedDraft!.version}</span><span>{displayedDraft!.provider || contentProvider}</span><span>{displayedDraft!.model || "已保存"}</span></div></div></> : <div className="future-grid"><div><strong>H2 分段生成</strong><p>每个 H2 仅发送本章 Brief 与相关资料，独立完成后再组装，避免重复与无来源编造。</p></div><div><strong>多模型任务</strong><p>内容模型将读取 AI 配置；每次生成都会记录模型、时间和版本。</p></div></div>}<div className="content-card-footer"><span>{detail.brief ? "一键生成将自动完成大纲、每个 H2 的独立章节和全文组装，并保留当前 Brief。" : "一键生成会先创建 Brief，再自动完成大纲、每个 H2 章节和全文组装。"}</span><div className="actions"><button disabled={saving} onClick={() => void generateStage("all")}>一键生成大纲和全文</button><button className="primary" disabled={!detail.outline || saving} onClick={() => void generateStage("draft")}>{detail.current_draft ? "生成新版本" : "AI 生成正文"}</button></div></div></section>
+        <section className="content-generation-log" aria-label="模型执行日志"><div><p className="eyebrow">Model Audit</p><h4>模型执行日志</h4></div>{(detail.generation_jobs || []).slice().reverse().slice(0, 5).map((job) => <article className={`generation-job ${job.status}`} key={job.id}><div><strong>{contentProviderLabel(job.provider)} · {job.model || "未记录模型"}</strong><span>{job.status === "completed" ? "已完成" : job.status === "failed" ? `${contentStageLabel(job.failed_stage)}失败` : "执行中"}</span></div><small>{(detail.generation_runs || []).filter((run) => run.generation_job_id === job.id).map((run) => `${contentStageLabel(run.stage)} ${run.status === "completed" ? "✓" : "×"}`).join(" · ") || "任务尚未写入阶段日志"}</small>{job.error_summary ? <p>{job.error_summary}</p> : null}</article>)}</section>
+      </>}</section>
+    </div>
+  </div>;
+}
+const aiProviderPresets: Record<AiProvider, { baseUrl: string; model: string }> = {
   openai: { baseUrl: "https://api.openai.com/v1", model: "gpt-5.5" },
   gemini: { baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", model: "gemini-2.5-flash" },
   deepseek: { baseUrl: "https://api.deepseek.com", model: "deepseek-v4-pro" },
@@ -67,6 +229,7 @@ function Workspace() {
   const [titleCandidates, setTitleCandidates] = useState<TitleCandidate[]>([]);
   const [titleLibrary, setTitleLibrary] = useState<TitleCandidate[]>([]);
   const [contentAssets, setContentAssets] = useState<ContentAsset[]>([]);
+  const [contentLibraryAssets, setContentLibraryAssets] = useState<ContentAsset[]>([]);
   const [contentStatus, setContentStatus] = useState("从标题库选择已选定标题，创建内容 Brief 和大纲。");
   const [titleStatus, setTitleStatus] = useState("从关键词库选择一个已审核关键词，生成美国市场 SEO 标题。");
   const [titleType, setTitleType] = useState("auto");
@@ -98,18 +261,22 @@ function Workspace() {
           setProjectId(activeProjectId);
         }
       }
-      const settings = await api.getAiSettings();
-      setAiProfiles((current) => (Object.keys(aiProviderPresets) as AiProvider[]).reduce((profiles, provider) => {
-        const saved = settings.providers?.[provider];
-        profiles[provider] = { baseUrl: saved?.base_url || current[provider].baseUrl, model: saved?.model || current[provider].model, apiKey: "" };
-        return profiles;
-      }, {} as Record<AiProvider, AiProfile>));
-      setAiConfigured((Object.keys(aiProviderPresets) as AiProvider[]).reduce((profiles, provider) => ({ ...profiles, [provider]: Boolean(settings.providers?.[provider]?.configured) }), {} as Record<AiProvider, boolean>));
-      if (settings.assignments?.keyword_review && settings.assignments?.title_generation) setAiAssignments(settings.assignments as AiAssignments);
-      setAiStatus(settings.configured ? `已配置：${settings.provider || "兼容接口"}` : "尚未配置 AI 接口。");
-      if (activeProjectId) await Promise.all([loadLibrary(activeProjectId), loadTitleLibrary(activeProjectId), loadContentAssets(activeProjectId)]);
+      try {
+        const settings = await api.getAiSettings();
+        setAiProfiles((current) => (Object.keys(aiProviderPresets) as AiProvider[]).reduce((profiles, provider) => {
+          const saved = settings.providers?.[provider];
+          profiles[provider] = { baseUrl: saved?.base_url || current[provider].baseUrl, model: saved?.model || current[provider].model, apiKey: "" };
+          return profiles;
+        }, {} as Record<AiProvider, AiProfile>));
+        setAiConfigured((Object.keys(aiProviderPresets) as AiProvider[]).reduce((profiles, provider) => ({ ...profiles, [provider]: Boolean(settings.providers?.[provider]?.configured) }), {} as Record<AiProvider, boolean>));
+        if (settings.assignments?.keyword_review && settings.assignments?.title_generation) setAiAssignments(settings.assignments as AiAssignments);
+        setAiStatus(settings.configured ? `已配置：${settings.provider || "兼容接口"}` : "尚未配置 AI 接口。");
+      } catch (error) {
+        setAiStatus(error instanceof Error ? `AI 配置读取失败：${error.message}` : "AI 配置读取失败。");
+      }
+      if (activeProjectId) await Promise.allSettled([loadLibrary(activeProjectId), loadTitleLibrary(activeProjectId), loadContentAssets(activeProjectId), loadContentLibrary(activeProjectId)]);
     };
-    restoreProjectAndAssets().catch(() => { localStorage.removeItem(projectKey); setProjectId(null); });
+    restoreProjectAndAssets().catch(() => setAiStatus("项目初始化失败；请刷新后重试。"));
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -132,12 +299,22 @@ function Workspace() {
     setTitleLibrary(await api.listTitleLibrary(id));
   };
   const loadContentAssets = async (id = projectId) => { if (id) setContentAssets(await api.listContentAssets(id)); };
+  const loadContentLibrary = async (id = projectId) => { if (id) setContentLibraryAssets(await api.listContentLibrary(id)); };
+  const refreshContentData = async (id = projectId) => { await Promise.all([loadContentAssets(id), loadContentLibrary(id)]); };
+  const deleteContentAssets = async (assetIds: number[]) => {
+    if (!projectId || !assetIds.length) return;
+    try {
+      const result = await api.deleteContentAssets({ project_id: projectId, content_asset_ids: assetIds });
+      setContentStatus(`已删除 ${result.deleted} 篇内容资产及其关联版本。`);
+      await refreshContentData();
+    } catch (error) { setContentStatus(error instanceof Error ? error.message : "删除内容失败。"); }
+  };
   const createContentFromTitle = async (title: TitleCandidate) => {
     if (!projectId) return;
     try {
       const asset = await api.createContentAsset({ project_id: projectId, selected_title_candidate_id: title.id, content_type: "guide" });
       setContentStatus(`已创建内容：${asset.title_snapshot}`);
-      await loadContentAssets();
+      await refreshContentData();
       navigate("/content");
     } catch (error) { setContentStatus(error instanceof Error ? error.message : "创建内容失败。"); navigate("/content"); }
   };
@@ -317,6 +494,14 @@ function Workspace() {
       setTitleStatus(error instanceof Error ? error.message : "删除标题候选失败。");
     }
   };
+  const deleteTitleLibraryCandidates = async (candidateIds: number[]) => {
+    if (!projectId || !candidateIds.length) return;
+    try {
+      await api.deleteTitleCandidates({ project_id: projectId, candidate_ids: candidateIds });
+      await Promise.all([loadTitleLibrary(), loadLibrary()]);
+      setTitleStatus(`已删除 ${candidateIds.length} 条标题候选。`);
+    } catch (error) { setTitleStatus(error instanceof Error ? error.message : "删除标题失败。"); }
+  };
 
   const expand = async () => {
     const seeds = seedsText.split(/\r?\n/).map((value) => value.trim()).filter(Boolean);
@@ -430,7 +615,7 @@ function Workspace() {
   const setScoreField = (key: keyof ScoreInputs, value: string) => setScoreInputs((current) => ({ ...current, [key]: value }));
 
   return <main className="app-shell">
-    <aside className="sidebar"><div className="brand"><span>SEO</span><small>Keyword Intelligence</small></div><nav><NavLink to="/research" className={({ isActive }) => isActive ? "active" : ""}>关键词挖掘</NavLink><NavLink to="/keywords" className={({ isActive }) => isActive ? "active" : ""}>关键词库</NavLink><NavLink to="/titles" className={({ isActive }) => isActive ? "active" : ""}>SEO 标题</NavLink><NavLink to="/title-library" className={({ isActive }) => isActive ? "active" : ""}>标题库</NavLink><NavLink to="/content" className={({ isActive }) => isActive ? "active" : ""}>内容系统</NavLink><NavLink to="/scoring" className={({ isActive }) => isActive ? "active" : ""}>SEO 评分</NavLink><NavLink to="/settings" className={({ isActive }) => isActive ? "active" : ""}>AI 配置</NavLink></nav><p className="connection">● 本地工作台已连接</p></aside>
+    <aside className="sidebar"><div className="brand"><span>SEO</span><small>Keyword Intelligence</small></div><nav><NavLink to="/research" className={({ isActive }) => isActive ? "active" : ""}>关键词挖掘</NavLink><NavLink to="/keywords" className={({ isActive }) => isActive ? "active" : ""}>关键词库</NavLink><NavLink to="/titles" className={({ isActive }) => isActive ? "active" : ""}>SEO 标题</NavLink><NavLink to="/title-library" className={({ isActive }) => isActive ? "active" : ""}>标题库</NavLink><NavLink to="/content" className={({ isActive }) => isActive ? "active" : ""}>内容系统</NavLink><NavLink to="/content-library" className={({ isActive }) => isActive ? "active" : ""}>所有内容</NavLink><NavLink to="/scoring" className={({ isActive }) => isActive ? "active" : ""}>SEO 评分</NavLink><NavLink to="/settings" className={({ isActive }) => isActive ? "active" : ""}>AI 配置</NavLink></nav><p className="connection">● 本地工作台已连接</p></aside>
     <section className="workspace">
       <header><div><p className="eyebrow">SEO 中控系统</p><h1>关键词工作台</h1><p>挖掘、审核、分类、入库和机会评估。</p></div><span className="project-chip">项目：{projectId ? `#${projectId}` : "未创建"}</span></header>
 
@@ -461,7 +646,12 @@ function Workspace() {
           <div className="manual-title"><Input label="人工补充标题" value={manualTitle} onChange={setManualTitle} /><button onClick={addManualTitle}>加入候选</button></div></>}</section>
       </>} />
 
-      <Route path="/content" element={<section className="panel" id="content-system"><PanelTitle eyebrow="Content System" title="内容系统" tag={`${contentAssets.length} 篇内容`} /><p className="hint">从已选标题建立内容资产。基础版先保存 Brief 和人工大纲；AI 分段写作与审核将在下一步接入。</p><p className="tag">{contentStatus}</p><ContentAssets titles={titleLibrary} assets={contentAssets} onCreate={createContentFromTitle} /></section>} />`r`n`r`n      <Route path="/title-library" element={<section className="panel" id="title-library"><PanelTitle eyebrow="Content Assets" title="标题库" tag={`${titleLibrary.length} 条标题`} /><p className="hint">每次 AI 或人工生成的标题都会自动保存到这里；“已选定”代表该关键词当前唯一可进入后续内容流程的标题。</p><div className="actions"><button onClick={() => loadTitleLibrary().catch((error) => setTitleStatus(error.message))}>刷新标题库</button></div><TitleLibrary titles={titleLibrary} onCreateContent={createContentFromTitle} onSelectTitle={selectLibraryTitle} /></section>} />
+      <Route path="/content-library/:assetId" element={<section className="panel content-reader-panel"><ContentReader projectId={projectId} /></section>} />
+      <Route path="/content-library" element={<section className="panel" id="content-library"><PanelTitle eyebrow="Content Library" title="所有内容" tag={`${contentLibraryAssets.length} 篇已完成`} /><p className="hint">这里只显示后端确认已生成正文的内容；点击阅读全文查看版本化保存的完整文章。</p><ContentLibrary assets={contentLibraryAssets} onDelete={deleteContentAssets} /></section>} />
+
+      <Route path="/content" element={<section className="panel content-system-panel" id="content-system"><PanelTitle eyebrow="Content System" title="内容系统" tag={`${contentAssets.length} 篇内容`} /><p className="hint">从已选标题建立内容资产，以 Brief → 大纲 → 每个 H2 独立生成 → 长文组装的工作流生成可追溯的 SEO 内容。</p><p className="tag">{contentStatus}</p><ContentWorkspace titles={titleLibrary} assets={contentAssets} projectId={projectId} onCreate={createContentFromTitle} onRefresh={refreshContentData} onDelete={deleteContentAssets} contentModels={{ openai: aiProfiles.openai.model, gemini: aiProfiles.gemini.model, deepseek: aiProfiles.deepseek.model }} /></section>} />
+
+      <Route path="/title-library" element={<section className="panel" id="title-library"><PanelTitle eyebrow="Content Assets" title="标题库" tag={`${titleLibrary.length} 条标题`} /><p className="hint">每次 AI 或人工生成的标题都会自动保存到这里；“已选定”代表该关键词当前唯一可进入后续内容流程的标题。</p><div className="actions"><button onClick={() => loadTitleLibrary().catch((error) => setTitleStatus(error.message))}>刷新标题库</button></div><TitleLibrary titles={titleLibrary} onCreateContent={createContentFromTitle} onSelectTitle={selectLibraryTitle} onDelete={deleteTitleLibraryCandidates} /></section>} />
 
       <Route path="/settings" element={<section className="panel" id="ai-settings"><PanelTitle eyebrow="Multi Provider" title="AI 配置" tag={aiStatus} /><p className="hint">三套配置独立保存、独立测试。下方可为关键词审核和标题生成分别指定提供商；后续模块会继续复用这些配置。</p><div className="provider-grid"><ProviderCard provider="openai" title="ChatGPT（OpenAI）" profile={aiProfiles.openai} configured={aiConfigured.openai} onChange={updateAiProfile} onTest={testAiSettings} onSave={saveAiProvider} /><ProviderCard provider="gemini" title="Gemini（Google）" profile={aiProfiles.gemini} configured={aiConfigured.gemini} onChange={updateAiProfile} onTest={testAiSettings} onSave={saveAiProvider} /><ProviderCard provider="deepseek" title="DeepSeek" profile={aiProfiles.deepseek} configured={aiConfigured.deepseek} onChange={updateAiProfile} onTest={testAiSettings} onSave={saveAiProvider} /></div><section className="assignment-panel"><div><strong>功能使用分配</strong><p>每个功能只使用此处选定的 AI；不会因为配置其他服务而自动切换。</p></div><div className="assignment-controls"><Select label="关键词审核" value={aiAssignments.keyword_review} onChange={(value) => setAiAssignments((current) => ({ ...current, keyword_review: value as AiProvider }))} options={[["openai", "ChatGPT"], ["gemini", "Gemini"], ["deepseek", "DeepSeek"]]} /><Select label="标题生成" value={aiAssignments.title_generation} onChange={(value) => setAiAssignments((current) => ({ ...current, title_generation: value as AiProvider }))} options={[["openai", "ChatGPT"], ["gemini", "Gemini"], ["deepseek", "DeepSeek"]]} /></div><div className="actions"><button onClick={saveAiAssignments}>保存功能分配</button></div></section></section>} />
 
@@ -481,7 +671,16 @@ function Input({ label, value, onChange, type = "text" }: { label: string; value
 function ProviderCard({ provider, title, profile, configured, onChange, onTest, onSave }: { provider: AiProvider; title: string; profile: AiProfile; configured: boolean; onChange: (provider: AiProvider, field: keyof AiProfile, value: string) => void; onTest: (provider: AiProvider) => void; onSave: (provider: AiProvider) => void }) { return <article className="provider-card"><div className="provider-card-title"><div><p className="eyebrow">独立 AI 配置</p><h3>{title}</h3></div><span className="tag">{profile.apiKey ? "待保存新 Key" : configured ? "已保存" : "待配置"}</span></div><Input label="兼容接口地址" value={profile.baseUrl} onChange={(value) => onChange(provider, "baseUrl", value)} /><Input label="模型名称" value={profile.model} onChange={(value) => onChange(provider, "model", value)} /><label>API Key<input type="password" value={profile.apiKey} onChange={(event) => onChange(provider, "apiKey", event.target.value)} placeholder="留空则保留已保存的 Key" autoComplete="off" /></label><div className="actions"><button className="primary" onClick={() => onSave(provider)}>保存 {title}</button><button onClick={() => onTest(provider)}>测试 {title}</button></div></article>; }
 function Results({ run, reviews }: { run: RunState; reviews: Record<string, Review> }) { if (!run) return <p className="empty">输入种子词并开始扩展后，结果会显示在这里。</p>; return <div className="table-wrap"><table><thead><tr><th>关键词</th><th>意图</th><th>分类</th><th>需求预估</th><th>SEO 审核</th></tr></thead><tbody id="suggest-keyword-table-body">{run.result.keywords.map((keyword) => { const review = reviews[keyword]; return <tr key={keyword}><td><strong>{keyword}</strong></td><td>{readableIntent(review?.search_intent)}</td><td>{review ? categoryOf(keyword, review) : "待审核"}</td><td>{demandEstimate(keyword)}/100</td><td>{review ? (review.is_seo_content_fit && review.same_topic_as_seed ? "适合" : "需人工确认") : "待审核"}</td></tr>; })}</tbody></table></div>; }
 function Library({ keywords, onDelete, onOpenTitles }: { keywords: LibraryKeyword[]; onDelete: (id: number) => void; onOpenTitles: (keyword: LibraryKeyword) => void }) { if (!keywords.length) return <p className="empty">当前项目还没有保存关键词。</p>; return <div className="table-wrap"><table><thead><tr><th>关键词</th><th>分类</th><th>意图</th><th>需求预估</th><th>真实 VOL</th><th>标题</th><th>操作</th></tr></thead><tbody>{keywords.map((keyword) => <tr key={keyword.id}><td><strong>{keyword.keyword}</strong></td><td>{keyword.category || "未分类"}</td><td>{readableIntent(keyword.search_intent || undefined)}</td><td>{keyword.demand_estimate ?? "—"}/100</td><td>{keyword.search_volume ?? "待 Ads"}</td><td>{keyword.selected_title || (keyword.title_candidate_count ? `待选择（${keyword.title_candidate_count}）` : "未生成")}</td><td><div className="actions"><button id="open-title-workspace" className="link" disabled={keyword.is_seo_content_fit !== 1} onClick={() => onOpenTitles(keyword)}>生成标题</button><button className="link danger" onClick={() => onDelete(keyword.id)}>删除</button></div></td></tr>)}</tbody></table></div>; }
-function TitleLibrary({ titles, onCreateContent, onSelectTitle }: { titles: TitleCandidate[]; onCreateContent: (title: TitleCandidate) => void; onSelectTitle: (title: TitleCandidate) => void }) { if (!titles.length) return <p className="empty">还没有已保存标题。请先从关键词库生成标题。</p>; return <div className="table-wrap"><table><thead><tr><th>标题</th><th>关联关键词</th><th>来源</th><th>质量分</th><th>状态</th><th>操作</th></tr></thead><tbody>{titles.map((title) => <tr key={title.id}><td><strong>{title.title}</strong></td><td>{title.keyword || "—"}</td><td>{title.source_type === "ai" ? <ProviderBadge reason={title.reason} /> : <span className="provider-badge provider-manual">人工录入</span>}</td><td>{title.quality_score}/100</td><td>{title.status === "selected" ? "已选定" : title.status === "candidate" ? "待选择" : "未选定"}</td><td><div className="actions">{title.status === "selected" ? <button className="primary" onClick={() => onCreateContent(title)}>加入内容生成</button> : <button onClick={() => onSelectTitle(title)}>选定标题</button>}</div></td></tr>)}</tbody></table></div>; }function ProviderBadge({ reason }: { reason: string | null }) { return <span className={`provider-badge provider-${providerKey(reason)}`}>{providerLabel(reason)}</span>; }
+function TitleLibrary({ titles, onCreateContent, onSelectTitle, onDelete }: { titles: TitleCandidate[]; onCreateContent: (title: TitleCandidate) => void; onSelectTitle: (title: TitleCandidate) => void; onDelete: (candidateIds: number[]) => Promise<void> }) {
+  const removableTitles = titles.filter((title) => title.status !== "selected");
+  const [selectedTitleIds, setSelectedTitleIds] = useState<number[]>([]);
+  useEffect(() => setSelectedTitleIds((current) => current.filter((titleId) => removableTitles.some((title) => title.id === titleId))), [titles]);
+  const toggleTitle = (titleId: number) => setSelectedTitleIds((current) => current.includes(titleId) ? current.filter((id) => id !== titleId) : [...current, titleId]);
+  const deleteSelected = async () => { if (!selectedTitleIds.length || !window.confirm(`确认删除 ${selectedTitleIds.length} 条未选定标题吗？`)) return; await onDelete(selectedTitleIds); setSelectedTitleIds([]); };
+  if (!titles.length) return <p className="empty">还没有已保存标题。请先从关键词库生成标题。</p>;
+  return <><div className="title-library-bulk"><label><input type="checkbox" checked={removableTitles.length > 0 && selectedTitleIds.length === removableTitles.length} onChange={(event) => setSelectedTitleIds(event.target.checked ? removableTitles.map((title) => title.id) : [])} /> 全选可删除标题</label><button className="danger" disabled={!selectedTitleIds.length} onClick={() => void deleteSelected}>批量删除标题（{selectedTitleIds.length}）</button><span>已选定标题不可删除</span></div><div className="table-wrap"><table><thead><tr><th>选择</th><th>标题</th><th>关联关键词</th><th>来源</th><th>质量分</th><th>状态</th><th>操作</th></tr></thead><tbody>{titles.map((title) => <tr key={title.id}><td>{title.status === "selected" ? <span className="locked-title" title="已选定标题不可删除">锁定</span> : <input type="checkbox" checked={selectedTitleIds.includes(title.id)} onChange={() => toggleTitle(title.id)} aria-label={`选择 ${title.title}`} />}</td><td><strong>{title.title}</strong></td><td>{title.keyword || "—"}</td><td>{title.source_type === "ai" ? <ProviderBadge reason={title.reason} /> : <span className="provider-badge provider-manual">人工录入</span>}</td><td>{title.quality_score}/100</td><td>{title.status === "selected" ? "已选定" : title.status === "candidate" ? "待选择" : "未选定"}</td><td><div className="actions">{title.status === "selected" ? <button className="primary" onClick={() => onCreateContent(title)}>加入内容生成</button> : <><button onClick={() => onSelectTitle(title)}>选定标题</button><button className="link danger" onClick={() => void onDelete([title.id])}>删除</button></>}</div></td></tr>)}</tbody></table></div></>;
+}
+function ProviderBadge({ reason }: { reason: string | null }) { return <span className={`provider-badge provider-${providerKey(reason)}`}>{providerLabel(reason)}</span>; }
 function providerKey(reason: string | null) { const provider = reason?.match(/^\[(ChatGPT|Gemini|DeepSeek)\]/)?.[1]; return ({ ChatGPT: "chatgpt", Gemini: "gemini", DeepSeek: "deepseek" } as Record<string, string>)[provider || ""] || "ai"; }
 function providerLabel(reason: string | null) { const provider = reason?.match(/^\[(ChatGPT|Gemini|DeepSeek)\]/)?.[1]; return provider ? `${provider} 生成` : "AI 生成"; }
 function readableLevel(level: string) { return ({ low: "低竞争", medium: "中等竞争", high: "高竞争", very_high: "很高竞争" } as Record<string, string>)[level] || level; }

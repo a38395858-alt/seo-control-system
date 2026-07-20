@@ -319,6 +319,108 @@ _MIGRATIONS: tuple[Migration, ...] = (
             "CREATE INDEX IF NOT EXISTS idx_content_assets_project ON content_assets(project_id, deleted_at, updated_at DESC)",
         ),
     ),
+    (
+        6,
+        "staged AI content generation and version history",
+        (
+            "ALTER TABLE content_assets ADD COLUMN current_draft_id INTEGER",
+            "ALTER TABLE content_assets ADD COLUMN current_generation_run_id INTEGER",
+            """
+            CREATE TABLE IF NOT EXISTS content_generation_runs (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                content_asset_id INTEGER NOT NULL,
+                stage TEXT NOT NULL CHECK(stage IN ('semantic','title','outline','section','assembly','qa')),
+                provider TEXT NOT NULL,
+                model TEXT,
+                status TEXT NOT NULL DEFAULT 'running' CHECK(status IN ('running','completed','failed')),
+                input_json TEXT NOT NULL DEFAULT '{}',
+                output_json TEXT,
+                error_summary TEXT,
+                prompt_version TEXT NOT NULL DEFAULT 'content_synthesis_v1',
+                started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                completed_at TEXT,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY(content_asset_id) REFERENCES content_assets(id) ON DELETE CASCADE
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS content_drafts (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                content_asset_id INTEGER NOT NULL,
+                outline_id INTEGER,
+                generation_run_id INTEGER,
+                version INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                meta_description TEXT,
+                markdown TEXT NOT NULL,
+                sources_used_json TEXT NOT NULL DEFAULT '[]',
+                unresolved_verify_json TEXT NOT NULL DEFAULT '[]',
+                qa_json TEXT NOT NULL DEFAULT '{}',
+                qa_status TEXT NOT NULL DEFAULT 'needs_verification',
+                status TEXT NOT NULL DEFAULT 'draft',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY(content_asset_id) REFERENCES content_assets(id) ON DELETE CASCADE,
+                FOREIGN KEY(outline_id) REFERENCES content_outlines(id) ON DELETE SET NULL,
+                FOREIGN KEY(generation_run_id) REFERENCES content_generation_runs(id) ON DELETE SET NULL,
+                UNIQUE(content_asset_id, version)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_content_runs_asset ON content_generation_runs(content_asset_id, id DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_content_drafts_asset ON content_drafts(content_asset_id, version DESC)",
+        ),
+    ),
+    (
+        7,
+        "content draft provider audit fields",
+        (
+            "ALTER TABLE content_drafts ADD COLUMN provider TEXT NOT NULL DEFAULT 'unknown'",
+            "ALTER TABLE content_drafts ADD COLUMN model TEXT",
+        ),
+    ),
+    (
+        8,
+        "backfill completed content workflow status",
+        (
+            "UPDATE content_assets SET status='needs_revision', updated_at=CURRENT_TIMESTAMP WHERE current_draft_id IS NOT NULL AND status IN ('planned','briefing','outlining','drafting')",
+        ),
+    ),
+    (
+        9,
+        "content generation provider lock jobs",
+        (
+            """
+            CREATE TABLE IF NOT EXISTS content_generation_jobs (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                content_asset_id INTEGER NOT NULL,
+                requested_action TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                model TEXT,
+                status TEXT NOT NULL DEFAULT 'running' CHECK(status IN ('running','completed','failed')),
+                failed_stage TEXT,
+                error_summary TEXT,
+                started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                completed_at TEXT,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY(content_asset_id) REFERENCES content_assets(id) ON DELETE CASCADE
+            )
+            """,
+            "ALTER TABLE content_generation_runs ADD COLUMN generation_job_id INTEGER",
+            "ALTER TABLE content_drafts ADD COLUMN generation_job_id INTEGER",
+            "CREATE INDEX IF NOT EXISTS idx_content_generation_jobs_asset ON content_generation_jobs(content_asset_id, id DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_content_runs_job ON content_generation_runs(generation_job_id, id)",
+        ),
+    ),
+    (
+        10,
+        "content outline section blueprint preservation",
+        (
+            "ALTER TABLE content_outline_sections ADD COLUMN section_json TEXT NOT NULL DEFAULT '{}'",
+        ),
+    ),
 )
 
 

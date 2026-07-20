@@ -94,3 +94,8 @@ class TitleGenerationWebTests(unittest.TestCase):
     def test_content_page_does_not_offer_duplicate_asset_creation(self) -> None:
         self.assertIn("createdByTitle", self.app)
         self.assertIn("asset ?", self.app)
+
+    def test_title_library_supports_batch_deletion_but_protects_the_selected_title(self) -> None:
+        self.assertIn("selectedTitleIds", self.app)
+        self.assertIn("批量删除标题", self.app)
+        self.assertIn("已选定标题不可删除", self.app)

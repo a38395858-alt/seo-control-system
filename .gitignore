@@ -9,6 +9,7 @@ data/*.sqlite
 data/*.sqlite3
 data/ai-settings.json
 data/logs/
+data/google-serp-browser-profile/
 
 # Python
 __pycache__/

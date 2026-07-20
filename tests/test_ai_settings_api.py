@@ -82,7 +82,7 @@ class AiSettingsApiTests(unittest.TestCase):
             },
         )
         self.assertEqual(200, status)
-        self.assertEqual({"keyword_review": "gemini", "title_generation": "deepseek"}, saved["assignments"])
+        self.assertEqual({"keyword_review": "gemini", "title_generation": "deepseek", "content_generation": "openai"}, saved["assignments"])
         self.assertEqual("gemini-2.5-flash", saved["providers"]["gemini"]["model"])
         self.assertTrue(saved["providers"]["openai"]["configured"])
         self.assertNotIn("openai-secret", json.dumps(saved))
