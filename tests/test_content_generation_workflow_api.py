@@ -73,6 +73,8 @@ class FakeContentGenerator:
                     "estimated_total_words": 1200,
                 }
             )
+        if stage == "chapter_plan":
+            return json.dumps({"section_id": request["current_section"]["id"], "writing_goal": "Develop this buyer decision.", "subtopics": [{"reader_question": request["current_section"].get("reader_question", ""), "points": request["current_section"].get("key_points", []), "source_ids": request["current_section"].get("source_ids", [])}], "must_include": [], "must_avoid_repeating": [], "format": request["current_section"].get("format", "paragraphs")})
         if stage == "section":
             return json.dumps({"section_id": "s1", "markdown": "## Practical comparison\n\n[VERIFY] current vendor pricing", "claims_used": [], "verify": ["[VERIFY] current vendor pricing"]})
         if stage == "assembly":
@@ -199,10 +201,10 @@ class ContentGenerationWorkflowApiTests(unittest.TestCase):
         self.assertEqual(draft["draft"]["id"], detail["current_draft"]["id"])  # type: ignore[index]
         self.assertEqual(1, len(detail["drafts"]))  # type: ignore[index]
         runs = detail["generation_runs"]  # type: ignore[index]
-        self.assertEqual(["semantic", "title", "outline", "section", "section", "assembly"], [run["stage"] for run in runs])
+        self.assertEqual(["semantic", "title", "outline", "chapter_plan", "section", "chapter_plan", "section", "assembly"], [run["stage"] for run in runs])
         self.assertTrue(all(run["status"] == "completed" for run in runs))
         self.assertTrue(all(run["provider"] == "gemini" for run in runs))
-        self.assertTrue(all(run["prompt_version"] == "content_seo_eeat_v2" for run in runs))
+        self.assertTrue(all(run["prompt_version"] == "content_competitor_learning_v11" for run in runs))
         self.assertEqual("not_run", detail["current_draft"]["qa_status"])  # type: ignore[index]
         self.assertNotIn("secret", json.dumps(detail).lower())
 

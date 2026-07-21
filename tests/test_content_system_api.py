@@ -77,7 +77,7 @@ class ContentSystemApiTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual(first["id"], second["id"])  # type: ignore[index]
 
-    def test_manual_brief_uses_an_internal_default_when_the_ui_omits_target_length(self) -> None:
+    def test_manual_brief_is_unbounded_when_the_ui_omits_target_length(self) -> None:
         """字数不是用户配置项；旧的手工保存入口也必须能正常保存。"""
         project_id, title_id = self.selected_title()
         status, asset = self.request("POST", "/api/content-assets", {"project_id": project_id, "selected_title_candidate_id": title_id})
@@ -88,7 +88,7 @@ class ContentSystemApiTests(unittest.TestCase):
             {"project_id": project_id, "target_audience": "US buyers", "business_goal": "commercial", "sources": []},
         )
         self.assertEqual(201, status)
-        self.assertEqual(1400, brief["target_length"])  # type: ignore[index]
+        self.assertEqual(0, brief["target_length"])  # type: ignore[index]
 
     def test_unfinished_assets_are_excluded_from_content_library_but_the_reader_route_loads(self) -> None:
         project_id, title_id = self.selected_title()

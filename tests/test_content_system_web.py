@@ -82,6 +82,17 @@ class ContentSystemWebTests(unittest.TestCase):
         self.assertIn(".content-reader", self.styles)
         self.assertIn(".markdown-preview table", self.styles)
 
+    def test_content_reader_supports_word_count_and_standalone_html_download(self) -> None:
+        for value in ("articleWordCount", "words ·", "downloadArticleHtml", "下载 HTML", "text/html;charset=utf-8"):
+            self.assertIn(value, self.app)
+        self.assertIn(".content-reader-actions", self.styles)
+
+    def test_content_reader_has_an_article_scoped_authority_reference_footer(self) -> None:
+        self.assertIn("ArticleAuthorityReferences", self.app)
+        self.assertIn("authority_sources", self.app)
+        self.assertIn("权威来源与验证依据", self.app)
+        self.assertIn(".article-authority-references", self.styles)
+
     def test_content_library_supports_selective_and_bulk_asset_deletion(self) -> None:
         source = self.app + (ROOT / "frontend" / "src" / "api.ts").read_text(encoding="utf-8")
         self.assertIn("deleteContentAssets", source)
@@ -100,3 +111,8 @@ class ContentSystemWebTests(unittest.TestCase):
             self.assertIn(value, self.app)
         for selector in (".content-provider-lock", ".content-generation-log", ".generation-job.failed"):
             self.assertIn(selector, self.styles)
+
+    def test_agent_platform_console_is_exposed_from_the_sidebar(self) -> None:
+        self.assertIn('to="/projects"', self.app)
+        self.assertIn("AgentPlatformConsole", self.app)
+        self.assertIn("agent-console", self.styles)

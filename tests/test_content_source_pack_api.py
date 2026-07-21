@@ -50,6 +50,8 @@ class CapturingSemanticGenerator:
         if stage == "outline":
             self.stage_sources["outline"] = request["sources"]  # type: ignore[assignment]
             return {"intro_brief": "Answer first.", "sections": [{"id": "s1", "heading": "Evaluation criteria", "level": "h2", "reader_question": "What matters?", "purpose": "Explain a decision.", "key_points": [], "source_ids": ["official-pricing"], "evidence_gaps": [], "word_budget": 300, "format": "paragraphs"}], "conclusion_brief": "Next steps.", "cta_placement": "end", "estimated_total_words": 300}
+        if stage == "chapter_plan":
+            return {"section_id": "s1", "writing_goal": "Explain the criteria.", "subtopics": [{"reader_question": "What matters?", "points": ["Use the available source"], "source_ids": ["official-pricing"]}], "must_include": [], "must_avoid_repeating": [], "format": "paragraphs"}
         if stage == "section":
             self.stage_sources["section"] = request["sources"]  # type: ignore[assignment]
             return {"section_id": "s1", "markdown": "## Evaluation criteria\n\n[VERIFY]", "claims_used": [], "verify": ["[VERIFY]"]}
@@ -136,7 +138,7 @@ class ContentSourcePackApiTests(unittest.TestCase):
         self.assertEqual(source_pack, persisted)
         self.assertEqual(source_pack, self.generator.semantic_sources)
         self.assertEqual(source_pack, self.generator.stage_sources["outline"])
-        self.assertEqual(source_pack, self.generator.stage_sources["section"])
+        self.assertEqual([source_pack[0]], self.generator.stage_sources["section"])
 
         status, detail = self.request("GET", f"/api/content-assets/{asset_id}?project_id={project_id}")
         self.assertEqual(200, status)
@@ -156,6 +158,15 @@ class ContentSourcePackApiTests(unittest.TestCase):
         self.assertEqual("available", source["availability"])  # type: ignore[index]
         self.assertTrue(source["source_id"].startswith("source-"))  # type: ignore[index]
         self.assertIn("Internal product note", source["content"])  # type: ignore[index]
+
+    def test_previous_frontend_provided_status_is_normalized_for_compatibility(self) -> None:
+        project_id, asset_id = self.content_asset()
+        status, generated = self.request(
+            "POST", f"/api/content-assets/{asset_id}/generate-brief",
+            {"project_id": project_id, "sources": [{"source_id": "pasted-note", "source_type": "note", "content": "A pasted company note.", "availability": "provided"}]},
+        )
+        self.assertEqual(201, status)
+        self.assertEqual("available", generated["brief"]["sources"][0]["availability"])  # type: ignore[index]
 
     def test_malformed_structured_source_is_rejected_before_creating_a_brief_or_ai_run(self) -> None:
         project_id, asset_id = self.content_asset()

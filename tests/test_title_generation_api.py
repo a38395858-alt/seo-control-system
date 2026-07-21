@@ -29,7 +29,8 @@ from seo_control.web import create_server  # noqa: E402
 class FakeTitleGenerator:
     """Returns the JSON contract expected from an OpenAI-compatible adapter."""
 
-    def generate(self, **_request: object) -> str:
+    def generate(self, **request: object) -> str:
+        self.last_generate_request = request
         return json.dumps(
             {
                 "candidates": [
@@ -229,6 +230,30 @@ class TitleGenerationApiTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual("browser", result["source_type"])  # type: ignore[index]
         self.assertEqual("Best iPhone Screen Call Apps", result["titles"][0]["title"])  # type: ignore[index]
+
+    def test_serp_titles_are_saved_as_project_memory_and_reused_for_generation(self) -> None:
+        project_id, keyword_id = self.create_project_and_keyword()
+        self.server.serp_title_client = FakeBrowserSerpClient()
+        status, result = self.request_json(
+            "POST",
+            "/api/browser-serp-title-research",
+            {"project_id": project_id, "keyword_id": keyword_id, "locale": "en-US"},
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(2, result["saved_count"])  # type: ignore[index]
+
+        status, memory = self.request_json("GET", f"/api/serp-title-samples?project_id={project_id}&keyword_id={keyword_id}")
+        self.assertEqual(200, status)
+        self.assertEqual(2, len(memory["titles"]))  # type: ignore[index]
+        self.assertEqual("browser", memory["titles"][0]["source_type"])  # type: ignore[index]
+
+        status, _job = self.request_json(
+            "POST",
+            "/api/title-generation-jobs",
+            {"project_id": project_id, "keyword_id": keyword_id, "locale": "en-US", "count": 2},
+        )
+        self.assertEqual(201, status)
+        self.assertIn("Best iPhone Screen Call Apps", self.server.title_generator.last_generate_request["competitor_titles"])
 
     def test_browser_serp_research_returns_a_captcha_image_for_user_verification(self) -> None:
         project_id, keyword_id = self.create_project_and_keyword()

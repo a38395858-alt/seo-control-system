@@ -421,6 +421,152 @@ _MIGRATIONS: tuple[Migration, ...] = (
             "ALTER TABLE content_outline_sections ADD COLUMN section_json TEXT NOT NULL DEFAULT '{}'",
         ),
     ),
+    (
+        11,
+        "project-scoped SERP title learning memory",
+        (
+            """
+            CREATE TABLE IF NOT EXISTS serp_title_samples (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                keyword_id INTEGER NOT NULL,
+                rank INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                normalized_title TEXT NOT NULL,
+                source TEXT,
+                source_type TEXT NOT NULL CHECK(source_type IN ('browser', 'ai')),
+                locale TEXT NOT NULL DEFAULT 'en-US',
+                captured_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY(keyword_id) REFERENCES keywords(id) ON DELETE CASCADE,
+                UNIQUE(project_id, keyword_id, normalized_title)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_serp_title_samples_keyword ON serp_title_samples(project_id, keyword_id, captured_at DESC)",
+        ),
+    ),
+    (
+        12,
+        "website-scoped competitor content learning memory",
+        (
+            """
+            CREATE TABLE IF NOT EXISTS competitor_research_runs (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                content_asset_id INTEGER NOT NULL,
+                query TEXT NOT NULL,
+                locale TEXT NOT NULL,
+                provider TEXT,
+                model TEXT,
+                status TEXT NOT NULL DEFAULT 'running' CHECK(status IN ('running','completed','insufficient','failed')),
+                discovered_count INTEGER NOT NULL DEFAULT 0,
+                usable_count INTEGER NOT NULL DEFAULT 0,
+                analysis_json TEXT NOT NULL DEFAULT '{}',
+                error_summary TEXT,
+                started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                completed_at TEXT,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY(content_asset_id) REFERENCES content_assets(id) ON DELETE CASCADE
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS competitor_content_memory (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                normalized_url TEXT NOT NULL,
+                url TEXT NOT NULL,
+                domain TEXT NOT NULL,
+                page_title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                structure_json TEXT NOT NULL DEFAULT '{}',
+                first_captured_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_captured_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                UNIQUE(project_id, normalized_url)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS competitor_research_items (
+                id INTEGER PRIMARY KEY,
+                research_run_id INTEGER NOT NULL,
+                memory_id INTEGER,
+                rank INTEGER NOT NULL,
+                search_title TEXT NOT NULL,
+                url TEXT NOT NULL,
+                domain TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('selected','skipped','failed')),
+                error_summary TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(research_run_id) REFERENCES competitor_research_runs(id) ON DELETE CASCADE,
+                FOREIGN KEY(memory_id) REFERENCES competitor_content_memory(id) ON DELETE SET NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS competitor_content_chunks (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                memory_id INTEGER NOT NULL,
+                position INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY(memory_id) REFERENCES competitor_content_memory(id) ON DELETE CASCADE,
+                UNIQUE(memory_id, position)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_competitor_memory_project ON competitor_content_memory(project_id,last_captured_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_competitor_chunks_project ON competitor_content_chunks(project_id,memory_id)",
+            "CREATE INDEX IF NOT EXISTS idx_competitor_runs_asset ON competitor_research_runs(content_asset_id,id DESC)",
+        ),
+    ),
+    (
+        13,
+        "project-scoped authority source library",
+        (
+            """
+            CREATE TABLE IF NOT EXISTS authority_source_library (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                source_type TEXT NOT NULL CHECK(source_type IN ('first_party','standard','certification','government','industry_research')),
+                url TEXT,
+                publisher TEXT,
+                published_at TEXT,
+                content TEXT NOT NULL,
+                authority_level TEXT NOT NULL DEFAULT 'needs_review' CHECK(authority_level IN ('primary','authoritative','supporting','needs_review')),
+                tags_json TEXT NOT NULL DEFAULT '[]',
+                classification_json TEXT NOT NULL DEFAULT '{}',
+                summary TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_authority_sources_project ON authority_source_library(project_id, updated_at DESC)",
+        ),
+    ),
+    (
+        14,
+        "article-scoped authority source references",
+        (
+            """
+            CREATE TABLE IF NOT EXISTS content_authority_source_links (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                content_asset_id INTEGER NOT NULL,
+                authority_source_id INTEGER NOT NULL,
+                section_heading TEXT,
+                claim_topic TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY(content_asset_id) REFERENCES content_assets(id) ON DELETE CASCADE,
+                FOREIGN KEY(authority_source_id) REFERENCES authority_source_library(id) ON DELETE CASCADE,
+                UNIQUE(content_asset_id, authority_source_id)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_article_authority_sources ON content_authority_source_links(project_id, content_asset_id)",
+        ),
+    ),
 )
 
 

@@ -1,7 +1,8 @@
 import { useEffect, useMemo, useState } from "react";
-import { BrowserRouter, NavLink, Navigate, Route, Routes, useNavigate, useParams } from "react-router-dom";
+import { BrowserRouter, NavLink, Navigate, Route, Routes, useLocation, useNavigate, useParams } from "react-router-dom";
+import { AgentPlatformConsole } from "./AgentPlatformConsole";
 import { api } from "./api";
-import type { ContentAsset, ContentAssetDetail, ContentBrief, ContentDraft, ContentGenerationResult, ContentOutline, ExpansionResult, LibraryKeyword, Review, Score, SerpTitle, TitleCandidate } from "./types";
+import type { ArticleAuthoritySource, AuthoritySource, ContentAsset, ContentAssetDetail, ContentBrief, ContentDraft, ContentGenerationResult, ContentMemoryItem, ContentOutline, ExpansionResult, LibraryKeyword, Review, Score, SerpTitle, TitleCandidate } from "./types";
 
 type RunState = { seeds: string[]; language: string; country: string; result: ExpansionResult } | null;
 type ScoreInputs = Record<"keyword" | "volume" | "authority" | "domains" | "titleMatch" | "authoritySites" | "intent" | "relevance" | "businessValue", string>;
@@ -20,15 +21,50 @@ function ContentLibrary({ assets, onDelete }: { assets: ContentAsset[]; onDelete
   if (!completedAssets.length) return <div className="content-library-empty"><strong>暂无已完成正文</strong><p>内容资产完成 AI 正文生成后才会显示在这里。可前往“内容系统”继续完成 Brief、大纲和正文。</p><NavLink className="primary" to="/content">前往内容系统</NavLink></div>;
   return <><div className="content-library-bulk"><label><input type="checkbox" checked={selectedAssetIds.length === completedAssets.length} onChange={(event) => setSelectedAssetIds(event.target.checked ? completedAssets.map((asset) => asset.id) : [])} /> 全选已完成内容</label><button className="danger" disabled={!selectedAssetIds.length} onClick={() => void deleteSelected}>删除已选内容（{selectedAssetIds.length}）</button></div><div className="content-library-grid">{completedAssets.map((asset) => <article className={`content-library-card ${selectedAssetIds.includes(asset.id) ? "is-selected" : ""}`} key={asset.id}><div className="content-library-card-top"><label className="asset-checkbox"><input type="checkbox" checked={selectedAssetIds.includes(asset.id)} onChange={() => toggleAsset(asset.id)} aria-label={`选择 ${asset.title_snapshot}`} /></label><span className="content-completion-chip">✓ {asset.content_status_label || "内容完成"}</span><span className="content-outline-chip">✓ {asset.outline_status_label || "大纲完成"}</span></div><h3>{asset.title_snapshot}</h3><p>{asset.keyword || "—"} · {asset.locale}</p><div className="content-library-card-footer"><span>{asset.status === "completed" ? "已完成" : "已生成"}</span><div className="actions"><button className="link danger" onClick={() => void onDelete([asset.id])}>删除</button><NavLink className="primary" to={`/content-library/${asset.id}`}>阅读全文</NavLink></div></div></article>)}</div></>;
 }
+function articleWordCount(markdown: string) { return markdown.replace(/```[\s\S]*?```/g, " ").match(/\b[\w]+(?:['’-][\w]+)?\b/g)?.length || 0; }
+function downloadArticleHtml(draft: ContentDraft, authoritySources: ArticleAuthoritySource[] = []) {
+  const title = draft.title || "SEO Article";
+  const references = authoritySources.length ? `<section class="references"><h2>Authority Sources &amp; Verification</h2><ol>${authoritySources.map((source) => `<li>${source.url ? `<a href="${escapeHtml(source.url)}">${escapeHtml(source.title)}</a>` : escapeHtml(source.title)}${source.publisher ? ` — ${escapeHtml(source.publisher)}` : ""}${source.claim_topic ? `<br><small>Supports: ${escapeHtml(source.claim_topic)}</small>` : ""}</li>`).join("")}</ol></section>` : "";
+  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="${escapeHtml(draft.meta_description || "")}"><title>${escapeHtml(title)}</title><style>body{margin:0;background:#f4f7fb;color:#33435e;font-family:Inter,Arial,sans-serif;line-height:1.82}.article{max-width:790px;margin:40px auto;padding:42px;background:#fff;border:1px solid #e2e8f1;border-radius:18px}.eyebrow{color:#7089c6;font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase}.article h1,.article h2,.article h3{color:#243e6b;line-height:1.25}.article h1{font-size:2.5rem;letter-spacing:-.045em}.article h2{margin-top:2.1em;font-size:1.55rem}.article h3{margin-top:1.7em}.article table{width:100%;border-collapse:collapse;margin:1.6em 0}.article th,.article td{padding:10px 12px;border:1px solid #dce4ef;text-align:left;vertical-align:top}.article th{background:#eff3ff}.article li{margin:.35em 0}.references{margin-top:3em;padding-top:1.5em;border-top:2px solid #dce4ef}.references small{color:#647591}@media(max-width:700px){.article{margin:0;border:0;border-radius:0;padding:24px}.article h1{font-size:2rem}}</style></head><body><main class="article"><p class="eyebrow">${escapeHtml(draft.provider || "AI")} · v${draft.version}</p><h1>${escapeHtml(title)}</h1>${draft.meta_description ? `<p>${escapeHtml(draft.meta_description)}</p>` : ""}<hr>${renderMarkdownPreview(draft.markdown)}${references}</main></body></html>`;
+  const blob = new Blob([html], { type: "text/html;charset=utf-8" }); const url = URL.createObjectURL(blob); const link = document.createElement("a");
+  link.href = url; link.download = `${title.replace(/[<>:"/\\|?*\x00-\x1F]/g, "-").slice(0, 100) || "article"}.html`; document.body.appendChild(link); link.click(); link.remove(); URL.revokeObjectURL(url);
+}
+function AuthoritySourceLibrary({ projectId }: { projectId: number | null }) {
+  const [items, setItems] = useState<AuthoritySource[]>([]); const [title, setTitle] = useState(""); const [content, setContent] = useState(""); const [url, setUrl] = useState(""); const [publisher, setPublisher] = useState(""); const [sourceType, setSourceType] = useState<AuthoritySource["source_type"]>("first_party"); const [notice, setNotice] = useState(""); const [saving, setSaving] = useState(false);
+  const load = async () => { if (projectId) setItems(await api.listAuthoritySources(projectId)); };
+  useEffect(() => { void load(); }, [projectId]);
+  const save = async () => { if (!projectId || !title.trim() || !content.trim()) return; setSaving(true); try { await api.createAuthoritySource({ project_id: projectId, title: title.trim(), source_type: sourceType, url: url.trim(), publisher: publisher.trim(), content: content.trim(), provider: "openai" }); setTitle(""); setContent(""); setUrl(""); setPublisher(""); setNotice("来源已归类并写入当前网站的长期来源库。"); await load(); } catch (error) { setNotice(error instanceof Error ? error.message : "来源入库失败。"); } finally { setSaving(false); } };
+  const remove = async (id: number) => { if (!projectId || !window.confirm("删除这条长期来源吗？")) return; await api.deleteAuthoritySource(id, projectId); await load(); };
+  if (!projectId) return <p className="empty">请先选择网站项目。</p>;
+  return <section className="authority-library"><PanelTitle eyebrow="Authority Source Library" title="权威来源库" tag={`${items.length} 条长期记忆`} /><p className="hint">保存官网规格书、标准、认证、政府资料或行业研究。AI 会分析可信度、标签和可支持的主题；后续一键生成内容会优先读取当前网站的这些资料。</p><div className="authority-source-form"><Input label="来源标题" value={title} onChange={setTitle} /><Select label="来源类型" value={sourceType} onChange={(value) => setSourceType(value as AuthoritySource["source_type"])} options={[["first_party", "第一方规格书 / 报告"], ["standard", "标准 / 规范"], ["certification", "认证 / 检测"], ["government", "政府 / 监管"], ["industry_research", "行业研究"]]} /><Input label="权威 URL（可选）" value={url} onChange={setUrl} /><Input label="发布者（可选）" value={publisher} onChange={setPublisher} /><label>来源正文 / 摘录<textarea value={content} onChange={(event) => setContent(event.target.value)} placeholder="粘贴规格书、证书内容、官方说明或权威研究正文。AI 将分类入库，不会伪造来源。" /></label><button className="primary" disabled={saving || !title.trim() || !content.trim()} onClick={() => void save()}>{saving ? "AI 归类中…" : "AI 归类并长期入库"}</button></div><p className="tag">{notice}</p><div className="authority-source-grid">{items.map((item) => <article key={item.id}><div><span className={`authority-level ${item.authority_level}`}>{item.authority_level}</span><span>{item.source_type}</span></div><h3>{item.title}</h3><p>{item.summary || "尚未生成摘要。"}</p><small>{item.publisher || "未标注发布者"}{item.url ? ` · ${item.url}` : ""}</small>{item.tags.length ? <div className="authority-tags">{item.tags.map((tag) => <i key={tag}>{tag}</i>)}</div> : null}<button className="link danger" onClick={() => void remove(item.id)}>删除</button></article>)}</div>{items.length ? null : <p className="empty">还没有来源。先把产品规格书、认证或权威标准资料粘贴进来。</p>}</section>;
+}
+function ArticleAuthorityReferences({ sources }: { sources: ArticleAuthoritySource[] }) {
+  return <section className="article-authority-references"><p className="eyebrow">Verification References</p><h2>权威来源与验证依据</h2>{sources.length ? <ol>{sources.map((source) => <li key={source.id}><div><span className={`authority-level ${source.authority_level}`}>{source.authority_level}</span>{source.url ? <a href={source.url} target="_blank" rel="noreferrer">{source.title}</a> : <strong>{source.title}</strong>}</div><p>{source.publisher || "已验证公开来源"}{source.claim_topic ? ` · 支持论断：${source.claim_topic}` : ""}</p>{source.summary ? <small>{source.summary}</small> : null}</li>)}</ol> : <p className="empty">暂无已验证的权威来源。点击“寻找权威来源”后，只有实际可打开且通过相关性与权威性检查的链接才会显示在这里。</p>}</section>;
+}
 function ContentReader({ projectId }: { projectId: number | null }) {
   const { assetId } = useParams();
   const [detail, setDetail] = useState<ContentAssetDetail | null>(null);
   const [readerError, setReaderError] = useState("");
+  const [researchingSources, setResearchingSources] = useState(false);
+  const [sourceResearchNotice, setSourceResearchNotice] = useState("");
   useEffect(() => { if (projectId && assetId) { setReaderError(""); api.getContentAsset(Number(assetId), projectId).then(setDetail).catch((error: unknown) => setReaderError(error instanceof Error ? error.message : "文章读取失败。")); } }, [assetId, projectId]);
   if (readerError) return <p className="empty">{readerError}</p>;
   if (!detail?.current_draft) return <p className="empty">正在加载文章，或该内容尚未生成正文。</p>;
   const draft = detail.current_draft;
-  return <article className="content-reader"><header className="content-reader-header"><NavLink to="/content-library">← 返回所有内容</NavLink><p className="eyebrow">{draft.provider || "AI"} · v{draft.version} · {draft.qa_status}</p><h1>{draft.title}</h1><p className="content-reader-description">{draft.meta_description}</p></header><article className="markdown-preview" dangerouslySetInnerHTML={{ __html: renderMarkdownPreview(draft.markdown) }} />{draft.unresolved_verify?.length ? <p className="verify-warning">待验证：{draft.unresolved_verify.join("；")}</p> : null}</article>;
+  const wordCount = articleWordCount(draft.markdown); const characterCount = draft.markdown.replace(/\s/g, "").length; const authoritySources = detail.authority_sources || [];
+  const researchSources = async () => {
+    if (!projectId || !assetId || researchingSources) return;
+    setResearchingSources(true);
+    setSourceResearchNotice("AI 正在从本文核心事实提出候选权威链接，并逐条打开验证；不会进行 Google 关键词搜索。");
+    try {
+      const result = await api.researchAuthoritySources({ project_id: projectId, asset_id: Number(assetId), provider: "openai" });
+      setSourceResearchNotice(`已检查 ${result.candidates_checked} 个 AI 候选链接，已入库 ${result.saved.length} 条权威来源；跳过 ${result.skipped.length} 条打不开、不相关、重复或不够权威的页面。`);
+      setDetail(await api.getContentAsset(Number(assetId), projectId));
+    } catch (error) {
+      setSourceResearchNotice(`权威来源研究失败：${error instanceof Error ? error.message : "请稍后重试。"}`);
+    } finally { setResearchingSources(false); }
+  };
+  return <article className="content-reader"><header className="content-reader-header"><NavLink to="/content-library">← 返回所有内容</NavLink><div className="content-reader-actions"><span title="按英文单词规则统计正文">{wordCount.toLocaleString()} words · {characterCount.toLocaleString()} chars</span><button type="button" disabled={researchingSources} onClick={() => void researchSources()}>{researchingSources ? "验证权威链接中…" : "寻找权威来源"}</button><button type="button" onClick={() => downloadArticleHtml(draft, authoritySources)}>下载 HTML</button></div>{sourceResearchNotice ? <p className="source-research-notice" role="status">{sourceResearchNotice}</p> : null}<p className="eyebrow">{draft.provider || "AI"} · v{draft.version} · {draft.qa_status}</p><h1>{draft.title}</h1><p className="content-reader-description">{draft.meta_description}</p></header><article className="markdown-preview" dangerouslySetInnerHTML={{ __html: renderMarkdownPreview(draft.markdown) }} />{draft.unresolved_verify?.length ? <p className="verify-warning">待验证：{draft.unresolved_verify.join("；")}</p> : null}<ArticleAuthorityReferences sources={authoritySources} /></article>;
 }
 function escapeHtml(value: string) { return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\"/g, "&quot;").replace(/'/g, "&#39;"); }
 function renderInlineMarkdown(value: string) { return escapeHtml(value).replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>").replace(/__(.+?)__/g, "<strong>$1</strong>"); }
@@ -63,6 +99,49 @@ function renderMarkdownPreview(markdown: string) {
 }
 function contentProviderLabel(provider: AiProvider | string | undefined) { return ({ openai: "ChatGPT", gemini: "Gemini", deepseek: "DeepSeek" } as Record<string, string>)[provider || ""] || provider || "AI"; }
 function contentStageLabel(stage: string | null | undefined) { return ({ semantic: "语义分析", title: "标题与元信息", outline: "文章大纲", section: "章节写作", assembly: "组装全文", configuration: "模型配置", preparation: "任务准备" } as Record<string, string>)[stage || ""] || stage || "生成"; }
+type PlatformWebsite = { id: number; domain: string; industry: string; audience: string; brand_tone: string };
+type PlatformTask = { id: number; website_id: number; domain: string; target_keyword: string; title: string; status: string; stage: string; progress: number; message: string };
+type PlatformDashboard = { services: Record<string, string>; summary: { websites: number; tasks: number; waiting_for_sources: number; active_tasks: number } };
+const platformApiUrl = "http://127.0.0.1:8010";
+
+function LegacyAgentPlatformConsole() {
+  const [dashboard, setDashboard] = useState<PlatformDashboard | null>(null);
+  const [websites, setWebsites] = useState<PlatformWebsite[]>([]);
+  const [tasks, setTasks] = useState<PlatformTask[]>([]);
+  const [notice, setNotice] = useState("正在连接 Docker 平台服务…");
+  const [domain, setDomain] = useState(""); const [industry, setIndustry] = useState(""); const [audience, setAudience] = useState(""); const [tone, setTone] = useState("");
+  const [websiteId, setWebsiteId] = useState(""); const [keyword, setKeyword] = useState(""); const [title, setTitle] = useState("");
+  const request = async <T,>(path: string, init?: RequestInit): Promise<T> => {
+    const response = await fetch(`${platformApiUrl}${path}`, { headers: { "Content-Type": "application/json" }, ...init });
+    const body = await response.json();
+    if (!response.ok) throw new Error(body.detail || "平台服务请求失败");
+    return body as T;
+  };
+  const refresh = async () => {
+    try {
+      const [summary, sites, queuedTasks] = await Promise.all([request<PlatformDashboard>("/api/dashboard"), request<PlatformWebsite[]>("/api/websites"), request<PlatformTask[]>("/api/tasks")]);
+      setDashboard(summary); setWebsites(sites); setTasks(queuedTasks); setWebsiteId((current) => current || (sites[0] ? String(sites[0].id) : "")); setNotice("平台已连接。任务会先进入 Celery，再等待资料来源后才能开始 SERP 与写作。");
+    } catch (error) { setNotice(error instanceof Error ? error.message : "无法连接平台服务，请确认 Docker 已启动。"); }
+  };
+  useEffect(() => { void refresh(); const timer = window.setInterval(() => void refresh(), 8000); return () => window.clearInterval(timer); }, []);
+  const createWebsite = async () => {
+    try { const site = await request<PlatformWebsite>("/api/websites", { method: "POST", body: JSON.stringify({ domain, industry, audience, brand_tone: tone }) }); setDomain(""); setIndustry(""); setAudience(""); setTone(""); setWebsiteId(String(site.id)); setNotice(`站点 ${site.domain} 已创建并隔离。`); await refresh(); } catch (error) { setNotice(error instanceof Error ? error.message : "创建站点失败"); }
+  };
+  const createTask = async () => {
+    if (!websiteId) { setNotice("请先创建或选择一个站点。"); return; }
+    try { await request<PlatformTask>("/api/tasks", { method: "POST", body: JSON.stringify({ website_id: Number(websiteId), target_keyword: keyword, title }) }); setKeyword(""); setTitle(""); setNotice("任务已进入 Celery。尚未接入 SERP/来源服务时，任务会诚实停在“待补来源”。"); await refresh(); } catch (error) { setNotice(error instanceof Error ? error.message : "创建任务失败"); }
+  };
+  const serviceLabel = (name: string) => ({ api: "FastAPI", database: "PostgreSQL", queue: "Redis", orchestrator: "编排器" } as Record<string, string>)[name] || name;
+  return <section className="agent-console" id="agent-console"><div className="agent-console-hero"><div><p className="eyebrow">B2B SEO Agent Platform</p><h2>Agent 控制台</h2><p>多站点资料、异步任务与内容工作流的新版入口。现阶段由 Celery 编排；CrewAI 保留为后续可选编排器。</p></div><button onClick={() => void refresh()}>刷新状态</button></div><p className="agent-notice">{notice}</p><div className="agent-service-grid">{Object.entries(dashboard?.services || { api: "checking", database: "checking", queue: "checking", orchestrator: "celery workflow" }).map(([name, state]) => <article key={name}><span className={state === "ready" || name === "orchestrator" ? "is-ready" : ""}>● {state}</span><strong>{serviceLabel(name)}</strong></article>)}</div><div className="agent-metrics"><Metric label="隔离站点" value={dashboard?.summary.websites || 0} /><Metric label="内容任务" value={dashboard?.summary.tasks || 0} /><Metric label="待补来源" value={dashboard?.summary.waiting_for_sources || 0} /><Metric label="运行中" value={dashboard?.summary.active_tasks || 0} /></div><div className="agent-grid"><section className="panel"><PanelTitle eyebrow="01 Workspace" title="创建 B2B 站点" /><div className="agent-form"><Input label="域名" value={domain} onChange={setDomain} /><Input label="行业" value={industry} onChange={setIndustry} /><Input label="目标受众" value={audience} onChange={setAudience} /><Input label="品牌语调" value={tone} onChange={setTone} /></div><button className="primary" disabled={!domain.trim() || !industry.trim()} onClick={() => void createWebsite}>创建隔离站点</button><div className="agent-site-list">{websites.length ? websites.map((site) => <button className={String(site.id) === websiteId ? "is-selected" : ""} key={site.id} onClick={() => setWebsiteId(String(site.id))}><strong>{site.domain}</strong><span>{site.industry} · {site.audience || "未填受众"}</span></button>) : <p className="empty">还没有站点。先创建站点，再建立内容任务。</p>}</div></section><section className="panel"><PanelTitle eyebrow="02 Task" title="创建内容任务" /><div className="agent-form"><Select label="执行站点" value={websiteId} onChange={setWebsiteId} options={websites.map((site) => [String(site.id), `${site.domain} · ${site.industry}`])} /><Input label="目标关键词" value={keyword} onChange={setKeyword} /><Input label="拟定标题（可选）" value={title} onChange={setTitle} /></div><button className="primary" disabled={!keyword.trim() || !websiteId} onClick={() => void createTask}>提交到 Celery</button><p className="hint">`Best / Compare / Pricing` 等任务需先绑定来源包；未接资料服务前不会假装完成竞品研究。</p></section></div><section className="panel"><PanelTitle eyebrow="03 Pipeline" title="任务运行可视化" tag={`${tasks.length} 条`} /><ol className="agent-pipeline"><li><strong>任务初始化</strong><span>站点上下文与任务隔离</span></li><li><strong>来源 / SERP</strong><span>需接入来源包或 SERP 服务</span></li><li><strong>大纲确认</strong><span>人工可编辑后确认</span></li><li><strong>H2 独立深写</strong><span>每节独立生成后组装</span></li><li><strong>自然内链 / 图片</strong><span>后续 GSC 与图片适配器</span></li></ol><div className="agent-task-list">{tasks.length ? tasks.map((task) => <article key={task.id}><div><span className={`task-state task-${task.status}`}>{task.status}</span><strong>{task.target_keyword}</strong><small>{task.domain} · {task.title || "未指定标题"}</small></div><div className="task-progress"><span>{task.stage}</span><i><b style={{ width: `${task.progress}%` }} /></i><small>{task.progress}%</small></div><p>{task.message}</p></article>) : <p className="empty">还没有任务。创建后会在此显示实时状态。</p>}</div></section></section>;
+}
+function ContentMemoryLibrary({ projectId }: { projectId: number | null }) {
+  const [items, setItems] = useState<ContentMemoryItem[]>([]); const [query, setQuery] = useState(""); const [notice, setNotice] = useState("读取当前网站的竞品内容学习记忆。");
+  const load = async () => { if (!projectId) return; try { const value = await api.listContentMemory(projectId, query); setItems(value); setNotice(`已读取 ${value.length} 篇当前网站竞品资料。`); } catch (error) { setNotice(error instanceof Error ? error.message : "读取内容记忆失败。"); } };
+  useEffect(() => { void load(); }, [projectId]); // eslint-disable-line react-hooks/exhaustive-deps
+  const remove = async (id: number) => { if (!projectId || !window.confirm("删除这篇竞品学习资料吗？它不会删除已生成文章。")) return; await api.deleteContentMemory(id, { project_id: projectId }); await load(); };
+  return <section className="panel content-memory-panel" id="content-memory"><PanelTitle eyebrow="Website Learning Memory" title="竞品内容学习库" tag={`${items.length} 篇`} /><p className="hint">仅保存当前网站采集到的竞品正文与结构资料。AI 会学习覆盖范围和写法，不会复制原文。</p><div className="actions"><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索标题、域名或正文" /><button onClick={() => void load()}>搜索</button></div><p className="tag">{notice}</p><div className="content-memory-grid">{items.map((item) => <article key={item.id}><span>{item.domain}</span><h3>{item.page_title}</h3><a href={item.url} target="_blank" rel="noreferrer">打开来源</a><small>最近采集：{item.last_captured_at}</small><button className="link danger" onClick={() => void remove(item.id)}>删除记忆</button></article>)}</div>{items.length ? null : <p className="empty">尚未采集竞品资料。执行一键生成后会自动建立记忆。</p>}</section>;
+}
+
 function ContentWorkspace({ titles, assets, projectId, onCreate, onRefresh, onDelete, contentModels }: { titles: TitleCandidate[]; assets: ContentAsset[]; projectId: number | null; onCreate: (title: TitleCandidate) => void; onRefresh: () => Promise<void>; onDelete: (assetIds: number[]) => Promise<void>; contentModels: Record<AiProvider, string> }) {
   const available = titles.filter((title) => title.status === "selected");
   const createdByTitle = new Map(assets.map((asset) => [asset.selected_title_candidate_id, asset]));
@@ -80,6 +159,8 @@ function ContentWorkspace({ titles, assets, projectId, onCreate, onRefresh, onDe
   const [contentProvider, setContentProvider] = useState<AiProvider>("openai");
   const contentModel = contentModels[contentProvider];
   const [outlineRows, setOutlineRows] = useState([{ heading: "Introduction: what the reader will decide", purpose: "Answer the search need and set clear decision context", }, { heading: "How to evaluate the options", purpose: "Give practical criteria and explain trade-offs", }, { heading: "Recommended next steps", purpose: "Turn the comparison into an informed action", }]);
+
+  useEffect(() => { const siteId = new URLSearchParams(window.location.search).get("site_id"); if (siteId) fetch(`http://127.0.0.1:8010/api/websites/${siteId}/knowledge/context`).then((response) => response.ok ? response.json() : null).then((context) => { if (context?.content) setSourcesText((current) => current || context.content); }).catch(() => undefined); }, []);
 
   const loadDetail = async (assetId: number) => {
     if (!projectId) return;
@@ -104,7 +185,7 @@ function ContentWorkspace({ titles, assets, projectId, onCreate, onRefresh, onDe
 
   useEffect(() => setSelectedAssetIds((current) => current.filter((assetId) => assets.some((asset) => asset.id === assetId))), [assets]);
 
-  const sourcePack = () => sourcesText.split(/\n\s*---+\s*\n/).map((item) => item.trim()).filter(Boolean).map((content, index) => { const url = content.match(/https?:\/\/[^\s]+/)?.[0] || ""; return { source_id: `source-${index + 1}`, source_type: url ? "url" : "note", url, publisher: "", published_at: "", content, availability: "provided" }; });
+  const sourcePack = () => sourcesText.split(/\n\s*---+\s*\n/).map((item) => item.trim()).filter(Boolean).map((content, index) => { const url = content.match(/https?:\/\/[^\s]+/)?.[0] || ""; return { source_id: `source-${index + 1}`, source_type: url ? "url" : "note", url, publisher: "", published_at: "", content, availability: "available" }; });
   const toggleAssetSelection = (assetId: number) => setSelectedAssetIds((current) => current.includes(assetId) ? current.filter((id) => id !== assetId) : [...current, assetId]);
   const deleteSelectedAssets = async () => { if (!selectedAssetIds.length || !window.confirm(`确认删除 ${selectedAssetIds.length} 篇内容资产及所有版本吗？`)) return; await onDelete(selectedAssetIds); setSelectedAssetIds([]); };
 
@@ -134,10 +215,10 @@ function ContentWorkspace({ titles, assets, projectId, onCreate, onRefresh, onDe
     finally { setSaving(false); }
   };
 
-  const generationPayload = () => ({ project_id: projectId, provider: contentProvider, target_audience: audience.trim(), business_goal: goal, sources: sourcePack() });
+  const generationPayload = (withCompetitorResearch = false) => ({ project_id: projectId, provider: contentProvider, target_audience: audience.trim(), business_goal: goal, sources: sourcePack(), competitor_research: withCompetitorResearch });
   const applyGenerated = async (result: ContentGenerationResult) => {
     if (!detail) return;
-    setDetail((current) => current ? { ...current, ...(result.asset || {}), brief: result.brief ?? current.brief, outline: result.outline ?? current.outline, current_draft: result.current_draft ?? result.draft ?? current.current_draft, drafts: result.draft ? [result.draft, ...(current.drafts || []).filter((draft) => draft.id !== result.draft?.id)] : current.drafts, generation_runs: result.generation_runs ?? result.runs ?? current.generation_runs, generation_jobs: result.generation_job ? [...(current.generation_jobs || []), result.generation_job] : current.generation_jobs } : current);
+    setDetail((current) => current ? { ...current, ...(result.asset || {}), brief: result.brief ?? current.brief, outline: result.outline ?? current.outline, competitor_research: result.competitor_research ?? current.competitor_research, current_draft: result.current_draft ?? result.draft ?? current.current_draft, drafts: result.draft ? [result.draft, ...(current.drafts || []).filter((draft) => draft.id !== result.draft?.id)] : current.drafts, generation_runs: result.generation_runs ?? result.runs ?? current.generation_runs, generation_jobs: result.generation_job ? [...(current.generation_jobs || []), result.generation_job] : current.generation_jobs } : current);
     await loadDetail(detail.id);
     await onRefresh();
   };
@@ -146,7 +227,7 @@ function ContentWorkspace({ titles, assets, projectId, onCreate, onRefresh, onDe
     setSaving(true); setNotice(`${contentProviderLabel(contentProvider)}（${contentModel}）正在严格执行${stageName === "all" ? (detail.brief ? "大纲与全文" : "Brief、大纲与全文") : `内容${stageName === "brief" ? " Brief" : stageName === "outline" ? "大纲" : "正文"}`}；每个 H2 独立写作后再组装，失败不会切换其他模型…`);
     try {
       const action = stageName === "brief" ? api.generateContentBrief : stageName === "outline" ? api.generateContentOutline : stageName === "draft" ? api.generateContentDraft : api.generateContent;
-      const result = await action(detail.id, generationPayload());
+      const result = await action(detail.id, generationPayload(stageName === "all"));
       await applyGenerated(result);
       setNotice(`${contentProviderLabel(contentProvider)} 已完成本次任务并保存；可在执行日志查看每个阶段。`);
     } catch (error) { setNotice(error instanceof Error ? error.message : `${contentProviderLabel(contentProvider)} 生成失败；未切换其他模型。`); await loadDetail(detail.id); await onRefresh(); }
@@ -159,12 +240,14 @@ function ContentWorkspace({ titles, assets, projectId, onCreate, onRefresh, onDe
   return <div className="content-workspace" id="content-workspace">
     <div className="content-workspace-header"><div><p className="eyebrow">Production Workspace</p><h3>内容工作流</h3><p>保留每一步输入与版本；没有来源支撑的事实在生成时会标记为 <code>[VERIFY]</code>。</p></div><div className="content-workspace-actions"><Select label="内容模型" value={contentProvider} onChange={(value) => setContentProvider(value as AiProvider)} options={[["openai", "ChatGPT"], ["gemini", "Gemini"], ["deepseek", "DeepSeek"]]} /><span className="content-provider-lock">本次严格使用：<strong>{contentProviderLabel(contentProvider)}</strong><small>{contentModel}</small></span><button onClick={() => void onRefresh()}>刷新资产</button><NavLink className="link" to="/title-library">管理标题库</NavLink></div></div>
     <p className="content-notice">{notice}</p>
+    <div className="content-memory-link"><NavLink to="/content-memory">打开当前网站竞品内容学习库 →</NavLink></div>
     {assets.length ? <section className="content-workspace-bulk"><div><strong>资产批量操作</strong><span>已选 {selectedAssetIds.length} / {assets.length}</span></div><div className="content-workspace-selection">{assets.map((asset) => <label key={asset.id}><input type="checkbox" checked={selectedAssetIds.includes(asset.id)} onChange={() => toggleAssetSelection(asset.id)} /> <span>{asset.current_draft_id ? "正文完成" : asset.current_outline_id ? "大纲完成" : asset.current_brief_id ? "Brief 完成" : "待开始"}</span>{asset.title_snapshot}</label>)}</div><div className="actions"><button onClick={() => setSelectedAssetIds(selectedAssetIds.length === assets.length ? [] : assets.map((asset) => asset.id))}>{selectedAssetIds.length === assets.length ? "取消全选" : "全选资产"}</button><button className="danger" disabled={!selectedAssetIds.length} onClick={() => void deleteSelectedAssets}>删除已选内容</button></div></section> : null}
     <div className="content-layout">
       <aside className="content-asset-list" id="content-asset-list"><div className="content-list-heading"><strong>内容资产</strong><span>{assets.length}</span></div>{assets.length ? assets.map((asset) => <article className={`content-asset-card ${asset.id === selectedAssetId ? "is-active" : ""} ${asset.current_draft_id ? "is-complete" : asset.current_outline_id ? "is-outline-ready" : asset.current_brief_id ? "is-brief-ready" : "is-pending"}`} key={asset.id}><button type="button" className="content-asset-open" onClick={() => void loadDetail(asset.id)}><span className="content-asset-status">{asset.content_status_label || (asset.current_draft_id ? "内容完成" : asset.current_outline_id ? "大纲完成" : asset.current_brief_id ? "Brief 完成" : "待生成")}</span><strong>{asset.title_snapshot}</strong><small>{asset.keyword || "—"} · {asset.locale}</small></button><button type="button" className="content-asset-delete" aria-label={`删除 ${asset.title_snapshot}`} title="删除内容资产" onClick={(event) => { event.stopPropagation(); void onDelete([asset.id]); }}>×</button></article>) : <p className="empty">尚未创建内容资产。</p>}<div className="content-list-divider" /><strong className="content-list-label">已选标题</strong>{available.length ? available.map((title) => { const asset = createdByTitle.get(title.id); return <article className="content-title-entry" key={title.id}><ProviderBadge reason={title.reason} /><strong>{title.title}</strong>{asset ? <button onClick={() => void loadDetail(asset.id)}>打开</button> : <button className="primary" onClick={() => onCreate(title)}>创建</button>}</article>; }) : <p className="empty">请先在标题库选定标题。</p>}</aside>
       <section className="content-editor-area">{loadingDetail ? <p className="empty">正在读取内容详情…</p> : !detail ? <div className="content-empty-state"><strong>从标题库选择一个标题开始</strong><p>创建内容资产后，所有 Brief、大纲、正文和审核结果都会在这里集中保存。</p></div> : <>
         <div className="content-hero"><div><span className="content-kicker">{detail.content_type} · {detail.locale}</span><h3>{detail.title_snapshot}</h3><p>核心关键词：<strong>{detail.keyword || "—"}</strong></p></div><span className="tag">{detail.status === "planned" ? "规划中" : detail.status}</span></div>
         <ol className="content-stage-rail">{stages.map((item, index) => <li className={`content-stage-step ${index + 1 < stage ? "is-complete" : index + 1 === stage ? "is-current" : ""}`} key={item}><span>{index + 1}</span><strong>{item}</strong><small>{index + 1 < stage ? "已保存" : index + 1 === stage ? "当前步骤" : "等待前序"}</small></li>)}</ol>
+        <section className="content-editor-card competitor-research-card" id="competitor-research"><div className="content-card-heading"><div><span>00</span><div><h4>竞品学习与动态大纲</h4><p>一键生成会用当前完整标题搜索 Google 前两页，采集 3–5 篇可访问同行内容，再由同一模型分析结构、术语和内容空白。</p></div></div><span className={detail.competitor_research?.status === "completed" ? "stage-state done" : "stage-state"}>{detail.competitor_research?.status === "completed" ? `已采集 ${detail.competitor_research.usable_count} 篇` : "待采集"}</span></div>{detail.competitor_research ? <div className="competitor-research-summary"><p><strong>检索词：</strong>{detail.competitor_research.query}　<strong>模型：</strong>{contentProviderLabel(detail.competitor_research.provider || contentProvider)} · {detail.competitor_research.model || contentModel}</p>{detail.competitor_research.analysis.missing_gaps?.length ? <p><strong>竞品遗漏点：</strong>{detail.competitor_research.analysis.missing_gaps.join(" · ")}</p> : null}<div className="competitor-source-list">{detail.competitor_research.items.map((item) => <article key={item.id}><span>#{item.rank}</span><div><strong>{item.page_title || item.search_title}</strong><small>{item.domain} · {item.status}{item.error_summary ? ` · ${item.error_summary}` : ""}</small></div></article>)}</div></div> : <p className="empty">尚未采集竞品。点击下方“一键生成”后自动执行；如果可访问页面不足 3 篇会安全停止。</p>}</section>
         <section className="content-editor-card" id="content-brief"><div className="content-card-heading"><div><span>01</span><div><h4>内容 Brief</h4><p>定义受众、业务目标和可验证资料；它是后续 AI 写作的事实边界。</p></div></div><span className={detail.brief ? "stage-state done" : "stage-state"}>{detail.brief ? "已保存" : "待填写"}</span></div><div className="content-brief-grid"><Input label="目标读者" value={audience} onChange={setAudience} /><Select label="业务目标" value={goal} onChange={setGoal} options={[["informational", "信息型内容"], ["commercial", "商业调研 / 对比"], ["lead-generation", "获客 / 线索"]]} /><label className="content-source-field">多篇文章 / URL / 研究资料（每篇文章之间用 --- 分隔，可粘贴全文）<textarea value={sourcesText} onChange={(event) => setSourcesText(event.target.value)} placeholder="【来源 1：官方文章】&#10;粘贴 URL 或全文…&#10;&#10;【来源 2：同行文章/笔记】&#10;粘贴 URL 或全文…" /></label></div><div className="content-card-footer"><span>{sourcesText.trim() ? "将把资料作为可引用事实来源。" : "未添加资料：正文中的具体事实将标记为 [VERIFY]。"}</span><div className="actions"><button disabled={saving} onClick={() => void saveBrief}>人工保存</button><button className="primary" disabled={saving} onClick={() => void generateStage("brief")}>AI 生成 Brief</button></div></div></section>
         <section className={`content-editor-card ${!detail.brief ? "is-locked" : ""}`} id="content-outline"><div className="content-card-heading"><div><span>02</span><div><h4>文章大纲</h4><p>每个 H2 只解决一个决策问题；比较类内容在正文阶段需要输出带来源列的表格。</p></div></div><span className={detail.outline ? "stage-state done" : "stage-state"}>{detail.outline ? "已保存" : "待编辑"}</span></div><div className="outline-table"><div className="outline-row outline-head"><span>章节标题</span><span>章节任务</span><span /></div>{outlineRows.map((row, index) => <div className="outline-row" key={`${row.heading}-${index}`}><input aria-label={`章节标题 ${index + 1}`} value={row.heading} onChange={(event) => setOutlineRows((current) => current.map((item, rowIndex) => rowIndex === index ? { ...item, heading: event.target.value } : item))} disabled={!detail.brief} /><input aria-label={`章节任务 ${index + 1}`} value={row.purpose} onChange={(event) => setOutlineRows((current) => current.map((item, rowIndex) => rowIndex === index ? { ...item, purpose: event.target.value } : item))} disabled={!detail.brief} /><button className="link danger" disabled={!detail.brief || outlineRows.length <= 1} onClick={() => setOutlineRows((current) => current.filter((_, rowIndex) => rowIndex !== index))}>移除</button></div>)}</div><div className="content-card-footer"><button disabled={!detail.brief} onClick={() => setOutlineRows((current) => [...current, { heading: "New section", purpose: "Add a distinct reader decision" }])}>添加章节</button><div className="actions"><button disabled={!detail.brief || saving} onClick={() => void saveOutline}>人工保存</button><button className="primary" disabled={!detail.brief || saving} onClick={() => void generateStage("outline")}>AI 生成大纲</button></div></div></section>
         <section className={`content-editor-card content-future-card ${!detail.outline ? "is-locked" : ""}`} id="content-draft"><div className="content-card-heading"><div><span>03</span><div><h4>正文版本</h4><p>每个 H2 独立写成一篇完整章节，再按大纲组装为一篇长文，并保留可回滚的版本历史。</p></div></div><span className="stage-state">{detail.current_draft ? `版本 v${displayedDraft!.version}` : detail.outline ? "准备生成" : "需先保存大纲"}</span></div>{displayedDraft ? <><div className="draft-switcher"><Select label="版本" value={String(selectedDraftVersion || displayedDraft!.version)} onChange={(value) => setSelectedDraftVersion(Number(value))} options={(detail.drafts || []).slice().reverse().map((draft) => [String(draft.version), `v${draft.version} · ${draft.provider || "AI"}`])} /><div className="actions"><button className={draftView === "markdown" ? "primary" : ""} onClick={() => setDraftView("markdown")}>Markdown 源码</button><button className={draftView === "html" ? "primary" : ""} onClick={() => setDraftView("html")}>HTML 预览</button></div></div><div className="content-draft-preview"><div><strong>{displayedDraft!.title}</strong><p>{displayedDraft!.meta_description}</p></div>{draftView === "markdown" ? <pre>{displayedDraft!.markdown}</pre> : <article className="markdown-preview" dangerouslySetInnerHTML={{ __html: renderMarkdownPreview(displayedDraft!.markdown) }} />}<div className="draft-meta"><span>版本 v{displayedDraft!.version}</span><span>{displayedDraft!.provider || contentProvider}</span><span>{displayedDraft!.model || "已保存"}</span></div></div></> : <div className="future-grid"><div><strong>H2 分段生成</strong><p>每个 H2 仅发送本章 Brief 与相关资料，独立完成后再组装，避免重复与无来源编造。</p></div><div><strong>多模型任务</strong><p>内容模型将读取 AI 配置；每次生成都会记录模型、时间和版本。</p></div></div>}<div className="content-card-footer"><span>{detail.brief ? "一键生成将自动完成大纲、每个 H2 的独立章节和全文组装，并保留当前 Brief。" : "一键生成会先创建 Brief，再自动完成大纲、每个 H2 章节和全文组装。"}</span><div className="actions"><button disabled={saving} onClick={() => void generateStage("all")}>一键生成大纲和全文</button><button className="primary" disabled={!detail.outline || saving} onClick={() => void generateStage("draft")}>{detail.current_draft ? "生成新版本" : "AI 生成正文"}</button></div></div></section>
@@ -209,6 +292,10 @@ export default function App() {
 
 function Workspace() {
   const navigate = useNavigate();
+  const location = useLocation();
+  const currentSiteId = new URLSearchParams(location.search).get("site_id");
+  const scopedSuffix = currentSiteId ? `?project_id=${new URLSearchParams(location.search).get("project_id") || ""}&site_id=${currentSiteId}` : "";
+  const isProjectContext = Boolean(currentSiteId);
   const [seedsText, setSeedsText] = useState("seo tools");
   const [language, setLanguage] = useState("en");
   const [country, setCountry] = useState("US");
@@ -220,7 +307,7 @@ function Workspace() {
   const [reviews, setReviews] = useState<Record<string, Review>>({});
   const [reviewStatus, setReviewStatus] = useState("等待扩词结果");
   const [reviewMode, setReviewMode] = useState<"fast" | "hybrid">("hybrid");
-  const [projectId, setProjectId] = useState<number | null>(() => Number(localStorage.getItem(projectKey)) || null);
+  const [projectId, setProjectId] = useState<number | null>(() => Number(new URLSearchParams(window.location.search).get("project_id")) || Number(localStorage.getItem(projectKey)) || null);
   const [library, setLibrary] = useState<LibraryKeyword[]>([]);
   const [libraryStatus, setLibraryStatus] = useState("审核通过的扩展词可加入关键词库。");
   const [scoreInputs, setScoreInputs] = useState<ScoreInputs>({ keyword: "", volume: "", authority: "", domains: "", titleMatch: "", authoritySites: "", intent: "3", relevance: "80", businessValue: "80" });
@@ -280,6 +367,11 @@ function Workspace() {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  useEffect(() => {
+    const selected = Number(new URLSearchParams(location.search).get("project_id")) || null;
+    if (selected && selected !== projectId) { localStorage.setItem(projectKey, String(selected)); setProjectId(selected); void Promise.allSettled([loadLibrary(selected), loadTitleLibrary(selected), loadContentAssets(selected), loadContentLibrary(selected)]); }
+  }, [location.search, projectId]);
+
   const ensureProject = async () => {
     if (projectId) return projectId;
     const project = await api.createProject({ name: "默认关键词项目", country_code: country, language_code: language });
@@ -337,12 +429,14 @@ function Workspace() {
     setTitleCandidates([]);
     setSerpTitles([]);
     setVerificationImage(null);
-    setSerpStatus("尚未抓取 Google 排名标题。");
+    setSerpStatus("正在读取本项目已保存的标题学习样本…");
     setTitleStatus(keyword.is_seo_content_fit === 1 ? `已选择“${keyword.keyword}”，默认按美国市场 en-US 生成。` : "该关键词尚未通过 SEO 审核，不能生成标题。");
     if (keyword.is_seo_content_fit !== 1) return;
     try {
-      await loadTitleCandidates(keyword);
-      navigate("/titles");
+      const [memory] = await Promise.all([api.listSerpTitleMemory(projectId, keyword.id), loadTitleCandidates(keyword)]);
+      setSerpTitles(memory.titles);
+      setSerpStatus(memory.titles.length ? `已读取 ${memory.titles.length} 条本项目标题学习样本；生成时会参考写法但不会复制。` : "尚未抓取 Google 排名标题。");
+      navigate(`/titles${scopedSuffix}`);
     } catch (error) {
       setTitleStatus(error instanceof Error ? error.message : "读取标题候选失败。");
     }
@@ -385,7 +479,7 @@ function Workspace() {
     try {
       const result = await api.researchSerpTitles({ project_id: projectId, keyword_id: titleKeyword.id, locale: "en-US" });
       setSerpTitles(result.titles);
-      setSerpStatus(result.warning || `已提取 ${result.titles.length} 条排名标题，可直接用于生成 SEO 标题。`);
+      setSerpStatus(result.warning || `已提取并保存 ${result.titles.length} 条排名标题，已加入本项目的标题学习样本。`);
     } catch (error) {
       setSerpStatus(error instanceof Error ? error.message : "AI SERP 标题抓取失败。");
     } finally {
@@ -405,7 +499,7 @@ function Workspace() {
         setSerpStatus("Google 要求浏览器验证：请在验证码图片对应的 Chrome 窗口完成验证后，再点击一次抓取。");
         return;
       }
-      setSerpStatus(`浏览器已抓取 ${result.titles.length} 条 Google 自然排名标题，可直接用于生成 SEO 标题。`);
+      setSerpStatus(`浏览器已抓取并保存 ${result.titles.length} 条 Google 自然排名标题；AI 将学习搜索意图与写法，不会复制原题。`);
     } catch (error) {
       setSerpStatus(error instanceof Error ? error.message : "浏览器 Google 标题抓取失败。");
     } finally {
@@ -615,13 +709,19 @@ function Workspace() {
   const setScoreField = (key: keyof ScoreInputs, value: string) => setScoreInputs((current) => ({ ...current, [key]: value }));
 
   return <main className="app-shell">
-    <aside className="sidebar"><div className="brand"><span>SEO</span><small>Keyword Intelligence</small></div><nav><NavLink to="/research" className={({ isActive }) => isActive ? "active" : ""}>关键词挖掘</NavLink><NavLink to="/keywords" className={({ isActive }) => isActive ? "active" : ""}>关键词库</NavLink><NavLink to="/titles" className={({ isActive }) => isActive ? "active" : ""}>SEO 标题</NavLink><NavLink to="/title-library" className={({ isActive }) => isActive ? "active" : ""}>标题库</NavLink><NavLink to="/content" className={({ isActive }) => isActive ? "active" : ""}>内容系统</NavLink><NavLink to="/content-library" className={({ isActive }) => isActive ? "active" : ""}>所有内容</NavLink><NavLink to="/scoring" className={({ isActive }) => isActive ? "active" : ""}>SEO 评分</NavLink><NavLink to="/settings" className={({ isActive }) => isActive ? "active" : ""}>AI 配置</NavLink></nav><p className="connection">● 本地工作台已连接</p></aside>
+    <aside className="sidebar"><div className="brand"><span>SEO</span><small>{isProjectContext ? "Website Project" : "Project Center"}</small></div><nav>{isProjectContext ? <><NavLink to={`/projects/${currentSiteId}${scopedSuffix}`} className={({ isActive }) => isActive ? "active" : ""}>项目总览</NavLink><p className="nav-group">关键词</p><NavLink to={`/research${scopedSuffix}`}>关键词挖掘</NavLink><NavLink to={`/keywords${scopedSuffix}`}>关键词库</NavLink><NavLink to={`/scoring${scopedSuffix}`}>机会评分</NavLink><p className="nav-group">标题与选题</p><NavLink to={`/titles${scopedSuffix}`}>标题生成</NavLink><NavLink to={`/title-library${scopedSuffix}`}>标题库</NavLink><p className="nav-group">内容生产</p><NavLink to={`/content${scopedSuffix}`}>内容生成</NavLink><NavLink to={`/content-library${scopedSuffix}`}>内容库</NavLink><NavLink to={`/authority-sources${scopedSuffix}`}>权威来源库</NavLink><span className="nav-disabled">内容发布 · 待接 CMS</span><p className="nav-group">资料与设置</p><NavLink to={`/projects/${currentSiteId}${scopedSuffix}#knowledge`}>公司知识库</NavLink><NavLink to={`/projects/${currentSiteId}${scopedSuffix}#settings`}>项目设置</NavLink></> : <><NavLink to="/projects" className={({ isActive }) => isActive ? "active" : ""}>网站项目</NavLink><NavLink to="/system-tasks">系统任务</NavLink><NavLink to="/integrations">AI 与集成</NavLink></>}</nav><p className="connection">● 本地工作台已连接</p></aside>
     <section className="workspace">
       <header><div><p className="eyebrow">SEO 中控系统</p><h1>关键词工作台</h1><p>挖掘、审核、分类、入库和机会评估。</p></div><span className="project-chip">项目：{projectId ? `#${projectId}` : "未创建"}</span></header>
 
       <section className="metrics"><Metric label="本次扩展关键词" value={run?.result.keywords.length ?? 0} /><Metric label="下拉词请求数" value={run?.result.requests_made ?? 0} /><Metric label="已审核关键词" value={reviewedCount} /><Metric label="已入库关键词" value={library.length} /></section>
 
       <Routes>
+      <Route path="/agent-platform" element={<Navigate to="/projects" replace />} />
+      <Route path="/agent-platform/site/:siteId" element={<AgentPlatformConsole />} />
+      <Route path="/projects" element={<AgentPlatformConsole />} />
+      <Route path="/projects/:siteId" element={<AgentPlatformConsole />} />
+      <Route path="/system-tasks" element={<section className="panel"><PanelTitle eyebrow="System Tasks" title="系统任务" /><p className="empty">采集、AI 归纳和发布任务将在这里显示真实执行状态。</p></section>} />
+      <Route path="/integrations" element={<section className="panel"><PanelTitle eyebrow="AI & Integrations" title="AI 与集成" /><p className="empty">请在此配置 AI 模型；CMS、GSC 将在后续版本接入。</p><NavLink className="primary" to="/settings">打开 AI 配置</NavLink></section>} />
       <Route path="/research" element={<>
       <section className="panel research-panel" id="research"><PanelTitle eyebrow="Google Suggest" title="递归关键词扩展" tag={busy ? "执行中" : "就绪"} /><textarea id="seed-keywords" value={seedsText} onChange={(event) => setSeedsText(event.target.value)} aria-label="输入种子关键词" placeholder="每行一个种子关键词" />
         <div className="controls"><Select id="suggest-language" label="建议语言" value={language} onChange={setLanguage} options={[["en", "English"], ["zh-CN", "简体中文"], ["zh-TW", "繁體中文"]]} /><Select id="suggest-country" label="目标国家/地区" value={country} onChange={setCountry} options={[["US", "美国"], ["CN", "中国"], ["GB", "英国"], ["SG", "新加坡"]]} /><Select label="最大请求数" value={maxRequests} onChange={setMaxRequests} options={[["20", "20（快速）"], ["50", "50（推荐）"], ["200", "200（深度）"]]} /><Select label="递归层数" value={maxDepth} onChange={setMaxDepth} options={[["2", "2 层"], ["3", "3 层"], ["5", "5 层"]]} /><button id="start-suggest-expansion" className="primary" disabled={busy} onClick={expand}>开始扩展关键词</button></div>
@@ -647,6 +747,7 @@ function Workspace() {
       </>} />
 
       <Route path="/content-library/:assetId" element={<section className="panel content-reader-panel"><ContentReader projectId={projectId} /></section>} />
+      <Route path="/content-memory" element={<ContentMemoryLibrary projectId={projectId} />} />
       <Route path="/content-library" element={<section className="panel" id="content-library"><PanelTitle eyebrow="Content Library" title="所有内容" tag={`${contentLibraryAssets.length} 篇已完成`} /><p className="hint">这里只显示后端确认已生成正文的内容；点击阅读全文查看版本化保存的完整文章。</p><ContentLibrary assets={contentLibraryAssets} onDelete={deleteContentAssets} /></section>} />
 
       <Route path="/content" element={<section className="panel content-system-panel" id="content-system"><PanelTitle eyebrow="Content System" title="内容系统" tag={`${contentAssets.length} 篇内容`} /><p className="hint">从已选标题建立内容资产，以 Brief → 大纲 → 每个 H2 独立生成 → 长文组装的工作流生成可追溯的 SEO 内容。</p><p className="tag">{contentStatus}</p><ContentWorkspace titles={titleLibrary} assets={contentAssets} projectId={projectId} onCreate={createContentFromTitle} onRefresh={refreshContentData} onDelete={deleteContentAssets} contentModels={{ openai: aiProfiles.openai.model, gemini: aiProfiles.gemini.model, deepseek: aiProfiles.deepseek.model }} /></section>} />
@@ -659,6 +760,7 @@ function Workspace() {
       <section className="panel" id="score"><PanelTitle eyebrow="SEO 机会评分" title="VOL · KD · 机会分" /><p className="hint">VOL 请使用 Google Ads CSV/API 数据；其余指标来自 SERP 前 10 名。缺数据时不要填猜测值。</p><div className="score-grid"><Input label="关键词" value={scoreInputs.keyword} onChange={(value) => setScoreField("keyword", value)} /><Input label="月搜索量 VOL" type="number" value={scoreInputs.volume} onChange={(value) => setScoreField("volume", value)} /><Input label="平均 DA (0-100)" type="number" value={scoreInputs.authority} onChange={(value) => setScoreField("authority", value)} /><Input label="平均引用域" type="number" value={scoreInputs.domains} onChange={(value) => setScoreField("domains", value)} /><Input label="标题完全匹配率 %" type="number" value={scoreInputs.titleMatch} onChange={(value) => setScoreField("titleMatch", value)} /><Input label="大站占比 %" type="number" value={scoreInputs.authoritySites} onChange={(value) => setScoreField("authoritySites", value)} /><Select label="意图竞争" value={scoreInputs.intent} onChange={(value) => setScoreField("intent", value)} options={[["1", "1 - 很低"], ["2", "2 - 较低"], ["3", "3 - 中等"], ["4", "4 - 较高"], ["5", "5 - 很高"]]} /><Input label="相关性 %" type="number" value={scoreInputs.relevance} onChange={(value) => setScoreField("relevance", value)} /><Input label="商业价值 %" type="number" value={scoreInputs.businessValue} onChange={(value) => setScoreField("businessValue", value)} /></div><div className="actions"><button id="calculate-keyword-score" className="primary" onClick={calculateScore}>计算 KD 与机会分</button><strong id="keyword-score-result" className="score-result">{score ? `KD ${score.keyword_difficulty}（${readableLevel(score.difficulty_level)}） · 机会分 ${score.opportunity_score}/100` : "等待 VOL 与 SERP 数据"}</strong></div></section>
       </>} />
       <Route path="*" element={<Navigate to="/research" replace />} />
+      <Route path="/authority-sources" element={<section className="panel"><AuthoritySourceLibrary projectId={projectId} /></section>} />
       </Routes>
     </section>
   </main>;

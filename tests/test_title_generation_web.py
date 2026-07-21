@@ -63,6 +63,12 @@ class TitleGenerationWebTests(unittest.TestCase):
         self.assertIn("/api/browser-serp-title-research", source)
         self.assertIn("浏览器抓取 Google 前 20 自然标题", self.app)
 
+    def test_title_workspace_restores_saved_project_title_learning_memory(self) -> None:
+        source = self.app + self.api
+        self.assertIn("listSerpTitleMemory", source)
+        self.assertIn("/api/serp-title-samples", source)
+        self.assertIn("标题学习样本", self.app)
+
     def test_title_workspace_can_generate_three_candidates_per_ai_provider(self) -> None:
         source = self.app + self.api
         self.assertIn("generateMultiProviderTitles", source)

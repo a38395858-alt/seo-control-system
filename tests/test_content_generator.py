@@ -42,7 +42,7 @@ class ContentGeneratorTests(unittest.TestCase):
         self.assertIn("source IDs", contract["instruction"])
         self.assertIn("Source column", contract["instruction"])
         self.assertIn("sections", contract["output_schema"])
-        self.assertEqual("content_seo_eeat_v2", PROMPT_VERSION)
+        self.assertEqual("content_competitor_learning_v11", PROMPT_VERSION)
 
 
 if __name__ == "__main__":

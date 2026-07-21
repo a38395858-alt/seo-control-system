@@ -32,6 +32,7 @@ class ContentModelSelectionTests(unittest.TestCase):
                 self.assertEqual("openai", provider)
                 self.assertEqual("gpt-5.4", model)
                 self.assertEqual("gpt-5.4", generator.model)
+                self.assertEqual(240.0, generator._timeout)
 
                 _generator, provider, model = handler._content_generator({"provider": "gemini"})
                 self.assertEqual("gemini", provider)

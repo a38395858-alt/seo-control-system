@@ -1,4 +1,4 @@
-import type { ContentAsset, ContentAssetDetail, ContentBrief, ContentGenerationResult, ContentOutline, ExpansionResult, LibraryKeyword, Review, Score, SerpTitle, TitleCandidate, TitleGenerationJob } from "./types";
+import type { AuthoritySource, CompetitorResearch, ContentAsset, ContentAssetDetail, ContentBrief, ContentGenerationResult, ContentMemoryItem, ContentOutline, ExpansionResult, LibraryKeyword, Review, Score, SerpTitle, SerpTitleMemory, TitleCandidate, TitleGenerationJob } from "./types";
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, options);
@@ -21,8 +21,9 @@ export const api = {
   listKeywords: (projectId: number) => request<LibraryKeyword[]>(`/api/keywords?project_id=${projectId}`),
   deleteKeywords: (body: object) => request<{ deleted: number }>("/api/keywords", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
   score: (body: object) => request<{ scores: Score[] }>("/api/keyword-opportunity-scores", json(body)),
-  researchSerpTitles: (body: object) => request<{ keyword: string; titles: SerpTitle[]; warning?: string }>("/api/serp-title-research", json(body)),
-  researchBrowserSerpTitles: (body: object) => request<{ keyword: string; titles: SerpTitle[]; source_type: "browser"; verification_required?: boolean; verification_image?: string | null }>("/api/browser-serp-title-research", json(body)),
+  researchSerpTitles: (body: object) => request<{ keyword: string; titles: SerpTitle[]; warning?: string; saved_count: number }>("/api/serp-title-research", json(body)),
+  researchBrowserSerpTitles: (body: object) => request<{ keyword: string; titles: SerpTitle[]; source_type: "browser"; saved_count?: number; verification_required?: boolean; verification_image?: string | null }>("/api/browser-serp-title-research", json(body)),
+  listSerpTitleMemory: (projectId: number, keywordId: number) => request<{ titles: SerpTitleMemory[] }>(`/api/serp-title-samples?project_id=${projectId}&keyword_id=${keywordId}`),
   createTitleJob: (body: object) => request<TitleGenerationJob>("/api/title-generation-jobs", json(body)),
   generateMultiProviderTitles: (body: object) => request<TitleGenerationJob & { failures: string[] }>("/api/multi-provider-title-generation-jobs", json(body)),
   listTitleCandidates: (projectId: number, keywordId: number) => request<{ candidates: TitleCandidate[]; selected_title: TitleCandidate | null }>(`/api/keywords/${keywordId}/title-candidates?project_id=${projectId}`),
@@ -33,6 +34,10 @@ export const api = {
   deleteTitleCandidates: (body: object) => request<{ deleted: number }>("/api/title-candidates", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
   listContentAssets: (projectId: number) => request<ContentAsset[]>(`/api/content-assets?project_id=${projectId}`),
   listContentLibrary: (projectId: number) => request<ContentAsset[]>(`/api/content-library?project_id=${projectId}`),
+  listAuthoritySources: (projectId: number) => request<AuthoritySource[]>(`/api/authority-sources?project_id=${projectId}`),
+  createAuthoritySource: (body: object) => request<AuthoritySource>("/api/authority-sources", json(body)),
+  researchAuthoritySources: (body: object) => request<{ article: string; candidates_checked: number; saved: AuthoritySource[]; skipped: Array<{ url: string; title: string; reason: string }> }>("/api/authority-sources/research", json(body)),
+  deleteAuthoritySource: (sourceId: number, projectId: number) => request<{ deleted: number }>(`/api/authority-sources/${sourceId}`, { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ project_id: projectId }) }),
   createContentAsset: (body: object) => request<ContentAsset>("/api/content-assets", json(body)),
   deleteContentAssets: (body: object) => request<{ deleted: number }>("/api/content-assets", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
   getContentAsset: (assetId: number, projectId: number) => request<ContentAssetDetail>(`/api/content-assets/${assetId}?project_id=${projectId}`),
@@ -42,4 +47,7 @@ export const api = {
   generateContentOutline: (assetId: number, body: object) => request<ContentGenerationResult>(`/api/content-assets/${assetId}/generate-outline`, json(body)),
   generateContentDraft: (assetId: number, body: object) => request<ContentGenerationResult>(`/api/content-assets/${assetId}/generate-draft`, json(body)),
   generateContent: (assetId: number, body: object) => request<ContentGenerationResult>(`/api/content-assets/${assetId}/generate`, json(body)),
+  researchCompetitors: (assetId: number, body: object) => request<CompetitorResearch>(`/api/content-assets/${assetId}/research-competitors`, json(body)),
+  listContentMemory: (projectId: number, query = "") => request<ContentMemoryItem[]>(`/api/content-memory?project_id=${projectId}&q=${encodeURIComponent(query)}`),
+  deleteContentMemory: (memoryId: number, body: object) => request<{ deleted: number }>(`/api/content-memory/${memoryId}`, { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
 };

@@ -36,10 +36,12 @@ class FakeContentGenerator:
             return {"candidates": [], "selected_title": data["title_snapshot"], "slug": "seo-tools-guide", "meta_description": "A practical comparison guide.", "selection_reason": "Keeps the approved title."}
         if stage == "outline":
             return {"intro_brief": "Answer the buyer question.", "sections": [{"id": "s1", "heading": "How to compare options", "level": "h2", "reader_question": "What should I compare?", "purpose": "Give criteria", "key_points": ["Start with needs"], "source_ids": [], "evidence_gaps": ["[VERIFY]"], "word_budget": 300, "format": "table"}], "conclusion_brief": "Summarize next steps.", "cta_placement": "after conclusion", "estimated_total_words": 300}
+        if stage == "chapter_plan":
+            return {"section_id": data["current_section"]["id"], "writing_goal": "Explain the current decision in depth.", "subtopics": [{"reader_question": "What should I compare first?", "points": ["Start with needs", "Verify evidence"], "source_ids": data["current_section"].get("source_ids", [])}], "must_include": ["A practical decision check"], "must_avoid_repeating": ["the introduction"], "format": data["current_section"].get("format", "paragraphs")}
         if stage == "section":
             return {"section_id": data["section"]["id"], "markdown": "## How to compare options\n\nStart with your needs. [VERIFY]", "claims_used": [], "verify": ["No sources supplied"]}
         if stage == "assembly":
-            return {"title": data["metadata"]["selected_title"], "meta_description": data["metadata"]["meta_description"], "markdown": "# SEO Tools Guide\n\n## How to compare options\n\nStart with your needs. [VERIFY]", "sources_used": [], "verify": ["No sources supplied"]}
+            return {"title": data["metadata"]["selected_title"], "meta_description": data["metadata"]["meta_description"], "intro_markdown": "Choose based on your workflow before comparing options.", "conclusion_markdown": "Use the checklist to confirm the right fit.", "sources_used": [], "verify": ["No sources supplied"]}
         if stage == "qa":
             return {"status": "needs_verification", "checks": [{"name": "factual support", "status": "verify", "note": "No sources supplied"}], "final_markdown": data["article"]["markdown"], "unresolved_verify": ["No sources supplied"]}
         raise AssertionError(stage)
@@ -88,17 +90,20 @@ class ContentGenerationApiTests(unittest.TestCase):
         status, generated = self.request("POST", f"/api/content-assets/{asset_id}/generate", {"project_id": project_id, "target_audience": "US small business owners", "business_goal": "commercial", "target_length": 900, "sources": [], "cta": "Compare your shortlist."})
 
         self.assertEqual(201, status)
-        self.assertEqual(["semantic", "title", "outline", "section", "assembly"], self.generator.stages)
+        self.assertEqual(["semantic", "title", "outline", "chapter_plan", "section", "assembly"], self.generator.stages)
         self.assertEqual(1, generated["draft"]["version"])  # type: ignore[index]
         self.assertIn("[VERIFY]", generated["draft"]["markdown"])  # type: ignore[index]
         self.assertEqual("not_run", generated["draft"]["qa_status"])  # type: ignore[index]
-        self.assertEqual(5, len(generated["runs"]))  # type: ignore[arg-type]
+        self.assertEqual(6, len(generated["runs"]))  # type: ignore[arg-type]
         self.assertNotIn("target_length", self.generator.stage_inputs["outline"][0])
         drafted_section = self.generator.stage_inputs["section"][0]["section"]
         self.assertEqual(["Start with needs"], drafted_section["key_points"])
         self.assertEqual(["[VERIFY]"], drafted_section["evidence_gaps"])
         self.assertEqual("table", drafted_section["format"])
-        self.assertEqual("content_seo_eeat_v2", generated["runs"][0]["prompt_version"])  # type: ignore[index]
+        self.assertEqual("Explain the current decision in depth.", drafted_section["chapter_plan"]["writing_goal"])
+        self.assertNotIn("section_drafts", self.generator.stage_inputs["assembly"][0])
+        self.assertIn("## How to compare options", generated["draft"]["markdown"])  # type: ignore[index]
+        self.assertEqual("content_competitor_learning_v11", generated["runs"][0]["prompt_version"])  # type: ignore[index]
 
         status, detail = self.request("GET", f"/api/content-assets/{asset_id}?project_id={project_id}")
         self.assertEqual(200, status)
@@ -172,7 +177,7 @@ class ContentGenerationApiTests(unittest.TestCase):
         )
 
         self.assertEqual(201, status)
-        self.assertEqual(["title", "outline", "section", "assembly"], self.generator.stages)
+        self.assertEqual(["title", "outline", "chapter_plan", "section", "assembly"], self.generator.stages)
         self.assertNotIn("brief", generated)  # type: ignore[operator]
         _, detail = self.request("GET", f"/api/content-assets/{asset_id}?project_id={project_id}")
         self.assertEqual(brief["id"], detail["brief"]["id"])  # type: ignore[index]
