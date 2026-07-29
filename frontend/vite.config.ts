@@ -5,6 +5,8 @@ export default defineConfig({
   plugins: [react()],
   build: {
     outDir: "../web",
-    emptyOutDir: true,
+    // The backend stores generated article images under web/generated-images.
+    // Do not erase them whenever the React bundle is rebuilt.
+    emptyOutDir: false,
   },
 });

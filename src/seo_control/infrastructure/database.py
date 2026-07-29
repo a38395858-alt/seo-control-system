@@ -567,6 +567,230 @@ _MIGRATIONS: tuple[Migration, ...] = (
             "CREATE INDEX IF NOT EXISTS idx_article_authority_sources ON content_authority_source_links(project_id, content_asset_id)",
         ),
     ),
+    (
+        15,
+        "authority search candidate audit",
+        (
+            """
+            CREATE TABLE IF NOT EXISTS authority_search_results (
+                id INTEGER PRIMARY KEY,
+                search_run_id TEXT NOT NULL,
+                project_id INTEGER NOT NULL,
+                content_asset_id INTEGER NOT NULL,
+                section_heading TEXT,
+                claim_topic TEXT,
+                search_query TEXT NOT NULL,
+                rank INTEGER,
+                title TEXT,
+                url TEXT,
+                domain TEXT,
+                status TEXT NOT NULL CHECK(status IN ('pending','accepted','skipped','search_error')),
+                error_summary TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY(content_asset_id) REFERENCES content_assets(id) ON DELETE CASCADE
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_authority_search_results_asset ON authority_search_results(project_id, content_asset_id, search_run_id, id)",
+        ),
+    ),
+    (
+        16,
+        "section images and wordpress publishing",
+        (
+            """
+            CREATE TABLE IF NOT EXISTS content_section_images (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                content_asset_id INTEGER NOT NULL,
+                draft_id INTEGER NOT NULL,
+                section_heading TEXT NOT NULL,
+                position INTEGER NOT NULL,
+                prompt TEXT NOT NULL,
+                alt_text TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'prompt_ready' CHECK(status IN ('prompt_ready','generating','ready','failed')),
+                image_url TEXT,
+                provider TEXT,
+                model TEXT,
+                error_summary TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY(content_asset_id) REFERENCES content_assets(id) ON DELETE CASCADE,
+                FOREIGN KEY(draft_id) REFERENCES content_drafts(id) ON DELETE CASCADE,
+                UNIQUE(draft_id, position)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS project_wordpress_configs (
+                project_id INTEGER PRIMARY KEY,
+                site_url TEXT NOT NULL,
+                username TEXT NOT NULL,
+                application_password TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS content_wordpress_publications (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                content_asset_id INTEGER NOT NULL,
+                draft_id INTEGER NOT NULL,
+                wordpress_post_id INTEGER,
+                wordpress_url TEXT,
+                status TEXT NOT NULL CHECK(status IN ('draft','publish','failed')),
+                error_summary TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY(content_asset_id) REFERENCES content_assets(id) ON DELETE CASCADE,
+                FOREIGN KEY(draft_id) REFERENCES content_drafts(id) ON DELETE CASCADE
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_content_section_images_asset ON content_section_images(project_id, content_asset_id, draft_id, position)",
+            "CREATE INDEX IF NOT EXISTS idx_content_wordpress_publications_asset ON content_wordpress_publications(project_id, content_asset_id, draft_id, id DESC)",
+        ),
+    ),
+    (
+        17,
+        "authority URL exclusion memory",
+        (
+            """
+            CREATE TABLE IF NOT EXISTS authority_url_exclusions (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                normalized_url TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                UNIQUE(project_id, normalized_url)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_authority_url_exclusions_project ON authority_url_exclusions(project_id, normalized_url)",
+            """
+            INSERT OR IGNORE INTO authority_url_exclusions(project_id, normalized_url, reason)
+            SELECT project_id, lower(rtrim(url, '/')), COALESCE(error_summary, 'Previously skipped authority-search URL')
+            FROM authority_search_results
+            WHERE status='skipped' AND url IS NOT NULL AND url<>''
+            """,
+        ),
+    ),
+    (
+        18,
+        "SEO section image filenames",
+        (
+            "ALTER TABLE content_section_images ADD COLUMN seo_filename TEXT",
+        ),
+    ),
+    (
+        19,
+        "project console metadata and first-party knowledge",
+        (
+            "ALTER TABLE projects ADD COLUMN industry TEXT NOT NULL DEFAULT ''",
+            """
+            CREATE TABLE IF NOT EXISTS project_knowledge_documents (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                source_type TEXT NOT NULL DEFAULT 'manual',
+                url TEXT NOT NULL DEFAULT '',
+                content TEXT NOT NULL DEFAULT '',
+                knowledge_type TEXT NOT NULL DEFAULT 'other',
+                status TEXT NOT NULL DEFAULT 'ready',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_project_knowledge_documents_project ON project_knowledge_documents(project_id, knowledge_type, updated_at DESC)",
+        ),
+    ),
+    (
+        20,
+        "first-party knowledge crawl history",
+        (
+            """
+            CREATE TABLE IF NOT EXISTS project_knowledge_crawl_runs (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','completed','failed')),
+                max_pages INTEGER NOT NULL DEFAULT 20,
+                discovered_count INTEGER NOT NULL DEFAULT 0,
+                accepted_count INTEGER NOT NULL DEFAULT 0,
+                skipped_count INTEGER NOT NULL DEFAULT 0,
+                failed_count INTEGER NOT NULL DEFAULT 0,
+                message TEXT NOT NULL DEFAULT '',
+                failure_reason TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                completed_at TEXT,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS project_knowledge_crawl_pages (
+                id INTEGER PRIMARY KEY,
+                crawl_run_id INTEGER NOT NULL,
+                url TEXT NOT NULL,
+                title TEXT NOT NULL DEFAULT '',
+                knowledge_type TEXT NOT NULL DEFAULT 'other',
+                status TEXT NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY(crawl_run_id) REFERENCES project_knowledge_crawl_runs(id) ON DELETE CASCADE,
+                UNIQUE(crawl_run_id, url)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_project_knowledge_crawl_runs_project ON project_knowledge_crawl_runs(project_id, id DESC)",
+        ),
+    ),
+    (
+        21,
+        "google search console project binding",
+        (
+            """
+            CREATE TABLE IF NOT EXISTS gsc_oauth_connection (
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                account_email TEXT NOT NULL DEFAULT '',
+                refresh_token TEXT NOT NULL,
+                scopes TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS project_gsc_properties (
+                project_id INTEGER PRIMARY KEY,
+                property_url TEXT NOT NULL,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS project_gsc_query_rows (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                property_url TEXT NOT NULL,
+                query TEXT NOT NULL,
+                page_url TEXT NOT NULL,
+                clicks REAL NOT NULL DEFAULT 0,
+                impressions REAL NOT NULL DEFAULT 0,
+                ctr REAL NOT NULL DEFAULT 0,
+                position REAL NOT NULL DEFAULT 0,
+                collected_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                UNIQUE(project_id, property_url, query, page_url)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_project_gsc_query_rows_anchor ON project_gsc_query_rows(project_id, clicks DESC, impressions DESC)",
+        ),
+    ),
+    (
+        22,
+        "content asset topic tags",
+        (
+            "ALTER TABLE content_assets ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]'",
+        ),
+    ),
 )
 
 

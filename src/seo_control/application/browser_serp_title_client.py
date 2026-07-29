@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from html.parser import HTMLParser
 import json
+import os
 from pathlib import Path
 import socket
 import subprocess
@@ -149,6 +150,13 @@ class BrowserSerpTitleClient:
     def _ensure_chrome(self) -> None:
         if self._process is not None and self._process.poll() is None and self._port is not None:
             return
+        existing_port = self._existing_gsc_debugging_port()
+        if existing_port is not None:
+            # A local service restart must continue using the already-open,
+            # user-authenticated Chrome profile instead of trying to launch a
+            # second process against the same profile directory.
+            self._process, self._port = None, existing_port
+            return
         if self._chrome_path is None:
             raise GoogleSerpProtocolError("未找到 Chrome 浏览器，无法执行 Google 标题抓取。")
         port = self._free_port()
@@ -172,6 +180,48 @@ class BrowserSerpTitleClient:
         except OSError as error:
             self._process, self._port = None, None
             raise GoogleSerpProtocolError("Chrome 无法启动。") from error
+
+    @staticmethod
+    def _existing_gsc_debugging_port() -> int | None:
+        """Find only Chrome instances that already expose a GSC DevTools page.
+
+        This avoids probing arbitrary local services.  It is primarily needed
+        when the Python server restarts while the dedicated, signed-in Chrome
+        profile remains open.
+        """
+        if os.name != "nt":
+            return None
+        try:
+            process_rows = subprocess.check_output(["tasklist", "/FO", "CSV", "/NH"], text=True, encoding="utf-8", errors="ignore")
+            chrome_pids = {
+                line.split('","')[1].strip('"')
+                for line in process_rows.splitlines()
+                if line.casefold().startswith('"chrome.exe",') and '","' in line
+            }
+            if not chrome_pids:
+                return None
+            sockets = subprocess.check_output(["netstat", "-ano", "-p", "tcp"], text=True, encoding="utf-8", errors="ignore")
+            ports: set[int] = set()
+            for line in sockets.splitlines():
+                parts = line.split()
+                if len(parts) != 5 or parts[3] != "LISTENING" or parts[4] not in chrome_pids:
+                    continue
+                host_port = parts[1].rsplit(":", 1)
+                if len(host_port) != 2 or host_port[0] not in {"127.0.0.1", "[::1]"}:
+                    continue
+                try: ports.add(int(host_port[1]))
+                except ValueError: continue
+            for port in sorted(ports):
+                try:
+                    with urlopen(f"http://127.0.0.1:{port}/json", timeout=0.4) as response:  # nosec B310 - local Chrome DevTools only
+                        targets = json.loads(response.read().decode("utf-8"))
+                    if any(isinstance(target, dict) and "search.google.com/search-console" in str(target.get("url") or "") for target in targets):
+                        return port
+                except (OSError, ValueError, json.JSONDecodeError):
+                    continue
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return None
 
     def _close_chrome(self) -> None:
         if self._process is not None and self._process.poll() is None:

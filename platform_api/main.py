@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field
 from redis import Redis
 
 from platform_api import storage
-from platform_api.tasks import assess_task_sources, initialize_content_task, run_legacy_import_task
+from platform_api.tasks import assess_task_sources, crawl_website_knowledge_task, initialize_content_task, run_legacy_import_task
 
 
 class WebsiteCreate(BaseModel):
@@ -48,6 +48,10 @@ class KnowledgeCreate(BaseModel):
     source_type: str = Field(pattern="^(upload|domain|note)$")
     url: str = Field(default="", max_length=2000)
     content: str = Field(default="", max_length=100000)
+
+
+class KnowledgeCrawlRequest(BaseModel):
+    max_pages: int = Field(default=100, ge=1, le=300)
 
 
 class SiteTermCreate(BaseModel):
@@ -201,6 +205,30 @@ def add_knowledge(site_id: int, payload: KnowledgeCreate) -> dict[str, Any]:
 def remove_knowledge(site_id: int, document_id: int) -> None:
     try:
         storage.delete_knowledge(site_id, document_id)
+    except Exception as error:
+        raise _translate(error) from error
+
+
+@app.post("/api/websites/{site_id}/knowledge/crawl")
+def crawl_website_knowledge(site_id: int, payload: KnowledgeCrawlRequest) -> dict[str, Any]:
+    """Queue a full first-party knowledge scan without blocking the browser."""
+    try:
+        sites = {int(item["id"]): item for item in storage.list_websites()}
+        site = sites.get(site_id)
+        if site is None:
+            raise ValueError("website does not exist")
+        run = storage.create_knowledge_crawl_run(site_id, payload.max_pages)
+        result = crawl_website_knowledge_task.delay(int(run["id"]))
+        storage.set_knowledge_crawl_celery_id(int(run["id"]), result.id)
+        return {"run_id": run["id"], "status": "queued", "max_pages": payload.max_pages, "celery_task_id": result.id}
+    except Exception as error:
+        raise _translate(error) from error
+
+
+@app.get("/api/websites/{site_id}/knowledge/crawl/{run_id}")
+def get_website_knowledge_crawl(site_id: int, run_id: int) -> dict[str, Any]:
+    try:
+        return storage.get_knowledge_crawl_run(site_id, run_id)
     except Exception as error:
         raise _translate(error) from error
 

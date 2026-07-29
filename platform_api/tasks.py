@@ -3,7 +3,17 @@
 from __future__ import annotations
 
 from platform_api.celery_app import celery_app
-from platform_api.storage import assess_sources, initialize_platform_schema, initialize_task, record_task_failure, run_legacy_import
+from platform_api.site_crawler import crawl_site
+from platform_api.storage import (
+    assess_sources,
+    complete_knowledge_crawl_run,
+    connection,
+    fail_knowledge_crawl_run,
+    initialize_platform_schema,
+    initialize_task,
+    record_task_failure,
+    run_legacy_import,
+)
 
 
 @celery_app.task(name="platform.initialize_content_task")
@@ -31,3 +41,25 @@ def assess_task_sources(task_id: int) -> dict[str, object]:
 def run_legacy_import_task(legacy_project_id: int) -> dict[str, object]:
     initialize_platform_schema()
     return run_legacy_import(legacy_project_id)
+
+
+@celery_app.task(name="platform.crawl_website_knowledge")
+def crawl_website_knowledge_task(run_id: int) -> dict[str, object]:
+    """Run a full same-site knowledge crawl outside of the browser request."""
+    initialize_platform_schema()
+    try:
+        with connection() as database, database.cursor() as cursor:
+            cursor.execute(
+                """SELECT runs.site_id,runs.max_pages,websites.domain FROM site_knowledge_crawl_runs runs
+                   JOIN websites ON websites.id=runs.site_id WHERE runs.id=%s FOR UPDATE""",
+                (run_id,),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                raise ValueError("knowledge crawl run does not exist")
+            cursor.execute("UPDATE site_knowledge_crawl_runs SET status='running',message='Discovering and classifying relevant company pages.' WHERE id=%s", (run_id,))
+        pages = crawl_site(str(row["domain"]), int(row["max_pages"]))
+        return complete_knowledge_crawl_run(run_id, pages)
+    except Exception as error:
+        fail_knowledge_crawl_run(run_id, error)
+        raise

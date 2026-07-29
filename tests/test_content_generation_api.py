@@ -42,6 +42,8 @@ class FakeContentGenerator:
             return {"section_id": data["section"]["id"], "markdown": "## How to compare options\n\nStart with your needs. [VERIFY]", "claims_used": [], "verify": ["No sources supplied"]}
         if stage == "assembly":
             return {"title": data["metadata"]["selected_title"], "meta_description": data["metadata"]["meta_description"], "intro_markdown": "Choose based on your workflow before comparing options.", "conclusion_markdown": "Use the checklist to confirm the right fit.", "sources_used": [], "verify": ["No sources supplied"]}
+        if stage == "content_tags":
+            return {"tags": ["SEO Tools", "Product Comparison", "Buying Guide"]}
         if stage == "qa":
             return {"status": "needs_verification", "checks": [{"name": "factual support", "status": "verify", "note": "No sources supplied"}], "final_markdown": data["article"]["markdown"], "unresolved_verify": ["No sources supplied"]}
         raise AssertionError(stage)
@@ -90,7 +92,7 @@ class ContentGenerationApiTests(unittest.TestCase):
         status, generated = self.request("POST", f"/api/content-assets/{asset_id}/generate", {"project_id": project_id, "target_audience": "US small business owners", "business_goal": "commercial", "target_length": 900, "sources": [], "cta": "Compare your shortlist."})
 
         self.assertEqual(201, status)
-        self.assertEqual(["semantic", "title", "outline", "chapter_plan", "section", "assembly"], self.generator.stages)
+        self.assertEqual(["semantic", "title", "outline", "chapter_plan", "section", "assembly", "content_tags"], self.generator.stages)
         self.assertEqual(1, generated["draft"]["version"])  # type: ignore[index]
         self.assertIn("[VERIFY]", generated["draft"]["markdown"])  # type: ignore[index]
         self.assertEqual("not_run", generated["draft"]["qa_status"])  # type: ignore[index]
@@ -103,11 +105,12 @@ class ContentGenerationApiTests(unittest.TestCase):
         self.assertEqual("Explain the current decision in depth.", drafted_section["chapter_plan"]["writing_goal"])
         self.assertNotIn("section_drafts", self.generator.stage_inputs["assembly"][0])
         self.assertIn("## How to compare options", generated["draft"]["markdown"])  # type: ignore[index]
-        self.assertEqual("content_competitor_learning_v11", generated["runs"][0]["prompt_version"])  # type: ignore[index]
+        self.assertEqual("content_competitor_learning_v15", generated["runs"][0]["prompt_version"])  # type: ignore[index]
 
         status, detail = self.request("GET", f"/api/content-assets/{asset_id}?project_id={project_id}")
         self.assertEqual(200, status)
         self.assertEqual(1, len(detail["drafts"]))  # type: ignore[index]
+        self.assertEqual(["SEO Tools", "Product Comparison", "Buying Guide"], detail["tags"])  # type: ignore[index]
         self.assertEqual("completed", detail["runs"][-1]["status"])  # type: ignore[index]
 
     def test_each_generation_creates_a_new_version_without_overwriting_history(self) -> None:
@@ -177,7 +180,7 @@ class ContentGenerationApiTests(unittest.TestCase):
         )
 
         self.assertEqual(201, status)
-        self.assertEqual(["title", "outline", "chapter_plan", "section", "assembly"], self.generator.stages)
+        self.assertEqual(["title", "outline", "chapter_plan", "section", "assembly", "content_tags"], self.generator.stages)
         self.assertNotIn("brief", generated)  # type: ignore[operator]
         _, detail = self.request("GET", f"/api/content-assets/{asset_id}?project_id={project_id}")
         self.assertEqual(brief["id"], detail["brief"]["id"])  # type: ignore[index]

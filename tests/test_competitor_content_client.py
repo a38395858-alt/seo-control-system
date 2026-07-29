@@ -12,10 +12,41 @@ SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from seo_control.application.browser_competitor_content_client import _ArticleTextParser, _FallbackArticleTextParser, BrowserCompetitorContentClient  # noqa: E402
+from seo_control.application.browser_competitor_content_client import _ArticleTextParser, _FallbackArticleTextParser, _LooseArticleTextParser, _unwrap_bing_result_url, BrowserCompetitorContentClient  # noqa: E402
+from seo_control.web import competitor_bing_query, competitor_search_queries  # noqa: E402
 
 
 class CompetitorContentClientTests(unittest.TestCase):
+    def test_competitor_query_keeps_full_title_and_adds_intent_focused_waterproof_variant(self) -> None:
+        queries = competitor_search_queries(
+            "Are LED Stair Lights Outdoor Solar Waterproof? What to Look For",
+            "led stair lights outdoor solar",
+        )
+        self.assertEqual("Are LED Stair Lights Outdoor Solar Waterproof? What to Look For", queries[0])
+        self.assertIn("waterproof", queries[1].casefold())
+        self.assertIn("ip rating", queries[1].casefold())
+        self.assertNotIn("what to look for", queries[1].casefold())
+
+    def test_inspiration_title_uses_the_full_title_before_the_keyword_variant(self) -> None:
+        title = "10 Inspiring Ideas for LED Stair Lights Outdoor"
+        queries = competitor_search_queries(title, "led stair lights outdoor")
+
+        self.assertEqual(title, queries[0])
+        self.assertEqual("led stair lights outdoor ideas guide", queries[1])
+
+    def test_bing_uses_a_natural_outdoor_stair_lighting_ideas_query(self) -> None:
+        query = competitor_bing_query(
+            "10 Inspiring Ideas for LED Stair Lights Outdoor",
+            "led stair lights outdoor",
+        )
+
+        self.assertEqual("outdoor stair lighting ideas guide", query)
+
+    def test_unwraps_bing_redirect_to_the_actual_editorial_page(self) -> None:
+        redirect = "https://www.bing.com/ck/a?u=a1aHR0cHM6Ly9leGFtcGxlLmNvbS9vdXRkb29yLXN0YWlyLWxpZ2h0aW5n"
+
+        self.assertEqual("https://example.com/outdoor-stair-lighting", _unwrap_bing_result_url(redirect))
+
     def test_fallback_parser_recovers_article_text_from_an_unbalanced_header_template(self) -> None:
         html = "<header><p>Navigation text that should not hide the article.</p><main><h1>IP ratings</h1><p>" + ("Article evidence about waterproof LED strip lights. " * 25) + "</p><p>" + ("A second useful paragraph for the buyer decision. " * 15) + "</p></main>"
         strict = _ArticleTextParser(); strict.feed(html)
@@ -23,6 +54,15 @@ class CompetitorContentClientTests(unittest.TestCase):
         self.assertEqual([], strict.blocks)
         self.assertGreaterEqual(len(fallback.blocks), 3)
         self.assertGreater(len("\n".join(fallback.blocks)), 500)
+
+    def test_loose_parser_recovers_div_only_editorial_text_after_semantic_parsers_fail(self) -> None:
+        article = "<div>" + ("Outdoor stair lighting ideas explain safe placement, fixture spacing, and visual hierarchy. " * 24) + "</div>"
+        strict = _ArticleTextParser(); strict.feed(article)
+        fallback = _FallbackArticleTextParser(); fallback.feed(article)
+        loose = _LooseArticleTextParser(); loose.feed(article)
+        self.assertEqual([], strict.blocks)
+        self.assertEqual([], fallback.blocks)
+        self.assertGreater(len("\n".join(loose.blocks)), 500)
 
     def test_protocol_page_collection_runs_independent_urls_concurrently(self) -> None:
         client = BrowserCompetitorContentClient(browser=object(), max_workers=5)  # type: ignore[arg-type]

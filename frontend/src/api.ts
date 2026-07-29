@@ -2,8 +2,17 @@ import type { AuthoritySource, CompetitorResearch, ContentAsset, ContentAssetDet
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, options);
-  const payload = await response.json() as T & { error?: string };
-  if (!response.ok) throw new Error(payload.error || "请求失败，请稍后重试。");
+  const contentType = response.headers.get("content-type") || "";
+  const raw = await response.text();
+  let payload: (T & { error?: string }) | undefined;
+  try {
+    payload = raw ? JSON.parse(raw) as T & { error?: string } : undefined;
+  } catch {
+    const detail = contentType.includes("text/html") ? "服务返回了网页而不是接口数据，请刷新或重启本地服务后重试。" : "服务返回了无法识别的数据，请稍后重试。";
+    throw new Error(`${detail}（${response.status} ${response.statusText}）`);
+  }
+  if (!response.ok) throw new Error(payload?.error || `请求失败（${response.status} ${response.statusText}）。`);
+  if (!payload) throw new Error("服务未返回数据，请稍后重试。");
   return payload;
 }
 
@@ -13,10 +22,29 @@ export const api = {
   expand: (body: object) => request<ExpansionResult>("/api/suggest-expansions", json(body)),
   review: (body: object) => request<{ review: Review }>("/api/ai-keyword-reviews", json(body)),
   createProject: (body: object) => request<{ id: number }>("/api/projects", json(body)),
-  listProjects: () => request<Array<{ id: number; name: string }>>("/api/projects"),
+  listProjects: () => request<Array<{ id: number; name: string; site_url?: string | null; industry?: string; default_country?: string; default_language?: string }>>("/api/projects"),
+  listProjectSummaries: () => request<Array<{ id: number; name: string; site_url?: string | null; industry: string; default_country: string; default_language: string; keyword_count: number; selected_title_count: number; content_count: number; knowledge_count: number; latest_content_status?: string | null }>>("/api/projects/summary"),
+  updateProject: (projectId: number, body: object) => request<{ id: number; name: string; site_url?: string | null; industry: string; default_country: string; default_language: string }>(`/api/projects/${projectId}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
+  deleteProject: (projectId: number) => request<{ deleted: number }>(`/api/projects/${projectId}`, { method: "DELETE" }),
+  listSystemTasks: () => request<Array<{ task_type: string; id: number; project_id: number; project_name: string; status: string; updated_at: string; message: string }>>("/api/system-tasks"),
+  listProjectKnowledge: (projectId: number) => request<Array<{ id: number; project_id: number; title: string; source_type: string; url: string; content: string; knowledge_type: string; status: string; created_at: string; updated_at: string }>>(`/api/projects/${projectId}/knowledge`),
+  createProjectKnowledge: (projectId: number, body: { title: string; content: string; source_type?: string; url?: string; knowledge_type?: string }) => request<{ id: number }>(`/api/projects/${projectId}/knowledge`, json(body)),
+  deleteProjectKnowledge: (projectId: number, documentId: number) => request<{ deleted: number }>(`/api/projects/${projectId}/knowledge/${documentId}`, { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({}) }),
+  crawlProjectKnowledge: (projectId: number, max_pages = 20) => request<{ id: number; status: string; message: string; accepted_count: number; skipped_count: number; failed_count: number; pages: Array<{ url: string; title: string; knowledge_type: string; status: string; reason: string }> }>(`/api/projects/${projectId}/knowledge/crawl`, json({ max_pages })),
+  getProjectKnowledgeCrawl: (projectId: number, runId: number) => request<{ id: number; status: string; message: string; accepted_count: number; skipped_count: number; failed_count: number; pages: Array<{ url: string; title: string; knowledge_type: string; status: string; reason: string }> }>(`/api/projects/${projectId}/knowledge/crawl/${runId}`),
   getAiSettings: () => request<{ configured: boolean; base_url: string | null; model: string | null; provider: string | null; providers?: Record<string, { configured: boolean; base_url: string | null; model: string | null }>; assignments?: { keyword_review: string; title_generation: string } }>("/api/settings/ai"),
   saveAiSettings: (body: object) => request<{ configured: boolean; base_url: string; model: string; provider: string; providers?: Record<string, { configured: boolean; base_url: string | null; model: string | null }>; assignments?: { keyword_review: string; title_generation: string } }>("/api/settings/ai", json(body)),
   testAiSettings: (body: object = {}) => request<{ status: string; provider: string; model: string }>("/api/settings/ai/test", json(body)),
+  getSerperSettings: () => request<{ configured: boolean; provider: string; website: string }>("/api/settings/serper"),
+  saveSerperSettings: (body: { api_key: string }) => request<{ configured: boolean; provider: string; website: string }>("/api/settings/serper", json(body)),
+  testSerperSettings: (body: { api_key?: string } = {}) => request<{ status: string; provider: string; website: string; sample_title: string }>("/api/settings/serper/test", json(body)),
+  getImageGenerationSettings: () => request<{ configured: boolean; base_url?: string | null; model: string; provider: "openai" | "siliconflow"; provider_label: string; api_key_saved: boolean }>("/api/settings/images"),
+  saveImageGenerationSettings: (body: { provider: "openai" | "siliconflow"; model: string; api_key?: string }) => request<{ configured: boolean; base_url?: string | null; model: string; provider: "openai" | "siliconflow"; provider_label: string; api_key_saved: boolean }>("/api/settings/images", json(body)),
+  testImageGenerationSettings: () => request<{ status: string; provider: string; base_url?: string; model: string }>("/api/settings/images/test", json({})),
+  openProjectGscBrowser: (projectId: number) => request<{ status: string; message: string }>(`/api/projects/${projectId}/gsc/browser/open`),
+  captureProjectGscBrowser: (projectId: number) => request<{ anchors: Array<{ query: string; page_url: string; clicks: number; impressions: number; ctr: number; position: number }>; synced?: number }>(`/api/projects/${projectId}/gsc/browser/capture`, json({})),
+  captureProjectGscRankedPages: (projectId: number) => request<{ anchors: Array<{ query: string; page_url: string; clicks: number; impressions: number; ctr: number; position: number }>; synced?: number; capture?: { queries_checked: number; queries_without_page: number; queries_non_english?: number; max_position: number; cleared?: number } }>(`/api/projects/${projectId}/gsc/browser/capture-ranked-pages`, json({})),
+  listProjectGscAnchors: (projectId: number) => request<{ anchors: Array<{ query: string; page_url: string; clicks: number; impressions: number; ctr: number; position: number; collected_at: string }> }>(`/api/projects/${projectId}/gsc/anchors`),
   saveExpanded: (body: object) => request<{ inserted: number; existing: number }>("/api/expanded-keywords", json(body)),
   listKeywords: (projectId: number) => request<LibraryKeyword[]>(`/api/keywords?project_id=${projectId}`),
   deleteKeywords: (body: object) => request<{ deleted: number }>("/api/keywords", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
@@ -41,6 +69,13 @@ export const api = {
   createContentAsset: (body: object) => request<ContentAsset>("/api/content-assets", json(body)),
   deleteContentAssets: (body: object) => request<{ deleted: number }>("/api/content-assets", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
   getContentAsset: (assetId: number, projectId: number) => request<ContentAssetDetail>(`/api/content-assets/${assetId}?project_id=${projectId}`),
+  createSectionImagePrompts: (assetId: number, projectId: number) => request<{ images: import("./types").SectionImage[] }>(`/api/content-assets/${assetId}/image-prompts`, json({ project_id: projectId })),
+  generateAllSectionImages: (assetId: number, projectId: number) => request<{ generated: import("./types").SectionImage[]; failed: Array<{ id: string; error: string }> }>(`/api/content-assets/${assetId}/generate-images`, json({ project_id: projectId })),
+  generateSectionImage: (imageId: number, projectId: number) => request<import("./types").SectionImage>(`/api/content-images/${imageId}/generate`, json({ project_id: projectId })),
+  getWordPressConfig: (projectId: number) => request<{ configured: boolean; site_url?: string; username?: string }>(`/api/projects/${projectId}/wordpress`),
+  saveWordPressConfig: (projectId: number, body: object) => request<{ configured: boolean; site_url?: string; username?: string }>(`/api/projects/${projectId}/wordpress`, json(body)),
+  testWordPressConfig: (projectId: number) => request<{ status: string; username: string }>(`/api/projects/${projectId}/wordpress/test`, json({})),
+  publishWordPress: (assetId: number, body: object) => request<import("./types").WordPressPublication>(`/api/content-assets/${assetId}/publish-wordpress`, json(body)),
   createContentBrief: (assetId: number, body: object) => request<ContentBrief>(`/api/content-assets/${assetId}/briefs`, json(body)),
   createContentOutline: (assetId: number, body: object) => request<ContentOutline>(`/api/content-assets/${assetId}/outlines`, json(body)),
   generateContentBrief: (assetId: number, body: object) => request<ContentGenerationResult>(`/api/content-assets/${assetId}/generate-brief`, json(body)),

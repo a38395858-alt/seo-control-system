@@ -3,17 +3,34 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import date
+from datetime import date, timedelta
+import base64
+import csv
+import html
+import io
 import json
+import mimetypes
 import os
 import re
 import hashlib
+import time
+import subprocess
+import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import sqlite3
 from typing import Any, Iterator, Mapping
-from urllib.parse import parse_qs, urlsplit
+from urllib.error import HTTPError
+from urllib.parse import parse_qs, quote, urlencode, urljoin, urlparse, urlsplit
+from urllib.request import Request, urlopen
+import requests
+from PIL import Image, ImageOps
+try:
+    import win32crypt
+except ImportError:  # pragma: no cover - Windows desktop runtime supplies this
+    win32crypt = None
 
 from seo_control.application.csv_keyword_import import parse_keyword_csv
 from seo_control.application.ai_keyword_reviewer import OpenAICompatibleKeywordReviewer, RuleBasedKeywordReviewer
@@ -21,20 +38,152 @@ from seo_control.application.ai_title_generator import OpenAICompatibleTitleGene
 from seo_control.application.content_generator import ContentGenerationProtocolError, OpenAICompatibleContentGenerator, PROMPT_VERSION
 from seo_control.application.browser_serp_title_client import BrowserSerpTitleClient, GoogleSerpProtocolError, GoogleSerpVerificationRequired
 from seo_control.application.browser_competitor_content_client import BrowserCompetitorContentClient, CompetitorContentProtocolError
+from seo_control.application.serper_search_client import SerperSearchClient, SerperSearchProtocolError
 from seo_control.application.google_suggest_client import GoogleSuggestClient, GoogleSuggestProtocolError
+from seo_control.application.gsc_browser_capture_client import GscBrowserCaptureClient, GscBrowserCaptureError
 from seo_control.application.keyword_expansion_service import KeywordExpansionService
 from seo_control.application.keyword_import_service import KeywordImportService
 from seo_control.domain.keywords import normalize_keyword
 from seo_control.domain.keyword_scoring import KeywordScoringInput, calculate_keyword_score
 from seo_control.infrastructure.database import initialize_database
+from platform_api.site_crawler import crawl_site
 
 
 WEB_ROOT = Path(__file__).resolve().parents[2] / "web"
 LOCAL_CONFIGURATION_FILE = Path(__file__).resolve().parents[2] / "配置文件.txt"
 AI_SETTINGS_FILE = Path(__file__).resolve().parents[2] / "data" / "ai-settings.json"
 AI_PROVIDERS = ("openai", "gemini", "deepseek")
+IMAGE_GENERATION_PROVIDERS = ("openai", "siliconflow")
+SILICONFLOW_IMAGE_BASE_URL = "https://api.siliconflow.cn/v1"
+CONTENT_SECTION_IMAGE_SIZE = "800x600"
+CONTENT_SECTION_IMAGE_DIMENSIONS = (800, 600)
+# Free-tier image generation is rate-limited more strictly than the request
+# API advertises. Twenty seconds keeps a full H2 batch below the observed
+# burst threshold while still letting the user finish it in one operation.
+SILICONFLOW_IMAGE_REQUEST_INTERVAL_SECONDS = 20
 DEFAULT_AI_ASSIGNMENTS = {"keyword_review": "openai", "title_generation": "openai", "content_generation": "openai"}
 CONTENT_PROVIDER_LABELS = {"openai": "ChatGPT", "gemini": "Gemini", "deepseek": "DeepSeek"}
+AUTHORITY_SEARCH_FILE_EXCLUSIONS = "-filetype:pdf -filetype:doc -filetype:docx -filetype:xls -filetype:xlsx -filetype:ppt -filetype:pptx -filetype:csv -filetype:zip"
+AUTHORITY_NON_ARTICLE_PATH_MARKERS = ("/documentcenter/", "/docview", "/pdfjsviewer/", "/virtual-library/", "/weblink/", "/records/", "/download/", "/bidopportunities/")
+COMPETITOR_NON_ARTICLE_DOMAINS = ("pinterest.com", "youtube.com", "youtu.be", "instagram.com", "facebook.com", "tiktok.com")
+COMPETITOR_MARKETPLACE_DOMAINS = ("amazon.com", "ebay.com", "aliexpress.com", "temu.com", "walmart.com", "etsy.com", "wayfair.com")
+COMPETITOR_PRODUCT_PATH_MARKERS = ("/product/", "/products/", "/collections/", "/category/", "/categories/", "/shop/", "/store/", "/dp/", "/best-sellers/")
+
+
+def _looks_like_image_bytes(payload: bytes) -> bool:
+    """Accept image downloads whose CDN omits a useful Content-Type header."""
+    return payload.startswith((
+        b"\x89PNG\r\n\x1a\n",
+        b"\xff\xd8\xff",
+        b"GIF87a",
+        b"GIF89a",
+    )) or (payload.startswith(b"RIFF") and payload[8:12] == b"WEBP")
+
+
+def _image_retry_delay(error: Exception, attempt: int, provider: str) -> int:
+    """Honor provider throttling instead of immediately exhausting free quotas."""
+    if isinstance(error, HTTPError) and error.code == HTTPStatus.TOO_MANY_REQUESTS:
+        retry_after = error.headers.get("Retry-After") if error.headers else None
+        if isinstance(retry_after, str) and retry_after.isdigit():
+            return min(max(int(retry_after), SILICONFLOW_IMAGE_REQUEST_INTERVAL_SECONDS), 90)
+        return min(SILICONFLOW_IMAGE_REQUEST_INTERVAL_SECONDS * (2 ** (attempt - 1)), 90)
+    return (SILICONFLOW_IMAGE_REQUEST_INTERVAL_SECONDS if provider == "siliconflow" else 2) * attempt
+
+
+def competitor_search_queries(title: str, keyword: str) -> list[str]:
+    """Return a full-intent query plus a compact research variant.
+
+    Product-name titles begin with their concise keyword, because their full
+    marketing headline usually returns retail listings. Informational titles
+    (including comparisons, guides and inspiration/idea lists) begin with the
+    exact approved title, because stripping their intent also strips the
+    article-shaped results needed for competitor research.
+    """
+    original = " ".join(title.split())
+    core_keyword = " ".join(keyword.split())
+    if not original and not core_keyword:
+        return []
+    stop_words = {"a", "an", "and", "are", "can", "do", "does", "for", "how", "is", "look", "of", "or", "the", "to", "what", "when", "which", "with"}
+    raw_terms = re.findall(r"[A-Za-z0-9]+", f"{title} {keyword}")
+    terms: list[str] = []
+    seen: set[str] = set()
+    for term in raw_terms:
+        lowered = term.casefold()
+        if len(lowered) < 2 or lowered in stop_words or lowered in seen:
+            continue
+        seen.add(lowered)
+        terms.append(term)
+    if not terms:
+        return [core_keyword or original]
+    compact = " ".join(terms)
+    title_intent = original.casefold()
+    inspiration_intent = any(
+        marker in title_intent
+        for marker in (" idea", "inspiration", "inspiring", "tips", "examples", "designs", "styles")
+    )
+    if inspiration_intent:
+        # A literal headline such as "10 Inspiring Ideas ..." frequently
+        # returns Pinterest and video cards. Keep its subject keyword but use
+        # a guide-shaped variant to surface editorial pages on the second
+        # query; the exact title remains the first query.
+        compact = core_keyword or compact
+        if "idea" not in compact.casefold():
+            compact = f"{compact} ideas"
+        if "guide" not in compact.casefold():
+            compact = f"{compact} guide"
+    elif any(marker in title_intent for marker in ("waterproof", "water resistant", "weatherproof")):
+        compact = f"{compact} IP rating"
+    elif any(marker in title_intent for marker in ("how ", "what to", "guide", "look for", "best ", "compare", "vs.")):
+        compact = f"{compact} guide"
+    # An informational headline carries intent that the raw product keyword
+    # loses (for example, "solar vs wired" or "inspiring ideas"). For ordinary
+    # product-style titles, begin with the concise keyword and use the
+    # title-derived form as a fallback.
+    intent_first = any(
+        marker in title_intent
+        for marker in (
+            " vs ", " vs. ", " versus ", "compare", "comparison",
+            "how ", "what to", "look for", "guide", "review",
+            " idea", "inspiration", "inspiring", "tips", "examples",
+            "designs", "styles", "ways to",
+        )
+    )
+    primary = original if intent_first else (core_keyword or original)
+    return list(dict.fromkeys(query for query in (primary, compact) if query.casefold()))
+
+
+def competitor_bing_query(title: str, keyword: str) -> str:
+    """Return a natural Bing query that retains the article's reader intent.
+
+    Bing can over-weight the token ``LED`` and return electronics definitions
+    for a product-shaped keyword. Inspiration titles need a human phrasing
+    such as ``outdoor stair lighting ideas`` rather than a bag of product
+    terms, while other intents retain the compact query used for Google.
+    """
+    title_intent = " ".join(title.casefold().split())
+    inspiration = any(marker in title_intent for marker in (" idea", "inspiration", "inspiring", "tips", "examples", "designs", "styles"))
+    if inspiration and "outdoor" in title_intent and "stair" in title_intent:
+        return "outdoor stair lighting ideas guide"
+    queries = competitor_search_queries(title, keyword)
+    return queries[-1] if queries else " ".join(keyword.split()) or " ".join(title.split())
+
+
+def competitor_candidate_exclusion_reason(item: Mapping[str, Any], own_domain: str) -> str | None:
+    """Reject obvious non-editorial candidates before any page crawler runs."""
+    domain = str(item.get("domain") or "").casefold()
+    url = str(item.get("url") or "").casefold()
+    title = str(item.get("title") or "").casefold()
+    if own_domain and (domain == own_domain or domain.endswith("." + own_domain)):
+        return "Current website page is excluded from competitor research."
+    if any(domain == blocked or domain.endswith("." + blocked) for blocked in COMPETITOR_NON_ARTICLE_DOMAINS):
+        return "Visual/social/video result is excluded because it is not a reusable editorial article source."
+    if any(domain == marketplace or domain.endswith("." + marketplace) for marketplace in COMPETITOR_MARKETPLACE_DOMAINS):
+        return "Marketplace listing is excluded before crawling because it is not an editorial article."
+    if any(marker in url for marker in COMPETITOR_PRODUCT_PATH_MARKERS):
+        return "Product, category, collection, or store page is excluded before crawling."
+    if any(marker in title for marker in ("buy ", "shop ", "best sellers", "for sale", "product catalog")):
+        return "Product-shopping result is excluded before crawling."
+    return None
 
 
 class KeywordDiscoveryServer(ThreadingHTTPServer):
@@ -46,6 +195,9 @@ class KeywordDiscoveryServer(ThreadingHTTPServer):
     ai_settings_path: Path
     content_generator: Any | None
     competitor_content_client: Any
+    competitor_search_client: Any | None
+    gsc_oauth_states: dict[str, int]
+    gsc_browser_client: GscBrowserCaptureClient
 
 
 class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
@@ -56,12 +208,44 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
-        if path == "/api/keywords":
+        wordpress_project = re.fullmatch(r"/api/projects/(\d+)/wordpress", path)
+        gsc_project = re.fullmatch(r"/api/projects/(\d+)/gsc(?:/(anchors|export\.csv))?", path)
+        gsc_authorize = re.fullmatch(r"/api/projects/(\d+)/gsc/authorize", path)
+        gsc_browser_open = re.fullmatch(r"/api/projects/(\d+)/gsc/browser/open", path)
+        knowledge_project = re.fullmatch(r"/api/projects/(\d+)/knowledge", path)
+        crawl_run = re.fullmatch(r"/api/projects/(\d+)/knowledge/crawl/(\d+)", path)
+        if gsc_browser_open:
+            self._open_gsc_browser(int(gsc_browser_open.group(1)))
+        elif path == "/api/gsc/oauth/callback":
+            self._gsc_oauth_callback(parse_qs(urlsplit(self.path).query))
+        elif gsc_authorize:
+            self._start_gsc_oauth(int(gsc_authorize.group(1)))
+        elif gsc_project:
+            if gsc_project.group(2) == "anchors": self._list_gsc_anchor_candidates(int(gsc_project.group(1)))
+            elif gsc_project.group(2) == "export.csv": self._export_gsc_anchor_candidates(int(gsc_project.group(1)))
+            else: self._get_gsc_project(int(gsc_project.group(1)))
+        elif wordpress_project:
+            self._get_wordpress_config(int(wordpress_project.group(1)))
+        elif crawl_run:
+            self._get_knowledge_crawl_run(int(crawl_run.group(1)), int(crawl_run.group(2)))
+        elif knowledge_project:
+            self._list_project_knowledge(int(knowledge_project.group(1)))
+        elif path == "/api/projects/summary":
+            self._list_project_summaries()
+        elif path == "/api/system-tasks":
+            self._list_system_tasks()
+        elif path == "/api/keywords":
             self._list_keywords()
         elif path == "/api/projects":
             self._list_projects()
         elif path == "/api/settings/ai":
             self._get_ai_settings()
+        elif path == "/api/settings/serper":
+            self._get_serper_settings()
+        elif path == "/api/settings/images":
+            self._get_image_generation_settings()
+        elif path == "/api/settings/gsc":
+            self._get_gsc_settings()
         elif path == "/api/title-library":
             self._list_title_library()
         elif path == "/api/serp-title-samples":
@@ -78,7 +262,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             self._get_content_asset(self._content_asset_path(path) or 0)
         elif self._keyword_title_candidates_path(path) is not None:
             self._list_title_candidates(self._keyword_title_candidates_path(path) or 0)
-        elif path in {"", "/", "/agent-platform", "/projects", "/system-tasks", "/integrations", "/research", "/keywords", "/titles", "/title-library", "/content", "/content-library", "/content-memory", "/authority-sources", "/scoring", "/settings"} or re.fullmatch(r"/content-library/\d+", path) or re.fullmatch(r"/(agent-platform/site|projects)/\d+", path):
+        elif path in {"", "/", "/agent-platform", "/projects", "/system-tasks", "/integrations", "/research", "/keywords", "/titles", "/title-library", "/content", "/content-library", "/content-memory", "/knowledge", "/website-crawl", "/gsc", "/content-publish", "/authority-sources", "/scoring", "/settings"} or re.fullmatch(r"/content-library/\d+", path) or re.fullmatch(r"/(agent-platform/site|projects)(/\d+)?(?:/.*)?", path):
             self._serve_index()
         else:
             super().do_GET()
@@ -87,13 +271,32 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         path = urlsplit(self.path).path
         candidate_id = self._title_candidate_action_path(path, "select")
         content_action = self._content_asset_action_path(path)
-        if path not in {"/api/projects", "/api/keyword-imports", "/api/suggest-expansions", "/api/keyword-opportunity-scores", "/api/expanded-keywords", "/api/ai-keyword-reviews", "/api/serp-title-research", "/api/browser-serp-title-research", "/api/title-generation-jobs", "/api/multi-provider-title-generation-jobs", "/api/title-candidates", "/api/content-assets", "/api/authority-sources", "/api/authority-sources/research", "/api/settings/ai", "/api/settings/ai/test"} and candidate_id is None and content_action is None:
+        wordpress_project = re.fullmatch(r"/api/projects/(\d+)/wordpress(?:/(test))?", path)
+        gsc_project = re.fullmatch(r"/api/projects/(\d+)/gsc/(property|sync)", path)
+        gsc_browser_capture = re.fullmatch(r"/api/projects/(\d+)/gsc/browser/(capture|capture-ranked-pages)", path)
+        knowledge_project = re.fullmatch(r"/api/projects/(\d+)/knowledge(?:/(crawl))?", path)
+        image_generate = re.fullmatch(r"/api/content-images/(\d+)/generate", path)
+        if path not in {"/api/projects", "/api/keyword-imports", "/api/suggest-expansions", "/api/keyword-opportunity-scores", "/api/expanded-keywords", "/api/ai-keyword-reviews", "/api/serp-title-research", "/api/browser-serp-title-research", "/api/title-generation-jobs", "/api/multi-provider-title-generation-jobs", "/api/title-candidates", "/api/content-assets", "/api/authority-sources", "/api/authority-sources/research", "/api/settings/ai", "/api/settings/ai/test", "/api/settings/serper", "/api/settings/serper/test", "/api/settings/images", "/api/settings/images/test", "/api/settings/gsc"} and candidate_id is None and content_action is None and wordpress_project is None and gsc_project is None and gsc_browser_capture is None and knowledge_project is None and image_generate is None:
             self._json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
             return
         payload = self._read_json()
         if payload is None:
             return
-        if path == "/api/projects":
+        if wordpress_project:
+            if wordpress_project.group(2): self._test_wordpress_config(int(wordpress_project.group(1)), payload)
+            else: self._save_wordpress_config(int(wordpress_project.group(1)), payload)
+        elif gsc_project:
+            if gsc_project.group(2) == "property": self._save_gsc_property(int(gsc_project.group(1)), payload)
+            else: self._sync_gsc_rankings(int(gsc_project.group(1)), payload)
+        elif gsc_browser_capture:
+            if gsc_browser_capture.group(2) == "capture-ranked-pages": self._capture_gsc_ranked_pages(int(gsc_browser_capture.group(1)))
+            else: self._capture_gsc_browser_rows(int(gsc_browser_capture.group(1)))
+        elif knowledge_project:
+            if knowledge_project.group(2): self._crawl_project_knowledge(int(knowledge_project.group(1)), payload)
+            else: self._create_project_knowledge(int(knowledge_project.group(1)), payload)
+        elif image_generate:
+            self._generate_section_image(int(image_generate.group(1)), payload)
+        elif path == "/api/projects":
             self._create_project(payload)
         elif path == "/api/keyword-imports":
             self._import_keywords(payload)
@@ -124,11 +327,24 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             if action == "briefs": self._create_content_brief(asset_id, payload)
             elif action == "outlines": self._create_content_outline(asset_id, payload)
             elif action == "research-competitors": self._research_competitors_api(asset_id, payload)
+            elif action == "image-prompts": self._create_section_image_prompts(asset_id, payload)
+            elif action == "generate-images": self._generate_all_section_images(asset_id, payload)
+            elif action == "publish-wordpress": self._publish_wordpress(asset_id, payload)
             else: self._generate_content(asset_id, action, payload)
         elif path == "/api/settings/ai":
             self._save_ai_settings(payload)
         elif path == "/api/settings/ai/test":
             self._test_ai_settings(payload)
+        elif path == "/api/settings/serper":
+            self._save_serper_settings(payload)
+        elif path == "/api/settings/serper/test":
+            self._test_serper_settings(payload)
+        elif path == "/api/settings/images":
+            self._save_image_generation_settings(payload)
+        elif path == "/api/settings/images/test":
+            self._test_image_generation_settings(payload)
+        elif path == "/api/settings/gsc":
+            self._save_gsc_settings(payload)
         elif candidate_id is not None:
             self._select_title_candidate(candidate_id, payload)
         else:
@@ -136,12 +352,17 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
 
     def do_DELETE(self) -> None:
         path = urlsplit(self.path).path
+        project_match = re.fullmatch(r"/api/projects/(\d+)", path)
+        if project_match:
+            self._delete_project(int(project_match.group(1)))
+            return
         candidate_id = self._title_candidate_path(path)
         content_asset_id = self._content_asset_path(path)
         memory_id = self._content_memory_path(path)
         authority_match = re.fullmatch(r"/api/authority-sources/(\d+)", path)
+        knowledge_match = re.fullmatch(r"/api/projects/(\d+)/knowledge/(\d+)", path)
         authority_id = int(authority_match.group(1)) if authority_match else None
-        if path not in {"/api/keywords", "/api/content-assets", "/api/title-candidates"} and candidate_id is None and content_asset_id is None and memory_id is None and authority_id is None:
+        if path not in {"/api/keywords", "/api/content-assets", "/api/title-candidates"} and candidate_id is None and content_asset_id is None and memory_id is None and authority_id is None and knowledge_match is None:
             self._json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
             return
         payload = self._read_json()
@@ -157,8 +378,20 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             self._delete_content_memory(memory_id, payload)
         elif payload is not None and authority_id is not None:
             self._delete_authority_source(authority_id, payload)
+        elif knowledge_match is not None:
+            self._delete_project_knowledge(int(knowledge_match.group(1)), int(knowledge_match.group(2)))
         elif payload is not None:
             self._delete_keywords(payload)
+
+    def do_PUT(self) -> None:
+        path = urlsplit(self.path).path
+        project_match = re.fullmatch(r"/api/projects/(\d+)", path)
+        if project_match is None:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
+            return
+        payload = self._read_json()
+        if payload is not None:
+            self._update_project(int(project_match.group(1)), payload)
 
     def _serve_index(self) -> None:
         try:
@@ -196,6 +429,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         if len(values) != 1: self._json(HTTPStatus.BAD_REQUEST, {"error": "project_id is required."}); return
         with self._database() as connection:
             rows = connection.execute("SELECT assets.*, keywords.keyword FROM content_assets assets JOIN keywords ON keywords.id=assets.keyword_id WHERE assets.project_id=? AND assets.deleted_at IS NULL ORDER BY assets.updated_at DESC, assets.id DESC", (int(values[0]),)).fetchall()
+            rows = [self._ensure_content_asset_tags(connection, row) for row in rows]
         self._json(HTTPStatus.OK, [self._content_asset_payload(row) for row in rows])
 
     def _list_content_library(self) -> None:
@@ -217,6 +451,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                    ORDER BY assets.updated_at DESC, assets.id DESC""",
                 (project_id,),
             ).fetchall()
+            rows = [self._ensure_content_asset_tags(connection, row) for row in rows]
         self._json(HTTPStatus.OK, [self._content_asset_payload(row) for row in rows])
 
     def _get_content_asset(self, asset_id: int) -> None:
@@ -281,30 +516,90 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         self._json(HTTPStatus.CREATED, research)
 
     def _run_competitor_research(self, connection: sqlite3.Connection, asset: sqlite3.Row, generator: Any, provider: str, model: str | None) -> dict[str, Any]:
-        """Capture up to five accessible competitors and persist website/project memory."""
+        """Capture one to five accessible competitors and persist website/project memory."""
+        queries = competitor_search_queries(str(asset["title_snapshot"]), str(asset["keyword"] or ""))
+        if not queries:
+            raise ValueError("a selected title is required for competitor research")
+        google_query = queries[0]
         with connection:
             cursor = connection.execute(
                 "INSERT INTO competitor_research_runs(project_id,content_asset_id,query,locale,provider,model) VALUES(?,?,?,?,?,?)",
-                (asset["project_id"], asset["id"], asset["title_snapshot"], asset["locale"], provider, model),
+                (asset["project_id"], asset["id"], f"Serper.dev · Google API: {' → '.join(queries)}", asset["locale"], provider, model),
             )
             run_id = int(cursor.lastrowid)
+            connection.execute("UPDATE competitor_research_runs SET query=? WHERE id=?", (f"Serper.dev Google API: {google_query}", run_id))
         try:
-            results = self.server.competitor_content_client.search(query=asset["title_snapshot"], locale=asset["locale"], max_results=20)
+            # Query one preserves the user-approved full title. Query two is a
+            # compact, informational form derived only from title/keyword terms
+            # (for example, "... waterproof IP rating"). Combining two first
+            # result pages avoids shopping-heavy SERPs without accepting retail
+            # pages as article evidence.
+            results: list[dict[str, Any]] = []
+            seen_urls: set[str] = set()
+            search_errors: list[str] = []
+            search_client = getattr(self.server, "competitor_search_client", None)
+            if search_client is None:
+                serper_key = _serper_api_key(self.server.ai_settings_path)
+                if serper_key is None:
+                    raise CompetitorContentProtocolError("Serper.dev · Google Search API is not configured. Save the Serper API key in AI & integrations before competitor research.")
+                search_client = SerperSearchClient(serper_key)
+            try:
+                found = search_client.search(query=google_query, locale=asset["locale"], max_results=30)
+            except SerperSearchProtocolError as error:
+                search_errors.append(f"{google_query}: {error}")
+                found = []
+            for item in found:
+                url = str(item.get("url") or "")
+                normalized = url.split("#", 1)[0].rstrip("/").casefold()
+                if not normalized or normalized in seen_urls:
+                    continue
+                seen_urls.add(normalized)
+                result = dict(item)
+                result["rank"] = len(results) + 1
+                result["search_query"] = google_query
+                results.append(result)
+                if len(results) >= 30:
+                    break
+            if not results:
+                message = "Serper.dev · Google Search API returned no readable organic results for the selected title. " + " | ".join(search_errors)
+                with connection:
+                    connection.execute(
+                        "UPDATE competitor_research_runs SET status='insufficient',error_summary=?,completed_at=CURRENT_TIMESTAMP WHERE id=?",
+                        (message, run_id),
+                    )
+                raise CompetitorContentProtocolError(message)
             selected: list[dict[str, Any]] = []
             own_domain = self._project_domain(connection, asset["project_id"])
             # Search covers Google's first two pages.  We probe all returned
             # organic candidates, but retain only the first five usable
             # articles.  Limiting the probe to page one caused legitimate
             # tasks to stop at two sources even when page two had articles.
-            candidates = [item for item in results if not own_domain or (item["domain"] != own_domain and not item["domain"].endswith("." + own_domain))]
-            batch = self.server.competitor_content_client.extract_many([str(item["url"]) for item in candidates], max_workers=5) if callable(getattr(self.server.competitor_content_client, "extract_many", None)) else {}
+            def editorial_candidates(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+                candidates: list[dict[str, Any]] = []
+                for item in items:
+                    reason = competitor_candidate_exclusion_reason(item, own_domain)
+                    if reason:
+                        with connection:
+                            connection.execute(
+                                "INSERT INTO competitor_research_items(research_run_id,rank,search_title,url,domain,status,error_summary) VALUES(?,?,?,?,?, 'skipped',?)",
+                                (run_id, item["rank"], item["title"], item["url"], item["domain"], reason),
+                            )
+                        continue
+                    candidates.append(item)
+                return candidates
+
+            # Crawl only the highest-ranking five non-product/article
+            # candidates. The AI relevance stage receives their extracted
+            # bodies, never search snippets or a large scraped corpus.
+            candidates = editorial_candidates(results)[:5]
+            batch = self.server.competitor_content_client.extract_many([str(item["url"]) for item in candidates], max_workers=5, respect_robots=False) if callable(getattr(self.server.competitor_content_client, "extract_many", None)) else {}
             extracted_pages: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
             for result in candidates:
                 try:
                     fetched = batch.get(str(result["url"])) if batch else None
                     if isinstance(fetched, Exception):
                         raise fetched
-                    page = fetched if isinstance(fetched, Mapping) else self.server.competitor_content_client.extract(url=str(result["url"]))
+                    page = fetched if isinstance(fetched, Mapping) else self._extract_competitor_content(url=str(result["url"]))
                     extracted_pages.append((result, page))
                 except Exception as error:
                     with connection:
@@ -312,17 +607,64 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                             "INSERT INTO competitor_research_items(research_run_id,rank,search_title,url,domain,status,error_summary) VALUES(?,?,?,?,?, 'failed',?)",
                             (run_id, result["rank"], result["title"], result["url"], result["domain"], str(error)),
                         )
+            # This content-research workflow deliberately uses the selected
+            # title's Serper/Google results only. Bing remains available for
+            # other tools, but is not mixed into this article's evidence pack.
+            bing_search = None
+            if callable(bing_search):
+                bing_query = competitor_bing_query(str(asset["title_snapshot"]), str(asset["keyword"] or ""))
+                try:
+                    bing_found = bing_search(query=bing_query, locale=asset["locale"], max_results=20)
+                except Exception as error:
+                    search_errors.append(f"Bing fallback {bing_query}: {error}")
+                    bing_found = []
+                bing_results: list[dict[str, Any]] = []
+                for item in bing_found:
+                    url = str(item.get("url") or "")
+                    normalized = url.split("#", 1)[0].rstrip("/").casefold()
+                    if not normalized or normalized in seen_urls:
+                        continue
+                    seen_urls.add(normalized)
+                    result = dict(item)
+                    result["rank"] = len(results) + len(bing_results) + 1
+                    result["search_query"] = f"Bing fallback: {bing_query}"
+                    bing_results.append(result)
+                if bing_results:
+                    results.extend(bing_results)
+                    with connection:
+                        connection.execute("UPDATE competitor_research_runs SET query=? WHERE id=?", (f"Serper.dev · Google API: {' → '.join(queries)} | Bing fallback: {bing_query}", run_id))
+                    bing_candidates = editorial_candidates(bing_results)
+                    bing_batch = self.server.competitor_content_client.extract_many([str(item["url"]) for item in bing_candidates], max_workers=5, respect_robots=False) if callable(getattr(self.server.competitor_content_client, "extract_many", None)) else {}
+                    for result in bing_candidates:
+                        try:
+                            fetched = bing_batch.get(str(result["url"])) if bing_batch else None
+                            if isinstance(fetched, Exception):
+                                raise fetched
+                            page = fetched if isinstance(fetched, Mapping) else self._extract_competitor_content(url=str(result["url"]))
+                            extracted_pages.append((result, page))
+                        except Exception as error:
+                            with connection:
+                                connection.execute(
+                                    "INSERT INTO competitor_research_items(research_run_id,rank,search_title,url,domain,status,error_summary) VALUES(?,?,?,?,?, 'failed',?)",
+                                    (run_id, result["rank"], result["title"], result["url"], result["domain"], str(error)),
+                                )
             relevance_data = {
                 "target_keyword": asset["keyword"],
                 "selected_title": asset["title_snapshot"],
                 "locale": asset["locale"],
                 "pages": [
-                    {"url": result["url"], "search_title": result["title"], "page_title": page.get("title", ""), "domain": page.get("domain", result["domain"]), "content_excerpt": str(page.get("content", ""))[:6000]}
+                    {"url": result["url"], "search_query": result.get("search_query", ""), "search_title": result["title"], "page_title": page.get("title", ""), "domain": page.get("domain", result["domain"]), "content_excerpt": str(page.get("content", ""))[:6000]}
                     for result, page in extracted_pages
                 ],
             }
             if not relevance_data["pages"]:
-                raise CompetitorContentProtocolError("No accessible competitor content pages were available for relevance screening.")
+                message = "Competitor research stopped: no accessible non-product article pages were available for relevance screening."
+                with connection:
+                    connection.execute(
+                        "UPDATE competitor_research_runs SET status='insufficient',error_summary=?,completed_at=CURRENT_TIMESTAMP WHERE id=?",
+                        (message, run_id),
+                    )
+                raise CompetitorContentProtocolError(message)
             raw_relevance = generator.run_stage(stage="competitor_relevance", data=relevance_data) if callable(getattr(generator, "run_stage", None)) else generator.generate(stage="competitor_relevance", **relevance_data)
             relevance = json.loads(raw_relevance) if isinstance(raw_relevance, str) else raw_relevance
             if not isinstance(relevance, Mapping) or not isinstance(relevance.get("items"), list):
@@ -331,22 +673,35 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 str(item.get("url")): item for item in relevance["items"]
                 if isinstance(item, Mapping) and item.get("decision") in {"accept", "reject"} and isinstance(item.get("url"), str)
             }
+            product_like_rejections = 0
             for result, page in extracted_pages:
                 decision = decisions.get(str(result["url"]))
                 accepted = bool(decision and decision.get("decision") == "accept")
                 reason = str(decision.get("reason") or "Did not match the selected title and search intent.") if decision else "No relevance decision returned for this page."
+                # Comparison SERPs commonly contain useful editorial guides for
+                # a neighbouring fixture (for example, deck or landscape lights
+                # rather than stair lights).  These pages can still teach the
+                # exact solar-versus-wired decision without being copied into
+                # the article.  Keep the AI gate as the default, but recover a
+                # narrowly-defined editorial comparison page when the model is
+                # stricter than the selected title's actual decision intent.
+                if not accepted and self._is_adjacent_comparison_decision(
+                    selected_title=str(asset["title_snapshot"]),
+                    result=result,
+                    page=page,
+                ):
+                    accepted = True
+                    reason = (
+                        "Accepted as a substantive adjacent-fixture comparison: "
+                        "it covers the same solar-versus-wired outdoor-lighting decision."
+                    )
                 if not accepted:
+                    if any(marker in reason.casefold() for marker in ("product", "retail", "sale", "commerce", "listing", "deal", "shopper", "sku", "category")):
+                        product_like_rejections += 1
                     with connection:
                         connection.execute(
                             "INSERT INTO competitor_research_items(research_run_id,rank,search_title,url,domain,status,error_summary) VALUES(?,?,?,?,?, 'skipped',?)",
                             (run_id, result["rank"], result["title"], result["url"], result["domain"], reason),
-                        )
-                    continue
-                if len(selected) >= 5:
-                    with connection:
-                        connection.execute(
-                            "INSERT INTO competitor_research_items(research_run_id,rank,search_title,url,domain,status,error_summary) VALUES(?,?,?,?,?, 'skipped',?)",
-                            (run_id, result["rank"], result["title"], result["url"], result["domain"], "Relevant page not selected because the five-page research limit was reached."),
                         )
                     continue
                 memory_id = self._upsert_competitor_memory(connection, asset["project_id"], result, page)
@@ -358,11 +713,27 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 selected.append({"source_id": f"competitor-{memory_id}", "source_type": "competitor_page", "availability": "available", "url": result["url"], "title": page["title"], "publisher": page["domain"], "content": page["content"]})
             with connection:
                 connection.execute("UPDATE competitor_research_runs SET discovered_count=?,usable_count=? WHERE id=?", (len(results), len(selected), run_id))
-            if len(selected) < 3:
+            # A single verified, relevant article is sufficient to produce an
+            # evidence-bounded outline.  More accessible content naturally
+            # enriches the research pack, up to the five pages crawled above;
+            # zero sources is the only unsafe state because the model would
+            # otherwise be forced to invent competitor evidence.
+            if not selected:
+                product_dominant = product_like_rejections >= 3 and product_like_rejections >= len(extracted_pages) / 2
+                guidance = (
+                    "The SERP is dominated by product-display and retail pages, so this title is not suitable for an SEO long-form article. "
+                    "Choose a researchable informational title (for example, installation, IP ratings, selection, comparison, maintenance, or troubleshooting)."
+                    if product_dominant else
+                    "Choose a more natural, researchable informational title and retry."
+                )
                 with connection:
-                    connection.execute("UPDATE competitor_research_runs SET status='insufficient',error_summary=?,completed_at=CURRENT_TIMESTAMP WHERE id=?", (f"Only {len(selected)} accessible competitor pages; at least 3 are required.", run_id))
-                raise CompetitorContentProtocolError(f"Competitor research stopped: only {len(selected)} accessible pages were available; at least 3 are required.")
-            analysis_data = {"target_keyword": asset["keyword"], "selected_title": asset["title_snapshot"], "locale": asset["locale"], "competitors_content": selected}
+                    connection.execute("UPDATE competitor_research_runs SET status='insufficient',error_summary=?,completed_at=CURRENT_TIMESTAMP WHERE id=?", (f"Competitor research stopped: no usable, relevant competitor articles were available after crawling the top-ranked non-product Google results. {guidance}", run_id))
+                raise CompetitorContentProtocolError(f"Competitor research stopped: no usable, relevant competitor articles were available after crawling the top-ranked non-product Google results. {guidance}")
+            # Keep every accepted article in the website memory, but bound
+            # this individual outline analysis to five sources so the model
+            # receives a deliberate, stable evidence pack rather than dozens
+            # of full pages in one request.
+            analysis_data = {"target_keyword": asset["keyword"], "selected_title": asset["title_snapshot"], "locale": asset["locale"], "competitors_content": selected[:5]}
             raw = generator.run_stage(stage="competitor_analysis", data=analysis_data) if callable(getattr(generator, "run_stage", None)) else generator.generate(stage="competitor_analysis", **analysis_data)
             analysis = json.loads(raw) if isinstance(raw, str) else raw
             if not isinstance(analysis, Mapping) or not isinstance(analysis.get("dynamic_outline"), list) or not analysis["dynamic_outline"]:
@@ -385,6 +756,47 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         value = row[0] if row else None
         from urllib.parse import urlparse
         return urlparse(str(value)).hostname.removeprefix("www.") if isinstance(value, str) and urlparse(str(value)).hostname else ""
+
+    def _extract_competitor_content(self, *, url: str) -> Mapping[str, Any]:
+        """Fetch public article HTML without treating robots.txt as a hard block.
+
+        The caller still rejects login walls, CAPTCHAs, non-HTML files, thin
+        pages and irrelevant content. The TypeError fallback keeps injected
+        test clients compatible with the older ``extract(url=...)`` contract.
+        """
+        extractor = self.server.competitor_content_client.extract
+        try:
+            return extractor(url=url, respect_robots=False)
+        except TypeError as error:
+            if "respect_robots" not in str(error):
+                raise
+            return extractor(url=url)
+
+    @staticmethod
+    def _is_adjacent_comparison_decision(*, selected_title: str, result: Mapping[str, Any], page: Mapping[str, Any]) -> bool:
+        """Allow a real adjacent-fixture guide for the same comparison decision.
+
+        This is intentionally a narrow recovery rule, not a replacement for
+        the AI relevance gate.  It only applies to explicit comparison titles
+        and rejects commerce paths, thin text, and pages that do not discuss
+        both sides of the power-source trade-off.
+        """
+        title = " ".join(selected_title.casefold().split())
+        if not any(marker in title for marker in (" vs ", " vs. ", " versus ", "compare", "comparison")):
+            return False
+        text = " ".join(
+            str(value or "")
+            for value in (result.get("title"), page.get("title"), page.get("content"))
+        ).casefold()
+        url = str(result.get("url") or "").casefold()
+        if len(str(page.get("content") or "").strip()) < 900:
+            return False
+        if any(marker in url for marker in ("/product", "/products/", "/shop", "/store", "/category", "/collections/", "/cart")):
+            return False
+        has_power_tradeoff = "solar" in text and any(marker in text for marker in ("wired", "hardwired", "mains-powered", "mains powered"))
+        has_fixture_context = "light" in text and any(marker in text for marker in ("outdoor", "landscape", "deck", "pathway", "path light", "stair"))
+        has_editorial_shape = any(marker in text for marker in (" vs ", "versus", "comparison", "compare", "guide", "which is", "pros and cons", "advantages"))
+        return has_power_tradeoff and has_fixture_context and has_editorial_shape
 
     def _upsert_competitor_memory(self, connection: sqlite3.Connection, project_id: int, result: Mapping[str, Any], page: Mapping[str, str]) -> int:
         url = str(result["url"]); normalized = url.split("#", 1)[0].rstrip("/").casefold(); content = str(page["content"])
@@ -479,13 +891,304 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
     def _delete_authority_source(self, source_id: int, payload: Mapping[str, Any]) -> None:
         project_id = self._integer(payload, "project_id")
         if project_id is None: return
-        with self._database() as connection, connection:
+        with self._database() as connection:
             cursor = connection.execute("DELETE FROM authority_source_library WHERE id=? AND project_id=?", (source_id, project_id))
         if cursor.rowcount != 1:
             self._json(HTTPStatus.NOT_FOUND, {"error": "authority source does not exist in this website."}); return
         self._json(HTTPStatus.OK, {"deleted": 1})
 
     def _research_authority_sources(self, payload: Mapping[str, Any]) -> None:
+        """Find citations from allowlisted search results, never AI-invented URLs."""
+        # Authority-link research deliberately has its own locked model.  The
+        # UI sends Gemini here: it proposes candidate URLs, then receives the
+        # fetched page back as an independent accept/reject verification step.
+        # It must never silently fall back to a different model or to Serper.
+        if self._optional_text(payload, "provider") == "gemini":
+            self._research_authority_sources_ai_legacy(payload)
+            return
+        project_id = self._integer(payload, "project_id")
+        asset_id = self._integer(payload, "asset_id") if "asset_id" in payload else None
+        if project_id is None or asset_id is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "project_id and a completed article asset_id are required."}); return
+        search_run_id = uuid.uuid4().hex
+        try:
+            with self._database() as connection:
+                asset = self._content_asset(connection, project_id, asset_id)
+                draft = connection.execute("SELECT markdown FROM content_drafts WHERE id=?", (asset["current_draft_id"],)).fetchone() if asset["current_draft_id"] else None
+                if draft is None: raise ValueError("a completed article is required before researching authority sources")
+                # The reader shows only the current run. Persistent exclusion
+                # memory is stored separately, so clearing the audit does not
+                # cause known-bad URLs to be retried later.
+                with connection:
+                    connection.execute("DELETE FROM authority_search_results WHERE project_id=? AND content_asset_id=?", (project_id, asset_id))
+                    # A new research run replaces this article's citation set.
+                    # Keep the source-library record as website memory, but do
+                    # not leave an old, now-irrelevant source displayed as a
+                    # citation for the newly researched article.
+                    connection.execute("DELETE FROM content_authority_source_links WHERE project_id=? AND content_asset_id=?", (project_id, asset_id))
+                candidates: list[dict[str, str]] = []
+                max_authority_candidates = 8
+                max_audit_rows = 8
+                skipped: list[dict[str, str]] = []
+                seen_urls: set[str] = set()
+                prior_unusable = self._previously_unusable_authority_urls(connection, project_id)
+                audit_rows: list[dict[str, str]] = []
+                serper_key = _serper_api_key(self.server.ai_settings_path)
+                serper_client = SerperSearchClient(serper_key) if serper_key else None
+
+                def audit_skip(task: Mapping[str, str], *, url: str, title: str, domain: str, rank: int, reason: str) -> None:
+                    self._remember_authority_exclusion(connection, project_id, url, reason)
+                    if len(audit_rows) >= max_audit_rows:
+                        return
+                    skipped.append({"url": url, "title": title, "reason": reason})
+                    audit_rows.append({"section_heading": task["section_heading"], "claim_topic": task["claim_topic"], "query": task["query"], "url": url, "title": title, "domain": domain, "rank": str(rank), "status": "skipped", "reason": reason})
+
+                def add_results(task: Mapping[str, str], results: list[Mapping[str, Any]], *, provider: str) -> None:
+                    for result in results:
+                        url = str(result.get("url") or "")
+                        domain = str(result.get("domain") or "")
+                        normalized = self._normalized_authority_url(url)
+                        rank = int(result.get("rank") or 0)
+                        title = str(result.get("title") or "")
+                        if not url or not normalized or normalized in seen_urls:
+                            continue
+                        seen_urls.add(normalized)
+                        if not self._authority_domain_allowed(domain):
+                            continue
+                        if self._authority_download_url(url):
+                            audit_skip(task, url=url, title=title, domain=domain, rank=rank, reason="Skipped before opening: downloadable files such as PDF, Office, spreadsheet, archive, and CSV are not valid citation pages.")
+                            continue
+                        if self._authority_non_article_url(url):
+                            audit_skip(task, url=url, title=title, domain=domain, rank=rank, reason="Skipped before opening: this is a document viewer, public-records portal, bid attachment, or download route rather than a citable article page.")
+                            continue
+                        relevant, relevance_reason = self._authority_source_relevance(
+                            keyword=str(asset["keyword"]),
+                            article_title=str(asset["title_snapshot"]),
+                            section_heading=task["section_heading"],
+                            source_title=title,
+                        )
+                        if not relevant:
+                            audit_skip(task, url=url, title=title, domain=domain, rank=rank, reason=f"Skipped before opening: unrelated to this article section. {relevance_reason}")
+                            continue
+                        if normalized in prior_unusable:
+                            audit_skip(task, url=url, title=title, domain=domain, rank=rank, reason="Skipped before opening: this URL was previously unreadable, blocked by robots, or not a usable HTML content page.")
+                            continue
+                        candidates.append({"url": url, "title": title, "domain": domain, "section_heading": task["section_heading"], "claim_topic": task["claim_topic"], "query": task["query"], "rank": str(rank), "provider": provider})
+                        if len(candidates) >= max_authority_candidates:
+                            return
+
+                for task in self._authority_google_tasks(str(draft["markdown"]), asset["title_snapshot"], asset["keyword"]):
+                    try:
+                        if serper_client is not None:
+                            results = serper_client.search(query=task["query"], locale=asset["locale"], max_results=10)
+                            search_provider = "serper"
+                        else:
+                            results = self.server.competitor_content_client.search(query=task["query"], locale=asset["locale"], max_results=10)
+                            search_provider = "google"
+                    except (GoogleSerpProtocolError, SerperSearchProtocolError) as error:
+                        search_name = "Serper" if serper_client is not None else "Google restricted"
+                        reason = f"{search_name} search failed: {error}"
+                        audit_rows.append({"section_heading": task["section_heading"], "claim_topic": task["claim_topic"], "query": task["query"], "url": "", "title": task["section_heading"], "domain": "", "rank": "0", "status": "search_error", "reason": reason})
+                        continue
+                    add_results(task, results, provider=search_provider)
+                    if len(candidates) >= max_authority_candidates:
+                        break
+
+                # Google frequently returns government PDFs rather than readable pages.
+                # Bing is a tested fallback, queried once per allowed domain family because
+                # its single-query OR site syntax is not reliable.
+                if len(candidates) < 3:
+                    for task in self._authority_bing_tasks(str(draft["markdown"]), asset["title_snapshot"], asset["keyword"]):
+                        try:
+                            results = self.server.competitor_content_client.search_bing(query=task["query"], locale=asset["locale"], max_results=8)
+                        except GoogleSerpProtocolError as error:
+                            reason = f"Bing fallback search failed: {error}"
+                            audit_rows.append({"section_heading": task["section_heading"], "claim_topic": task["claim_topic"], "query": task["query"], "url": "", "title": task["section_heading"], "domain": "", "rank": "0", "status": "search_error", "reason": reason})
+                            continue
+                        add_results(task, results, provider="bing")
+                        if len(candidates) >= max_authority_candidates:
+                            break
+                if not candidates:
+                    with connection:
+                        self._save_authority_search_audit(connection, search_run_id, project_id, asset_id, audit_rows)
+                    raise ValueError("Configured search providers returned no usable HTML candidates from the authority-domain allowlist.")
+                with connection:
+                    self._save_authority_search_audit(connection, search_run_id, project_id, asset_id, audit_rows)
+                    for candidate in candidates:
+                        connection.execute("INSERT INTO authority_search_results(search_run_id,project_id,content_asset_id,section_heading,claim_topic,search_query,rank,title,url,domain,status) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (search_run_id, project_id, asset_id, candidate["section_heading"], candidate["claim_topic"], candidate["query"], int(candidate["rank"]), candidate["title"], candidate["url"], candidate["domain"], "pending"))
+                batch = self.server.competitor_content_client.extract_many([item["url"] for item in candidates], max_workers=5)
+                accepted: list[dict[str, Any]] = []
+                for candidate in candidates:
+                    fetched = batch.get(candidate["url"])
+                    if not isinstance(fetched, Mapping):
+                        reason = str(fetched) if isinstance(fetched, Exception) else "The search result could not be opened as a usable HTML content page."
+                        skipped.append({"url": candidate["url"], "title": candidate["title"], "reason": reason})
+                        with connection:
+                            connection.execute("UPDATE authority_search_results SET status='skipped',error_summary=? WHERE search_run_id=? AND url=?", (reason, search_run_id, candidate["url"]))
+                            self._remember_authority_exclusion(connection, project_id, candidate["url"], reason)
+                        continue
+                    relevant, relevance_reason = self._authority_source_relevance(
+                        keyword=str(asset["keyword"]),
+                        article_title=str(asset["title_snapshot"]),
+                        section_heading=candidate["section_heading"],
+                        source_title=str(fetched.get("title") or candidate["title"]),
+                        source_content=str(fetched.get("content") or ""),
+                    )
+                    if not relevant:
+                        reason = f"Skipped after opening: unrelated to this article section. {relevance_reason}"
+                        skipped.append({"url": candidate["url"], "title": candidate["title"], "reason": reason})
+                        with connection:
+                            connection.execute("UPDATE authority_search_results SET status='skipped',error_summary=? WHERE search_run_id=? AND url=?", (reason, search_run_id, candidate["url"]))
+                            self._remember_authority_exclusion(connection, project_id, candidate["url"], reason)
+                        continue
+                    existing = connection.execute("SELECT * FROM authority_source_library WHERE project_id=? AND url=?", (project_id, candidate["url"])).fetchone()
+                    if existing is None:
+                        source_type, authority_level = self._authority_source_profile(candidate["domain"])
+                        classification = {"relevance": "accept", "reason": f"Verified {candidate['provider']} result matched the article claim and passed the authority-domain allowlist.", "summary": f"Verified {candidate['provider']} authority-search source for: {candidate['claim_topic']}", "tags": [item for item in re.findall(r"[A-Za-z0-9]{3,}", candidate["claim_topic"])][:8], "authority_level": authority_level, "supported_claim_topics": [candidate["claim_topic"]], "evidence_gaps": []}
+                        with connection:
+                            cursor = connection.execute("INSERT INTO authority_source_library(project_id,title,source_type,url,publisher,content,authority_level,tags_json,classification_json,summary) VALUES(?,?,?,?,?,?,?,?,?,?)", (project_id, str(fetched.get("title") or candidate["title"] or candidate["domain"]), source_type, candidate["url"], str(fetched.get("domain") or candidate["domain"]), str(fetched.get("content") or "")[:30000], authority_level, json.dumps(classification["tags"], ensure_ascii=False), json.dumps(classification, ensure_ascii=False), classification["summary"]))
+                            existing = connection.execute("SELECT * FROM authority_source_library WHERE id=?", (cursor.lastrowid,)).fetchone()
+                    with connection:
+                        connection.execute("INSERT OR IGNORE INTO content_authority_source_links(project_id,content_asset_id,authority_source_id,section_heading,claim_topic) VALUES(?,?,?,?,?)", (project_id, asset_id, existing["id"], candidate["section_heading"], candidate["claim_topic"]))
+                        connection.execute("UPDATE authority_search_results SET status='accepted',error_summary=NULL WHERE search_run_id=? AND url=?", (search_run_id, candidate["url"]))
+                    accepted.append(self._authority_source_payload(existing))
+                    if len(accepted) >= 5:
+                        with connection:
+                            connection.execute("UPDATE authority_search_results SET status='skipped',error_summary='Skipped: enough verified authority sources were already collected for this run.' WHERE search_run_id=? AND status='pending'", (search_run_id,))
+                        break
+                if accepted:
+                    with connection:
+                        connection.execute("UPDATE content_assets SET status='ready_to_publish',updated_at=CURRENT_TIMESTAMP WHERE id=? AND project_id=?", (asset_id, project_id))
+        except (sqlite3.Error, ValueError, GoogleSerpProtocolError, SerperSearchProtocolError, CompetitorContentProtocolError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)}); return
+        providers = sorted({candidate["provider"] for candidate in candidates})
+        self._json(HTTPStatus.CREATED, {"article": asset["title_snapshot"], "provider": "_with_".join(providers) + "_search", "model": None, "search_run_id": search_run_id, "candidates_checked": len(candidates) + len(audit_rows), "saved": accepted, "skipped": skipped})
+
+    @staticmethod
+    def _normalized_authority_url(url: str) -> str:
+        return url.split("#", 1)[0].rstrip("/").casefold()
+
+    @staticmethod
+    def _authority_download_url(url: str) -> bool:
+        path = urlparse(url).path.casefold()
+        return path.endswith((".pdf", ".xls", ".xlsx", ".doc", ".docx", ".ppt", ".pptx", ".zip", ".csv"))
+
+    @staticmethod
+    def _authority_non_article_url(url: str) -> bool:
+        parsed = urlparse(url)
+        value = f"{parsed.path.casefold()}?{parsed.query.casefold()}"
+        return any(marker in value for marker in AUTHORITY_NON_ARTICLE_PATH_MARKERS)
+
+    @staticmethod
+    def _previously_unusable_authority_urls(connection: sqlite3.Connection, project_id: int) -> set[str]:
+        rows = connection.execute("SELECT normalized_url FROM authority_url_exclusions WHERE project_id=?", (project_id,)).fetchall()
+        return {str(row["normalized_url"] if isinstance(row, sqlite3.Row) else row[0]) for row in rows}
+
+    @staticmethod
+    def _remember_authority_exclusion(connection: sqlite3.Connection, project_id: int, url: str, reason: str) -> None:
+        normalized = KeywordDiscoveryRequestHandler._normalized_authority_url(url)
+        if not normalized:
+            return
+        connection.execute("INSERT INTO authority_url_exclusions(project_id,normalized_url,reason) VALUES(?,?,?) ON CONFLICT(project_id,normalized_url) DO UPDATE SET reason=excluded.reason,last_seen_at=CURRENT_TIMESTAMP", (project_id, normalized, reason[:500]))
+
+    @staticmethod
+    def _save_authority_search_audit(connection: sqlite3.Connection, search_run_id: str, project_id: int, asset_id: int, rows: list[Mapping[str, str]]) -> None:
+        for row in rows:
+            connection.execute("INSERT INTO authority_search_results(search_run_id,project_id,content_asset_id,section_heading,claim_topic,search_query,rank,title,url,domain,status,error_summary) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (search_run_id, project_id, asset_id, row["section_heading"], row["claim_topic"], row["query"], int(row["rank"]), row["title"], row["url"] or None, row["domain"] or None, row["status"], row["reason"]))
+            if row["status"] == "skipped" and row["url"]:
+                KeywordDiscoveryRequestHandler._remember_authority_exclusion(connection, project_id, row["url"], row["reason"])
+
+    @staticmethod
+    def _authority_domain_allowed(domain: str) -> bool:
+        host = domain.casefold().removeprefix("www.").rstrip(".")
+        return host.endswith(".gov") or host.endswith(".edu") or host in {"iso.org", "astm.org", "wikipedia.org"} or host.endswith(".iso.org") or host.endswith(".astm.org") or host.endswith(".wikipedia.org")
+
+    @staticmethod
+    def _authority_source_profile(domain: str) -> tuple[str, str]:
+        host = domain.casefold().removeprefix("www.")
+        if host.endswith(".gov"): return "government", "authoritative"
+        if host.endswith(".iso.org") or host.endswith(".astm.org") or host in {"iso.org", "astm.org"}: return "standard", "authoritative"
+        if host.endswith(".wikipedia.org") or host == "wikipedia.org": return "industry_research", "supporting"
+        return "industry_research", "authoritative"
+
+    @staticmethod
+    def _authority_google_tasks(markdown: str, title: str, keyword: str) -> list[dict[str, str]]:
+        headings = [" ".join(value.split()) for value in re.findall(r"(?m)^##\s+([^\n#]+)", markdown) if value.strip()]
+        topics = headings[:4] or [title]
+        scope = "(site:.gov OR site:.edu OR site:iso.org OR site:astm.org OR site:wikipedia.org)"
+        return [{"section_heading": heading, "claim_topic": heading, "query": f"{KeywordDiscoveryRequestHandler._authority_core_terms(keyword, heading)} {scope} {AUTHORITY_SEARCH_FILE_EXCLUSIONS}"[:1_500]} for heading in topics]
+
+    @staticmethod
+    def _authority_bing_tasks(markdown: str, title: str, keyword: str) -> list[dict[str, str]]:
+        headings = [" ".join(value.split()) for value in re.findall(r"(?m)^##\s+([^\n#]+)", markdown) if value.strip()]
+        heading = (headings[:1] or [title])[0]
+        core_terms = KeywordDiscoveryRequestHandler._authority_core_terms(keyword, heading)
+        return [{"section_heading": heading, "claim_topic": heading, "query": f"{core_terms} site:{domain} {AUTHORITY_SEARCH_FILE_EXCLUSIONS}"[:1_500]} for domain in ("gov", "edu", "iso.org", "astm.org", "wikipedia.org")]
+
+    @staticmethod
+    def _authority_core_terms(keyword: str, heading: str) -> str:
+        """Keep authority searches narrow: buyer terms plus the H2's factual entity."""
+        stop_words = {"a", "an", "and", "are", "as", "at", "by", "complete", "does", "each", "explained", "for", "from", "good", "guide", "how", "in", "is", "it", "means", "of", "on", "or", "short", "that", "the", "this", "to", "versus", "vs", "what", "why", "with", "your"}
+        terms: list[str] = []
+        seen: set[str] = set()
+
+        def add(value: str) -> None:
+            normalized = value.casefold()
+            if len(normalized) < 2 or normalized in stop_words or normalized in seen or any(character.isdigit() for character in normalized):
+                return
+            seen.add(normalized)
+            terms.append(value)
+
+        # A heading often lists standard codes such as IP20/IP54/IP65. The
+        # shared alphabetic prefix is the real entity; individual codes make
+        # a web search drift toward PDFs, CVs, and unrelated catalog files.
+        for value in re.findall(r"[A-Za-z0-9]+", keyword):
+            add(value)
+        for value in re.findall(r"[A-Za-z]+\d+", heading):
+            prefix = re.match(r"[A-Za-z]+", value)
+            if prefix:
+                add(prefix.group(0))
+        for value in re.findall(r"[A-Za-z0-9]+", heading):
+            add(value)
+            if len(terms) >= 9:
+                break
+        return " ".join(terms) or " ".join(keyword.split())[:180]
+
+    @staticmethod
+    def _authority_source_relevance(*, keyword: str, article_title: str, section_heading: str, source_title: str, source_content: str = "") -> tuple[bool, str]:
+        """Require a source to be about the article section, not merely .gov/.edu.
+
+        A whitelist proves who published a page; it does not prove that the
+        page supports an LED/IP-rating claim.  Two distinct subject terms must
+        occur in the source title before we spend a request, and the opened
+        page must repeat enough of those terms to be treated as evidence.
+        """
+        stop_words = {
+            "a", "an", "and", "are", "as", "at", "by", "complete", "does", "each", "explained", "for", "from", "good", "guide", "how", "in", "is", "it", "of", "on", "or", "the", "this", "to", "vs", "what", "why", "with", "your",
+            "answer", "chapter", "difference", "explained", "guide", "matters", "short", "step", "steps", "tips", "versus", "water",
+        }
+
+        def terms(value: str) -> set[str]:
+            return {
+                item.casefold() for item in re.findall(r"[A-Za-z][A-Za-z0-9-]*", value)
+                if len(item) >= 2 and item.casefold() not in stop_words
+            }
+
+        subject_terms = terms(f"{keyword} {article_title} {section_heading}")
+        title_terms = terms(source_title)
+        title_matches = subject_terms & title_terms
+        if len(title_matches) < 2:
+            return False, f"The result title only matches {len(title_matches)} subject term(s): {', '.join(sorted(title_matches)) or 'none'}."
+        if not source_content:
+            return True, f"The result title has {len(title_matches)} matching subject terms: {', '.join(sorted(title_matches))}."
+        content_terms = terms(source_content[:30_000])
+        content_matches = subject_terms & content_terms
+        score = len(title_matches) * 2 + len(content_matches)
+        if score < 5:
+            return False, f"The opened page has insufficient topical evidence (title matches: {len(title_matches)}, body matches: {len(content_matches)})."
+        return True, f"Title and body match the article subject (title: {len(title_matches)}, body: {len(content_matches)})."
+
+    def _research_authority_sources_ai_legacy(self, payload: Mapping[str, Any]) -> None:
         project_id = self._integer(payload, "project_id")
         asset_id = self._integer(payload, "asset_id") if "asset_id" in payload else None
         if project_id is None or asset_id is None:
@@ -500,8 +1203,16 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 if draft is None: raise ValueError("a completed article is required before researching authority sources")
                 article_topic = asset["title_snapshot"]
                 evidence_context = self._authority_evidence_context(str(draft["markdown"]))
+                search_run_id = uuid.uuid4().hex
+                # A new Gemini recommendation run replaces only this
+                # article's old citation links.  Source-library records stay
+                # as project memory, but must pass Gemini verification again
+                # before they can be cited by this article.
+                with connection:
+                    connection.execute("DELETE FROM authority_search_results WHERE project_id=? AND content_asset_id=?", (project_id, asset_id))
+                    connection.execute("DELETE FROM content_authority_source_links WHERE project_id=? AND content_asset_id=?", (project_id, asset_id))
                 def request_plan(context: str) -> Any:
-                    data = {"title": asset["title_snapshot"], "keyword": asset["keyword"], "evidence_context": context}
+                    data = {"title": asset["title_snapshot"], "keyword": asset["keyword"], "evidence_context": context, "authority_domain_policy": "Only .gov, .edu, iso.org, astm.org, or wikipedia.org. Recommend only exact public HTML pages, never downloads, document viewers, forums, generic homepages, or merely topic-adjacent pages."}
                     return generator.run_stage(stage="authority_research_plan", data=data) if callable(getattr(generator, "run_stage", None)) else generator.generate(stage="authority_research_plan", **data)
                 retry_contexts = (evidence_context, evidence_context[:1_800], evidence_context[:1_000])
                 raw_plan: Any | None = None
@@ -522,6 +1233,8 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 plan = json.loads(raw_plan) if isinstance(raw_plan, str) else raw_plan
                 if not isinstance(plan, Mapping) or not isinstance(plan.get("source_candidates"), list): raise ContentGenerationProtocolError("AI authority source plan returned invalid JSON.")
                 candidates: list[dict[str, str]] = []
+                audit_rows: list[dict[str, str]] = []
+                skipped: list[dict[str, Any]] = []
                 seen_urls: set[str] = set()
                 for candidate in plan["source_candidates"]:
                     if not isinstance(candidate, Mapping): continue
@@ -530,40 +1243,71 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                     normalized = url.split("#", 1)[0].rstrip("/").casefold()
                     if parsed.scheme not in {"http", "https"} or not parsed.netloc or normalized in seen_urls: continue
                     seen_urls.add(normalized)
-                    candidates.append({"url": url, "claim_topic": str(candidate.get("claim_topic", "")).strip(), "section_heading": str(candidate.get("section_heading", "")).strip(), "preferred_source_type": str(candidate.get("preferred_source_type", "")).strip()})
-                    if len(candidates) >= 12: break
+                    title = str(candidate.get("title", "")).strip()
+                    domain = parsed.netloc.casefold().removeprefix("www.")
+                    claim_topic = str(candidate.get("claim_topic", "")).strip()
+                    section_heading = str(candidate.get("section_heading", "")).strip()
+                    if not self._authority_domain_allowed(domain):
+                        reason = "Rejected before opening: Gemini proposed a domain outside the authority whitelist."
+                        skipped.append({"url": url, "title": title, "reason": reason})
+                        audit_rows.append({"section_heading": section_heading, "claim_topic": claim_topic, "query": "Gemini authority recommendation", "url": url, "title": title, "domain": domain, "rank": "0", "status": "skipped", "reason": reason})
+                        continue
+                    if self._authority_download_url(url) or self._authority_non_article_url(url):
+                        reason = "Rejected before opening: Gemini proposed a download, document viewer, or non-article URL."
+                        skipped.append({"url": url, "title": title, "reason": reason})
+                        audit_rows.append({"section_heading": section_heading, "claim_topic": claim_topic, "query": "Gemini authority recommendation", "url": url, "title": title, "domain": domain, "rank": "0", "status": "skipped", "reason": reason})
+                        continue
+                    candidates.append({"url": url, "title": title, "domain": domain, "claim_topic": claim_topic, "section_heading": section_heading, "preferred_source_type": str(candidate.get("preferred_source_type", "")).strip()})
+                    if len(candidates) >= 8: break
                 if not candidates: raise ContentGenerationProtocolError("AI authority source plan returned no valid public URLs.")
-                batch = self.server.competitor_content_client.extract_many([item["url"] for item in candidates], max_workers=5)
-                accepted: list[dict[str, Any]] = []; skipped: list[dict[str, Any]] = []
+                with connection:
+                    self._save_authority_search_audit(connection, search_run_id, project_id, asset_id, audit_rows)
+                    for rank, candidate in enumerate(candidates, 1):
+                        connection.execute("INSERT INTO authority_search_results(search_run_id,project_id,content_asset_id,section_heading,claim_topic,search_query,rank,title,url,domain,status) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (search_run_id, project_id, asset_id, candidate["section_heading"], candidate["claim_topic"], "Gemini authority recommendation", rank, candidate["title"], candidate["url"], candidate["domain"], "pending"))
+                # This is a user-triggered citation check for a public URL,
+                # not a competitor crawl. The user explicitly allows an
+                # accessible reference page to be assessed even when its
+                # robots policy disallows automated indexing.
+                batch = self.server.competitor_content_client.extract_many([item["url"] for item in candidates], max_workers=5, respect_robots=False)
+                accepted: list[dict[str, Any]] = []
                 for candidate in candidates:
                     url = candidate["url"]
                     fetched = batch.get(url)
                     if not isinstance(fetched, Mapping):
-                        skipped.append({"url": url, "title": "", "reason": str(fetched) if isinstance(fetched, Exception) else "The proposed URL could not be opened as a usable content page."}); continue
-                    existing_source = connection.execute("SELECT * FROM authority_source_library WHERE project_id=? AND url=?", (project_id, url)).fetchone()
-                    if existing_source is not None:
+                        reason = str(fetched) if isinstance(fetched, Exception) else "The Gemini-proposed URL could not be opened as a usable HTML content page."
+                        skipped.append({"url": url, "title": candidate["title"], "reason": reason})
                         with connection:
-                            connection.execute(
-                                "INSERT OR IGNORE INTO content_authority_source_links(project_id,content_asset_id,authority_source_id,section_heading,claim_topic) VALUES(?,?,?,?,?)",
-                                (project_id, asset_id, existing_source["id"], candidate["section_heading"] or None, candidate["claim_topic"] or None),
-                            )
-                        accepted.append(self._authority_source_payload(existing_source))
+                            connection.execute("UPDATE authority_search_results SET status='skipped',error_summary=? WHERE search_run_id=? AND url=?", (reason, search_run_id, url))
                         continue
                     requested_type = candidate["preferred_source_type"]
                     source_type = requested_type if requested_type in {"first_party", "standard", "certification", "government", "industry_research"} else self._authority_source_type(str(fetched.get("domain", "")))
-                    data = {"topic": article_topic, "claim_topic": candidate["claim_topic"], "section_heading": candidate["section_heading"], "title": fetched.get("title", ""), "source_type": source_type, "url": url, "publisher": fetched.get("domain", ""), "content": str(fetched.get("content", ""))[:30000]}
-                    raw = generator.run_stage(stage="source_classification", data=data) if callable(getattr(generator, "run_stage", None)) else generator.generate(stage="source_classification", **data)
-                    classification = json.loads(raw) if isinstance(raw, str) else raw
+                    data = {"topic": article_topic, "keyword": asset["keyword"], "claim_topic": candidate["claim_topic"], "section_heading": candidate["section_heading"], "title": fetched.get("title", ""), "source_type": source_type, "url": url, "publisher": fetched.get("domain", ""), "content": str(fetched.get("content", ""))[:30000], "verification_rule": "Reject unless the fetched title and body materially support this exact article section and claim. A prestigious but generic, adjacent, or wrong-product page must be rejected."}
+                    try:
+                        raw = generator.run_stage(stage="source_classification", data=data) if callable(getattr(generator, "run_stage", None)) else generator.generate(stage="source_classification", **data)
+                        classification = json.loads(raw) if isinstance(raw, str) else raw
+                    except ContentGenerationProtocolError as error:
+                        reason = f"Gemini verification failed: {error}"
+                        skipped.append({"url": url, "title": str(fetched.get("title", "")), "reason": reason})
+                        with connection:
+                            connection.execute("UPDATE authority_search_results SET title=?,status='skipped',error_summary=? WHERE search_run_id=? AND url=?", (str(fetched.get("title", "")), reason, search_run_id, url))
+                        continue
                     if not isinstance(classification, Mapping) or classification.get("relevance") != "accept" or classification.get("authority_level") == "needs_review":
-                        skipped.append({"url": url, "title": str(fetched.get("title", "")), "reason": str(classification.get("reason", "The verified page did not support the article claim with sufficient authority.")) if isinstance(classification, Mapping) else "AI returned invalid classification."}); continue
+                        reason = str(classification.get("reason", "Gemini rejected this page because it did not support the article claim with sufficient authority.")) if isinstance(classification, Mapping) else "Gemini returned an invalid verification decision."
+                        skipped.append({"url": url, "title": str(fetched.get("title", "")), "reason": reason})
+                        with connection:
+                            connection.execute("UPDATE authority_search_results SET title=?,status='skipped',error_summary=? WHERE search_run_id=? AND url=?", (str(fetched.get("title", "")), reason, search_run_id, url))
+                        continue
                     tags = classification.get("tags") if isinstance(classification.get("tags"), list) else []
                     with connection:
-                        connection.execute("INSERT INTO authority_source_library(project_id,title,source_type,url,publisher,content,authority_level,tags_json,classification_json,summary) VALUES(?,?,?,?,?,?,?,?,?,?)", (project_id, str(data["title"]), source_type, url, str(data["publisher"]), str(data["content"]), str(classification["authority_level"]), json.dumps([tag for tag in tags if isinstance(tag, str)], ensure_ascii=False), json.dumps(dict(classification), ensure_ascii=False), classification.get("summary") if isinstance(classification.get("summary"), str) else None))
-                        row = connection.execute("SELECT * FROM authority_source_library WHERE id=last_insert_rowid()").fetchone()
+                        row = connection.execute("SELECT * FROM authority_source_library WHERE project_id=? AND url=?", (project_id, url)).fetchone()
+                        if row is None:
+                            connection.execute("INSERT INTO authority_source_library(project_id,title,source_type,url,publisher,content,authority_level,tags_json,classification_json,summary) VALUES(?,?,?,?,?,?,?,?,?,?)", (project_id, str(data["title"]), source_type, url, str(data["publisher"]), str(data["content"]), str(classification["authority_level"]), json.dumps([tag for tag in tags if isinstance(tag, str)], ensure_ascii=False), json.dumps(dict(classification), ensure_ascii=False), classification.get("summary") if isinstance(classification.get("summary"), str) else None))
+                            row = connection.execute("SELECT * FROM authority_source_library WHERE id=last_insert_rowid()").fetchone()
                         connection.execute(
                             "INSERT OR IGNORE INTO content_authority_source_links(project_id,content_asset_id,authority_source_id,section_heading,claim_topic) VALUES(?,?,?,?,?)",
                             (project_id, asset_id, row["id"], candidate["section_heading"] or None, candidate["claim_topic"] or None),
                         )
+                        connection.execute("UPDATE authority_search_results SET title=?,status='accepted',error_summary=NULL WHERE search_run_id=? AND url=?", (str(data["title"]), search_run_id, url))
                     accepted.append(self._authority_source_payload(row))
                     if len(accepted) >= 5: break
         except (sqlite3.Error, ValueError, ContentGenerationProtocolError) as error:
@@ -571,7 +1315,930 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         if accepted:
             with self._database() as connection, connection:
                 connection.execute("UPDATE content_assets SET status='ready_to_publish',updated_at=CURRENT_TIMESTAMP WHERE id=? AND project_id=?", (asset_id, project_id))
-        self._json(HTTPStatus.CREATED, {"article": article_topic, "provider": provider, "model": model, "candidates_checked": len(candidates), "saved": accepted, "skipped": skipped})
+        self._json(HTTPStatus.CREATED, {"article": article_topic, "provider": provider, "model": model, "search_run_id": search_run_id, "candidates_checked": len(candidates) + len(audit_rows), "saved": accepted, "skipped": skipped})
+
+    @staticmethod
+    def _seo_image_filename(keyword: str, heading: str, position: int) -> str:
+        def slug(value: str) -> str:
+            return (re.sub(r"[^a-z0-9]+", "-", value.casefold()).strip("-")[:72].strip("-") or "article-section")
+        return f"{slug(keyword)}-{slug(heading)}-{position:02d}.webp"
+
+    def _designer_image_prompt(self, *, keyword: str, heading: str, section_text: str) -> str:
+        """Turn an article H2 into a compact marketing-art direction."""
+        configuration = _provider_configuration(self.server.ai_settings_path, "openai")
+        fallback = f"Modern minimalist marketing graphic for {heading}, illustrating {keyword} with one accurate real-world product or installation detail, European editorial design, light neutral background, soft gradients, refined technical materials, one coherent horizontal composition, no people, no text, no letters, no numbers, no IP codes, no labels, no cards, no tables, no charts, no logos, no watermark, no collage, and no unrelated product parts."
+        if configuration is None:
+            return fallback
+        api_key, base_url, model = configuration
+        system_prompt = """You are a graphic design expert who converts one SEO article section into one final text-to-image prompt for a polished professional marketing graphic. Read the article context and identify only the H2's central message. Make the visual directly support that one message, not the whole article. Use a light-colored minimalist European editorial aesthetic appropriate for a professional LinkedIn feed and blog: refined layout, soft gradients, subtle abstract shape overlays, accurate product materials, and one coherent visual concept. Never write or repeat article prose. Text is forbidden in the image: do not request words, letters, numbers, IP codes, badges, labels, cards, screens, charts, tables, captions, title text, logos, or watermarks. Avoid people unless the H2 is explicitly about installation action. Do not request surreal scenes, collages, repeated product lineups, or cropped objects. Output only the final English image prompt, no quotation marks, no explanation, 390 to 420 characters."""
+        payload = {"model": model, "temperature": 0.35, "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": json.dumps({"keyword": keyword, "h2": heading, "section_context": section_text[:1_400]}, ensure_ascii=False)}]}
+        try:
+            request = Request(f"{base_url.rstrip('/')}/chat/completions", data=json.dumps(payload).encode(), headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, method="POST")
+            with urlopen(request, timeout=90) as response:  # nosec B310 - configured prompt endpoint
+                body = json.loads(response.read().decode("utf-8"))
+            prompt = str(body["choices"][0]["message"]["content"] or "").strip().strip('"')
+            prompt = " ".join(prompt.replace("```", "").split())
+            if len(prompt) >= 260:
+                guard = " No visible text, letters, numbers, IP codes, labels, cards, charts, typography, logos, or watermark."
+                limit = 420 - len(guard)
+                return prompt[:limit].rsplit(" ", 1)[0] + guard
+        except Exception:
+            pass
+        return fallback
+
+    def _ensure_section_image_prompts(self, asset_id: int, project_id: int) -> list[sqlite3.Row]:
+        with self._database() as connection:
+            asset = self._content_asset(connection, project_id, asset_id)
+            draft = connection.execute("SELECT * FROM content_drafts WHERE id=?", (asset["current_draft_id"],)).fetchone() if asset["current_draft_id"] else None
+            if draft is None: raise ValueError("a completed article is required before creating H2 image prompts")
+            raw_sections = re.split(r"(?m)^##\s+", str(draft["markdown"]))[1:]
+            sections = [(" ".join(chunk.partition("\n")[0].split()), " ".join(chunk.partition("\n")[2].split())) for chunk in raw_sections]
+            # Some model outputs repeat the article title as the first H2.
+            # That is an article heading, not a content section, so it must
+            # never receive a hero image above the real body sections.
+            canonical_title = re.sub(r"[^a-z0-9]+", " ", str(draft["title"] or "").casefold()).strip()
+            indexed_sections = [
+                (position, heading, body)
+                for position, (heading, body) in enumerate(sections, 1)
+                if heading and re.sub(r"[^a-z0-9]+", " ", heading.casefold()).strip() != canonical_title
+            ]
+            if not indexed_sections: raise ValueError("the article has no H2 sections to illustrate")
+            prepared: list[tuple[int, str, str, str, str]] = []
+            for position, heading, section_text in indexed_sections:
+                prompt = self._designer_image_prompt(keyword=str(asset["keyword"]), heading=heading, section_text=section_text)
+                alt_text = f"{asset['keyword']} — {heading}"
+                filename = self._seo_image_filename(str(asset["keyword"]), heading, position)
+                prepared.append((position, heading, prompt, alt_text, filename))
+        with self._database() as connection, connection:
+            # Creating prompts is also called by the "generate all" action.
+            # Do not replace the rows wholesale here: doing so turns already
+            # generated images back into pending work and needlessly spends
+            # another image request every time the user retries failed H2s.
+            existing_rows = connection.execute(
+                "SELECT * FROM content_section_images WHERE project_id=? AND content_asset_id=? AND draft_id=?",
+                (project_id, asset_id, draft["id"]),
+            ).fetchall()
+            existing_by_key = {(int(row["position"]), str(row["section_heading"])): row for row in existing_rows}
+            prepared_keys: set[tuple[int, str]] = set()
+            for position, heading, prompt, alt_text, filename in prepared:
+                key = (position, heading)
+                prepared_keys.add(key)
+                current = existing_by_key.get(key)
+                if current is None:
+                    connection.execute(
+                        "INSERT INTO content_section_images(project_id,content_asset_id,draft_id,section_heading,position,prompt,alt_text,seo_filename,provider,model) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                        (project_id, asset_id, draft["id"], heading, position, prompt, alt_text, filename, draft["provider"], _image_generation_model(self.server.ai_settings_path)),
+                    )
+                elif str(current["status"]) != "ready":
+                    # A pending or failed item gets the current prompt and
+                    # SEO metadata before it is retried. Ready images stay
+                    # intact so a retry only targets the unsuccessful H2s.
+                    connection.execute(
+                        "UPDATE content_section_images SET prompt=?,alt_text=?,seo_filename=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                        (prompt, alt_text, filename, current["id"]),
+                    )
+            stale_ids = [int(row["id"]) for key, row in existing_by_key.items() if key not in prepared_keys]
+            if stale_ids:
+                placeholders = ",".join("?" for _ in stale_ids)
+                connection.execute(f"DELETE FROM content_section_images WHERE id IN ({placeholders})", stale_ids)
+            return connection.execute("SELECT * FROM content_section_images WHERE draft_id=? ORDER BY position", (draft["id"],)).fetchall()
+
+    def _create_section_image_prompts(self, asset_id: int, payload: Mapping[str, Any]) -> None:
+        project_id = self._integer(payload, "project_id")
+        if project_id is None: return
+        try: rows = self._ensure_section_image_prompts(asset_id, project_id)
+        except (sqlite3.Error, ValueError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)}); return
+        self._json(HTTPStatus.CREATED, {"images": [dict(row) for row in rows]})
+
+    @staticmethod
+    def _generate_image_with_local_proxy(*, prompt: str, output_path: Path, model: str) -> bool:
+        """Use the user-provided Windows image relay when it is available."""
+        relay = Path(r"D:\网站\generate-image.ps1")
+        if not relay.is_file():
+            return False
+        response_path = output_path.with_suffix(".response.json")
+        last_error = ""
+        for attempt in range(1, 4):
+            try:
+                completed = subprocess.run(
+                    ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(relay), "-Prompt", prompt, "-OutputPath", str(output_path), "-Size", CONTENT_SECTION_IMAGE_SIZE, "-N", "1", "-Model", model],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    timeout=240,
+                    check=False,
+                )
+                if completed.returncode == 0 and output_path.is_file() and output_path.stat().st_size > 0:
+                    response_path.unlink(missing_ok=True)
+                    return True
+                last_error = (completed.stderr or completed.stdout or f"exit code {completed.returncode}").strip()[:500]
+            except (OSError, subprocess.TimeoutExpired) as error:
+                last_error = str(error)[:500]
+            if attempt < 3:
+                time.sleep(attempt * 2)
+        raise ValueError(f"local image relay failed after 3 attempts: {last_error}")
+
+    @staticmethod
+    def _normalize_section_image_to_webp(source_path: Path, output_path: Path) -> None:
+        """Create the fixed 800×600 WebP used by article sections.
+
+        Providers may return PNG/JPEG bytes even when a .webp output path was
+        requested. Re-encoding locally makes browser delivery and WordPress
+        uploads consistent without trusting the provider's file extension.
+        """
+        temporary = output_path.with_suffix(".conversion.webp")
+        try:
+            with Image.open(source_path) as raw:
+                image = ImageOps.exif_transpose(raw).convert("RGB")
+                rendered = ImageOps.fit(image, CONTENT_SECTION_IMAGE_DIMENSIONS, method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+                rendered.save(temporary, format="WEBP", quality=84, method=6)
+            temporary.replace(output_path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def _generate_section_image_row(self, image_id: int, project_id: int) -> dict[str, Any]:
+        with self._database() as connection:
+            image = connection.execute("SELECT * FROM content_section_images WHERE id=? AND project_id=?", (image_id, project_id)).fetchone()
+            if image is None: raise ValueError("image prompt does not exist in this website")
+        existing_filename = str(image["seo_filename"] or f"section-{image_id}.webp")
+        filename = Path(existing_filename).with_suffix(".webp").name
+        directory = WEB_ROOT / "generated-images" / str(project_id); directory.mkdir(parents=True, exist_ok=True)
+        output_path = directory / filename
+        legacy_path = directory / existing_filename
+        image_configuration = _image_generation_configuration(self.server.ai_settings_path)
+        if image_configuration is None: raise ValueError("configure the selected image provider before generating images")
+        image_provider, api_key, base_url, image_model = image_configuration
+        # A provider can finish writing the PNG immediately before the local
+        # process or the server is interrupted. Recover that completed file on
+        # the next retry instead of generating and charging for it again.
+        if not output_path.is_file() and legacy_path.is_file() and legacy_path.stat().st_size > 0:
+            self._normalize_section_image_to_webp(legacy_path, output_path)
+        if output_path.is_file() and output_path.stat().st_size > 0:
+            self._normalize_section_image_to_webp(output_path, output_path)
+            output_path.with_suffix(".response.json").unlink(missing_ok=True)
+            local_url = f"/generated-images/{project_id}/{filename}"
+            with self._database() as connection, connection:
+                connection.execute(
+                    "UPDATE content_section_images SET status='ready',image_url=?,seo_filename=?,provider=?,model=?,error_summary=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (local_url, filename, image_provider, image_model, image_id),
+                )
+                recovered = connection.execute("SELECT * FROM content_section_images WHERE id=?", (image_id,)).fetchone()
+            return dict(recovered)
+        with self._database() as connection, connection:
+            connection.execute("UPDATE content_section_images SET status='generating',error_summary=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?", (image_id,))
+        generated_with_relay = image_provider == "openai" and self._generate_image_with_local_proxy(prompt=str(image["prompt"]), output_path=output_path, model=image_model)
+        if not generated_with_relay:
+            request_payload: dict[str, Any] = {"model": image_model, "prompt": image["prompt"]}
+            if image_provider == "siliconflow":
+                request_payload.update({"image_size": CONTENT_SECTION_IMAGE_SIZE, "batch_size": 1, "num_inference_steps": 20, "guidance_scale": 7.5})
+            else:
+                request_payload["size"] = CONTENT_SECTION_IMAGE_SIZE
+            request = Request(f"{base_url.rstrip('/')}/images/generations", data=json.dumps(request_payload).encode(), headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}, method="POST")
+            # OpenAI-compatible proxy connections can occasionally close during a
+            # long image render. Retry the same configured model and prompt before
+            # marking a section failed; no model fallback is used.
+            result: Any = None
+            last_error: Exception | None = None
+            for attempt in range(1, 4):
+                try:
+                    with urlopen(request, timeout=180) as response:  # nosec B310 - configured OpenAI-compatible image endpoint
+                        result = json.loads(response.read().decode("utf-8"))
+                    break
+                except (OSError, TimeoutError, ValueError) as error:
+                    last_error = error
+                    if attempt < 3:
+                        time.sleep(_image_retry_delay(error, attempt, image_provider))
+            if result is None:
+                raise ValueError(f"image generation failed after 3 attempts: {last_error}")
+            data = (result.get("data") or result.get("images")) if isinstance(result, Mapping) else None
+            item = data[0] if isinstance(data, list) and data and isinstance(data[0], Mapping) else None
+            if not isinstance(item, Mapping): raise ValueError("image provider returned no image data")
+            b64_json, remote_url = item.get("b64_json"), item.get("url")
+            if isinstance(b64_json, str) and b64_json:
+                output_path.write_bytes(base64.b64decode(b64_json))
+            elif isinstance(remote_url, str) and remote_url.startswith(("http://", "https://")):
+                with urlopen(Request(remote_url, headers={"User-Agent": "SEOContentImageStore/1.0"}), timeout=60) as download:  # nosec B310 - configured image result
+                    downloaded_bytes = download.read(12_000_000)
+                    content_type = download.headers.get_content_type()
+                    if not content_type.startswith("image/") and not _looks_like_image_bytes(downloaded_bytes):
+                        raise ValueError(f"image provider URL did not return an image (Content-Type: {content_type})")
+                    output_path.write_bytes(downloaded_bytes)
+            else: raise ValueError("image provider returned neither b64_json nor a downloadable image URL")
+        if not output_path.is_file() or output_path.stat().st_size <= 0:
+            raise ValueError("image provider did not create a usable local image file")
+        self._normalize_section_image_to_webp(output_path, output_path)
+        local_url = f"/generated-images/{project_id}/{filename}"
+        with self._database() as connection, connection:
+            connection.execute("UPDATE content_section_images SET status='ready',image_url=?,seo_filename=?,provider=?,model=?,error_summary=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?", (local_url, filename, image_provider, image_model, image_id))
+            row = connection.execute("SELECT * FROM content_section_images WHERE id=?", (image_id,)).fetchone()
+        return dict(row)
+
+    def _generate_section_image(self, image_id: int, payload: Mapping[str, Any]) -> None:
+        project_id = self._integer(payload, "project_id")
+        if project_id is None: return
+        try: image = self._generate_section_image_row(image_id, project_id)
+        except Exception as error:
+            with self._database() as connection, connection: connection.execute("UPDATE content_section_images SET status='failed',error_summary=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND project_id=?", (str(error)[:500], image_id, project_id))
+            self._json(HTTPStatus.BAD_GATEWAY, {"error": str(error)}); return
+        self._json(HTTPStatus.CREATED, image)
+
+    def _generate_all_section_images(self, asset_id: int, payload: Mapping[str, Any]) -> None:
+        project_id = self._integer(payload, "project_id")
+        if project_id is None: return
+        try:
+            rows = self._ensure_section_image_prompts(asset_id, project_id)
+            image_directory = WEB_ROOT / "generated-images" / str(project_id)
+            # A frontend build used to empty web/, which can leave a ready
+            # database row pointing at a missing PNG. Treat that as unfinished
+            # so one-click generation repairs the physical file as well.
+            image_ids = [
+                int(row["id"])
+                for row in rows
+                if str(row["status"]) != "ready"
+                or not (image_directory / Path(str(row["seo_filename"] or f"section-{row['id']}.webp")).with_suffix(".webp").name).is_file()
+            ]
+            completed: list[dict[str, Any]] = []; failures: list[dict[str, str]] = []
+            # The HTTP request already runs in a server worker thread, so a
+            # second executor adds no benefit. A plain ordered loop keeps one
+            # image request in flight, makes status transitions deterministic,
+            # and lets a retry continue from the first unfinished H2.
+            uses_siliconflow = _image_generation_provider(self.server.ai_settings_path) == "siliconflow"
+            for index, image_id in enumerate(image_ids):
+                # The free SiliconFlow image endpoint throttles bursts. Space
+                # bulk requests so a long H2 article does not fail halfway
+                # through simply because the first few images were accepted.
+                if uses_siliconflow and index:
+                    time.sleep(SILICONFLOW_IMAGE_REQUEST_INTERVAL_SECONDS)
+                try:
+                    completed.append(self._generate_section_image_row(image_id, project_id))
+                except Exception as error:
+                    with self._database() as connection, connection:
+                        connection.execute(
+                            "UPDATE content_section_images SET status='failed',error_summary=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND project_id=?",
+                            (str(error)[:500], image_id, project_id),
+                        )
+                    failures.append({"id": str(image_id), "error": str(error)})
+            completed.sort(key=lambda row: int(row["position"]))
+        except (sqlite3.Error, ValueError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)}); return
+        self._json(HTTPStatus.CREATED, {"generated": completed, "failed": failures})
+
+    def _open_gsc_browser(self, project_id: int) -> None:
+        with self._database() as connection:
+            project = connection.execute("SELECT site_url,name FROM projects WHERE id=?", (project_id,)).fetchone()
+            if project is None:
+                self._json(HTTPStatus.NOT_FOUND, {"error": "project does not exist"}); return
+        try:
+            property_url = str(project["site_url"] or project["name"] or "")
+            self._json(HTTPStatus.OK, self.server.gsc_browser_client.open_console(property_url=property_url))
+        except GscBrowserCaptureError as error:
+            self._json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
+
+    def _capture_gsc_browser_rows(self, project_id: int) -> None:
+        try:
+            with self._database() as connection:
+                project = connection.execute("SELECT site_url,name FROM projects WHERE id=?", (project_id,)).fetchone()
+            if project is None: raise ValueError("project does not exist")
+            fallback_page = str(project["site_url"] or project["name"] or "")
+            if not fallback_page.startswith(("http://", "https://")): raise ValueError("save this project's website URL before capturing GSC rows")
+            rows = self.server.gsc_browser_client.capture_visible_rows(fallback_page_url=fallback_page)
+            with self._database() as connection, connection:
+                for row in rows:
+                    connection.execute("INSERT INTO project_gsc_query_rows(project_id,property_url,query,page_url,clicks,impressions,ctr,position,collected_at) VALUES(?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(project_id,property_url,query,page_url) DO UPDATE SET clicks=excluded.clicks,impressions=excluded.impressions,ctr=excluded.ctr,position=excluded.position,collected_at=CURRENT_TIMESTAMP", (project_id, fallback_page, str(row["query"]), str(row["page_url"]), float(row["clicks"]), float(row["impressions"]), float(row["ctr"]), float(row["position"])))
+        except (GscBrowserCaptureError, ValueError, sqlite3.Error) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": f"GSC browser capture failed: {str(error)[:300]}"}); return
+        self._list_gsc_anchor_candidates(project_id, synced=len(rows))
+
+    def _capture_gsc_ranked_pages(self, project_id: int) -> None:
+        """Replace this project's GSC mapping with a fresh signed-in UI capture."""
+        try:
+            with self._database() as connection:
+                project = connection.execute("SELECT site_url,name FROM projects WHERE id=?", (project_id,)).fetchone()
+            if project is None: raise ValueError("project does not exist")
+            fallback_page = str(project["site_url"] or project["name"] or "")
+            if not fallback_page.startswith(("http://", "https://")): raise ValueError("save this project's website URL before capturing GSC rows")
+            # The action is a refresh, not an append. Clear only this
+            # project's previously collected GSC query-to-page mappings; it
+            # never touches its keyword library, content, or other projects.
+            with self._database() as connection, connection:
+                cleared = connection.execute("DELETE FROM project_gsc_query_rows WHERE project_id=?", (project_id,)).rowcount
+            result = self.server.gsc_browser_client.capture_ranked_query_pages(fallback_page_url=fallback_page)
+            rows = result["rows"]
+            with self._database() as connection, connection:
+                for row in rows:
+                    connection.execute("INSERT INTO project_gsc_query_rows(project_id,property_url,query,page_url,clicks,impressions,ctr,position,collected_at) VALUES(?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(project_id,property_url,query,page_url) DO UPDATE SET clicks=excluded.clicks,impressions=excluded.impressions,ctr=excluded.ctr,position=excluded.position,collected_at=CURRENT_TIMESTAMP", (project_id, fallback_page, str(row["query"]), str(row["page_url"]), float(row["clicks"]), float(row["impressions"]), float(row["ctr"]), float(row["position"])))
+        except (GscBrowserCaptureError, ValueError, sqlite3.Error) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": f"GSC ranked-page capture failed: {str(error)[:360]}"}); return
+        self._list_gsc_anchor_candidates(project_id, synced=len(rows), capture={**result, "cleared": cleared})
+
+    def _get_gsc_settings(self) -> None:
+        settings = _gsc_settings(self.server.ai_settings_path)
+        with self._database() as connection:
+            connection = connection.execute("SELECT account_email FROM gsc_oauth_connection WHERE id=1").fetchone()
+        self._json(HTTPStatus.OK, {"configured": bool(settings["client_id"] and settings["client_secret"]), "client_id": settings["client_id"], "client_secret_configured": bool(settings["client_secret"]), "connected": connection is not None, "account_email": str(connection["account_email"]) if connection else "", "redirect_uri": self._gsc_redirect_uri()})
+
+    def _save_gsc_settings(self, payload: Mapping[str, Any]) -> None:
+        client_id = self._text(payload, "client_id")
+        client_secret = self._optional_text(payload, "client_secret")
+        if client_id is None:
+            return
+        if not client_id.endswith(".apps.googleusercontent.com"):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "Google OAuth client ID must end with .apps.googleusercontent.com."}); return
+        document = dict(_ai_settings_document(self.server.ai_settings_path)); integrations = dict(document.get("integrations") or {}); current = dict(integrations.get("gsc") or {})
+        current["client_id"] = client_id
+        if client_secret: current["client_secret"] = client_secret
+        integrations["gsc"] = current; document["integrations"] = integrations
+        self.server.ai_settings_path.parent.mkdir(parents=True, exist_ok=True); self.server.ai_settings_path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+        self._get_gsc_settings()
+
+    def _gsc_redirect_uri(self) -> str:
+        return f"http://127.0.0.1:{self.server.server_port}/api/gsc/oauth/callback"
+
+    def _start_gsc_oauth(self, project_id: int) -> None:
+        settings = _gsc_settings(self.server.ai_settings_path)
+        if not settings["client_id"] or not settings["client_secret"]:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "Save the Google OAuth client ID and client secret first."}); return
+        with self._database() as connection:
+            if connection.execute("SELECT 1 FROM projects WHERE id=?", (project_id,)).fetchone() is None:
+                self._json(HTTPStatus.NOT_FOUND, {"error": "project does not exist"}); return
+        state = uuid.uuid4().hex; self.server.gsc_oauth_states[state] = project_id
+        query = urlencode({"client_id": settings["client_id"], "redirect_uri": self._gsc_redirect_uri(), "response_type": "code", "access_type": "offline", "prompt": "consent", "scope": "https://www.googleapis.com/auth/webmasters.readonly https://www.googleapis.com/auth/userinfo.email", "state": state})
+        self.send_response(HTTPStatus.FOUND); self.send_header("Location", f"https://accounts.google.com/o/oauth2/v2/auth?{query}"); self.end_headers()
+
+    def _gsc_oauth_callback(self, query: Mapping[str, list[str]]) -> None:
+        state, code = (query.get("state") or [""])[0], (query.get("code") or [""])[0]
+        project_id = self.server.gsc_oauth_states.pop(state, None)
+        error = (query.get("error") or [""])[0]
+        if project_id is None or error or not code:
+            self._serve_gsc_callback_page(project_id, f"Google authorization failed: {error or 'missing authorization code'}"); return
+        settings = _gsc_settings(self.server.ai_settings_path)
+        try:
+            response = requests.post("https://oauth2.googleapis.com/token", data={"code": code, "client_id": settings["client_id"], "client_secret": settings["client_secret"], "redirect_uri": self._gsc_redirect_uri(), "grant_type": "authorization_code"}, timeout=25)
+            response.raise_for_status(); token = response.json(); refresh_token = str(token.get("refresh_token") or "")
+            if not refresh_token: raise ValueError("Google did not return a refresh token; revoke this app in Google Account permissions and connect again")
+            email = ""
+            profile = requests.get("https://www.googleapis.com/oauth2/v2/userinfo", headers={"Authorization": f"Bearer {token.get('access_token', '')}"}, timeout=20)
+            if profile.ok: email = str(profile.json().get("email") or "")
+            with self._database() as connection, connection:
+                connection.execute("INSERT INTO gsc_oauth_connection(id,account_email,refresh_token,scopes) VALUES(1,?,?,?) ON CONFLICT(id) DO UPDATE SET account_email=excluded.account_email,refresh_token=excluded.refresh_token,scopes=excluded.scopes,updated_at=CURRENT_TIMESTAMP", (email, self._protect_gsc_token(refresh_token), "webmasters.readonly userinfo.email"))
+        except Exception as exception:
+            self._serve_gsc_callback_page(project_id, f"Google token exchange failed: {str(exception)[:180]}"); return
+        self._serve_gsc_callback_page(project_id, "Google Search Console connected. You can now select a property and sync rankings.", success=True)
+
+    def _serve_gsc_callback_page(self, project_id: int | None, message: str, success: bool = False) -> None:
+        destination = f"/gsc?project_id={project_id or ''}&gsc={'connected' if success else 'failed'}"
+        safe_message = html.escape(message)
+        body = f"<!doctype html><meta charset='utf-8'><title>Google Search Console</title><body style='font-family:Segoe UI,Arial;padding:48px;color:#14242d'><h1>{'已绑定 Google Search Console' if success else 'Google Search Console 绑定失败'}</h1><p>{safe_message}</p><p><a href='{destination}'>返回 SEO 中控系统</a></p><script>setTimeout(()=>location.href={json.dumps(destination)},1200)</script></body>"
+        raw = body.encode("utf-8"); self.send_response(HTTPStatus.OK); self.send_header("Content-Type", "text/html; charset=utf-8"); self.send_header("Content-Length", str(len(raw))); self.end_headers(); self.wfile.write(raw)
+
+    def _get_gsc_project(self, project_id: int) -> None:
+        with self._database() as connection:
+            project = connection.execute("SELECT id,name,site_url FROM projects WHERE id=?", (project_id,)).fetchone(); selected = connection.execute("SELECT property_url FROM project_gsc_properties WHERE project_id=?", (project_id,)).fetchone(); account = connection.execute("SELECT account_email FROM gsc_oauth_connection WHERE id=1").fetchone()
+        if project is None: self._json(HTTPStatus.NOT_FOUND, {"error": "project does not exist"}); return
+        properties: list[str] = []; warning = ""
+        if account:
+            try: properties = self._gsc_properties()
+            except Exception as error: warning = str(error)[:220]
+        self._json(HTTPStatus.OK, {"configured": bool(_gsc_settings(self.server.ai_settings_path)["client_id"]), "connected": account is not None, "account_email": str(account["account_email"]) if account else "", "project_site_url": str(project["site_url"] or ""), "property_url": str(selected["property_url"]) if selected else "", "properties": properties, "warning": warning, "redirect_uri": self._gsc_redirect_uri()})
+
+    def _save_gsc_property(self, project_id: int, payload: Mapping[str, Any]) -> None:
+        property_url = self._text(payload, "property_url")
+        if property_url is None: return
+        try:
+            if property_url not in self._gsc_properties(): raise ValueError("selected Search Console property is not accessible to the connected Google account")
+            with self._database() as connection, connection: connection.execute("INSERT INTO project_gsc_properties(project_id,property_url) VALUES(?,?) ON CONFLICT(project_id) DO UPDATE SET property_url=excluded.property_url,updated_at=CURRENT_TIMESTAMP", (project_id, property_url))
+        except Exception as error: self._json(HTTPStatus.BAD_GATEWAY, {"error": f"GSC property binding failed: {str(error)[:260]}"}); return
+        self._get_gsc_project(project_id)
+
+    def _sync_gsc_rankings(self, project_id: int, payload: Mapping[str, Any]) -> None:
+        days = max(7, min(365, self._integer(payload, "days") or 90))
+        try:
+            with self._database() as connection: selected = connection.execute("SELECT property_url FROM project_gsc_properties WHERE project_id=?", (project_id,)).fetchone()
+            if selected is None: raise ValueError("select a Search Console property for this website first")
+            property_url = str(selected["property_url"]); end = date.today() - timedelta(days=3); start = end - timedelta(days=days)
+            rows = self._gsc_request("POST", f"https://searchconsole.googleapis.com/webmasters/v3/sites/{quote(property_url, safe='')}/searchAnalytics/query", {"startDate": start.isoformat(), "endDate": end.isoformat(), "dimensions": ["query", "page"], "rowLimit": 500}) .get("rows", [])
+            with self._database() as connection, connection:
+                for row in rows:
+                    keys = row.get("keys") or []
+                    if len(keys) != 2: continue
+                    connection.execute("INSERT INTO project_gsc_query_rows(project_id,property_url,query,page_url,clicks,impressions,ctr,position,collected_at) VALUES(?,?,?,?,?,?,?,?,CURRENT_TIMESTAMP) ON CONFLICT(project_id,property_url,query,page_url) DO UPDATE SET clicks=excluded.clicks,impressions=excluded.impressions,ctr=excluded.ctr,position=excluded.position,collected_at=CURRENT_TIMESTAMP", (project_id, property_url, str(keys[0]), str(keys[1]), float(row.get("clicks") or 0), float(row.get("impressions") or 0), float(row.get("ctr") or 0), float(row.get("position") or 0)))
+        except Exception as error: self._json(HTTPStatus.BAD_GATEWAY, {"error": f"GSC ranking sync failed: {str(error)[:300]}"}); return
+        self._list_gsc_anchor_candidates(project_id, days=days, synced=len(rows))
+
+    def _list_gsc_anchor_candidates(self, project_id: int, days: int | None = None, synced: int | None = None, capture: Mapping[str, Any] | None = None) -> None:
+        with self._database() as connection:
+            rows = connection.execute("SELECT query,page_url,clicks,impressions,ctr,position,collected_at FROM project_gsc_query_rows WHERE project_id=? ORDER BY clicks DESC,impressions DESC,position ASC LIMIT 80", (project_id,)).fetchall()
+        self._json(HTTPStatus.OK, {"anchors": [dict(row) for row in rows], "days": days, "synced": synced, "capture": dict(capture) if capture else None})
+
+    def _export_gsc_anchor_candidates(self, project_id: int) -> None:
+        with self._database() as connection:
+            project = connection.execute("SELECT name FROM projects WHERE id=?", (project_id,)).fetchone()
+            rows = connection.execute("SELECT query,page_url,clicks,impressions,ctr,position,collected_at FROM project_gsc_query_rows WHERE project_id=? ORDER BY position ASC, impressions DESC, query ASC", (project_id,)).fetchall()
+        if project is None:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "project does not exist"}); return
+        buffer = io.StringIO(newline="")
+        writer = csv.writer(buffer)
+        writer.writerow(["查询词", "对应网页 URL", "点击", "展示", "点击率", "平均排名", "采集时间"])
+        for row in rows:
+            writer.writerow([row["query"], row["page_url"], row["clicks"], row["impressions"], row["ctr"], row["position"], row["collected_at"]])
+        raw = ("\ufeff" + buffer.getvalue()).encode("utf-8")
+        safe_name = re.sub(r"[^A-Za-z0-9_-]+", "-", str(project["name"]) or "gsc").strip("-") or "gsc"
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="{safe_name}-gsc-query-page.csv"')
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers(); self.wfile.write(raw)
+
+    def _gsc_properties(self) -> list[str]:
+        payload = self._gsc_request("GET", "https://searchconsole.googleapis.com/webmasters/v3/sites")
+        return [str(item.get("siteUrl")) for item in payload.get("siteEntry", []) if item.get("siteUrl")]
+
+    def _gsc_request(self, method: str, url: str, body: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
+        with self._database() as connection: connection = connection.execute("SELECT refresh_token FROM gsc_oauth_connection WHERE id=1").fetchone()
+        if connection is None: raise ValueError("connect a Google account first")
+        settings = _gsc_settings(self.server.ai_settings_path); refresh_token = self._unprotect_gsc_token(str(connection["refresh_token"]))
+        token_response = requests.post("https://oauth2.googleapis.com/token", data={"client_id": settings["client_id"], "client_secret": settings["client_secret"], "refresh_token": refresh_token, "grant_type": "refresh_token"}, timeout=20); token_response.raise_for_status(); access_token = str(token_response.json().get("access_token") or "")
+        response = requests.request(method, url, headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}, json=body, timeout=35); response.raise_for_status(); return response.json()
+
+    @staticmethod
+    def _protect_gsc_token(value: str) -> str:
+        if win32crypt is None: raise RuntimeError("Windows credential encryption is unavailable")
+        return "dpapi:" + base64.b64encode(win32crypt.CryptProtectData(value.encode("utf-8"), "SEO Control GSC", None, None, None, 0)).decode("ascii")
+
+    @staticmethod
+    def _unprotect_gsc_token(value: str) -> str:
+        if not value.startswith("dpapi:") or win32crypt is None: raise RuntimeError("GSC token needs to be connected again on this Windows user account")
+        return win32crypt.CryptUnprotectData(base64.b64decode(value.removeprefix("dpapi:")), None, None, None, 0)[1].decode("utf-8")
+
+    def _get_wordpress_config(self, project_id: int) -> None:
+        with self._database() as connection:
+            row = connection.execute("SELECT project_id,site_url,username,updated_at FROM project_wordpress_configs WHERE project_id=?", (project_id,)).fetchone()
+        self._json(HTTPStatus.OK, dict(row) | {"configured": True} if row else {"configured": False})
+
+    def _save_wordpress_config(self, project_id: int, payload: Mapping[str, Any]) -> None:
+        site_url, username, password = self._text(payload, "site_url"), self._text(payload, "username"), self._text(payload, "password")
+        if None in {site_url, username, password}: return
+        site_url = self._normalize_wordpress_site_url(site_url)
+        if not site_url.startswith(("https://", "http://")):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "site_url must start with https:// or http://."}); return
+        try:
+            with self._database() as connection, connection:
+                if connection.execute("SELECT 1 FROM projects WHERE id=?", (project_id,)).fetchone() is None: raise ValueError("project does not exist")
+                connection.execute("INSERT INTO project_wordpress_configs(project_id,site_url,username,application_password) VALUES(?,?,?,?) ON CONFLICT(project_id) DO UPDATE SET site_url=excluded.site_url,username=excluded.username,application_password=excluded.application_password,updated_at=CURRENT_TIMESTAMP", (project_id, site_url.rstrip("/"), username, self._protect_wordpress_password(password)))
+        except (sqlite3.Error, ValueError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)}); return
+        self._get_wordpress_config(project_id)
+
+    def _test_wordpress_config(self, project_id: int, payload: Mapping[str, Any]) -> None:
+        try:
+            configuration = self._wordpress_configuration(project_id, payload)
+            session, _page = self._wordpress_admin_session(configuration)
+        except Exception as error:
+            self._json(HTTPStatus.BAD_GATEWAY, {"error": f"WordPress backend login failed: {type(error).__name__}. Check site URL, username and password."}); return
+        self._json(HTTPStatus.OK, {"status": "connected", "username": configuration["username"], "method": "python_form_session"})
+
+    def _publish_wordpress(self, asset_id: int, payload: Mapping[str, Any]) -> None:
+        project_id = self._integer(payload, "project_id")
+        if project_id is None: return
+        wordpress_stage = {"value": "create_draft"}
+        try:
+            with self._database() as connection:
+                asset = self._content_asset(connection, project_id, asset_id)
+                draft = connection.execute("SELECT * FROM content_drafts WHERE id=?", (asset["current_draft_id"],)).fetchone() if asset["current_draft_id"] else None
+                if draft is None: raise ValueError("a completed article is required before publishing")
+                configuration = self._wordpress_configuration(project_id, payload)
+                status = self._text(payload, "status") or "draft"
+                if status not in {"draft", "publish"}:
+                    raise ValueError("WordPress status must be draft or publish")
+                session, editor = self._wordpress_admin_session(configuration)
+                if not self._wordpress_has_classic_post_form(editor):
+                    post_id, link = self._publish_wordpress_gutenberg(
+                        connection, project_id, asset_id, draft, session, configuration, status, editor,
+                        lambda stage: wordpress_stage.__setitem__("value", stage),
+                    )
+                    with connection:
+                        cursor = connection.execute("INSERT INTO content_wordpress_publications(project_id,content_asset_id,draft_id,wordpress_post_id,wordpress_url,status) VALUES(?,?,?,?,?,?)", (project_id, asset_id, draft["id"], post_id, link, status))
+                        row = connection.execute("SELECT * FROM content_wordpress_publications WHERE id=?", (cursor.lastrowid,)).fetchone()
+                    self._json(HTTPStatus.CREATED, dict(row)); return
+                nonce = self._wordpress_post_nonce(editor)
+                if not nonce: raise ValueError("WordPress post form did not contain _wpnonce")
+                # A media attachment may only be associated with an existing
+                # WordPress post.  Create a real draft first, then attach the
+                # locally generated H2 images to that post, and finally update
+                # the draft to the selected status.
+                initial_html = self._markdown_to_wordpress_html(str(draft["markdown"]))
+                wordpress_stage["value"] = "create_draft"
+                create_form = self._wordpress_post_form(
+                    nonce, post_id=0, original_status="auto-draft", status="draft",
+                    title=str(draft["title"]), content=initial_html,
+                    excerpt=str(draft["meta_description"] or ""),
+                )
+                session.headers.update({"Referer": f"{configuration['site_url']}/wp-admin/post-new.php", "Origin": configuration["site_url"]})
+                create_response = session.post(f"{configuration['site_url']}/wp-admin/post.php", data=create_form, timeout=40, allow_redirects=True)
+                # A post-new page can contain several WordPress nonces.  Only
+                # the nonce inside the article form is valid for editpost. If
+                # the server still reports an expired link, refresh it once.
+                if self._wordpress_link_expired(create_response):
+                    refreshed_editor = session.get(f"{configuration['site_url']}/wp-admin/post-new.php?post_type=post", timeout=30)
+                    refreshed_editor.raise_for_status()
+                    refreshed_nonce = self._wordpress_post_nonce(refreshed_editor.text)
+                    if not refreshed_nonce:
+                        raise ValueError("WordPress refreshed the post editor but did not provide its form nonce")
+                    create_form = self._wordpress_post_form(
+                        refreshed_nonce, post_id=0, original_status="auto-draft", status="draft",
+                        title=str(draft["title"]), content=initial_html,
+                        excerpt=str(draft["meta_description"] or ""),
+                    )
+                    create_response = session.post(f"{configuration['site_url']}/wp-admin/post.php", data=create_form, timeout=40, allow_redirects=True)
+                create_response.raise_for_status()
+                post_id = self._wordpress_post_id(create_response.url, create_response.text)
+                if post_id is None: raise ValueError("WordPress did not confirm a created post ID")
+                editor_response = session.get(f"{configuration['site_url']}/wp-admin/post.php?post={post_id}&action=edit", timeout=30)
+                editor_response.raise_for_status()
+                update_nonce = self._wordpress_post_nonce(editor_response.text)
+                if not update_nonce: raise ValueError("WordPress saved the draft but did not provide an edit nonce")
+                wordpress_stage["value"] = "upload_media"
+                article_html = self._wordpress_article_html(connection, project_id, asset_id, draft, session, configuration, post_id)
+                wordpress_stage["value"] = "publish" if status == "publish" else "save_draft"
+                update_form = self._wordpress_post_form(
+                    update_nonce, post_id=post_id, original_status="draft", status=status,
+                    title=str(draft["title"]), content=article_html,
+                    excerpt=str(draft["meta_description"] or ""),
+                )
+                session.headers.update({"Referer": f"{configuration['site_url']}/wp-admin/post.php?post={post_id}&action=edit", "Origin": configuration["site_url"]})
+                response = session.post(f"{configuration['site_url']}/wp-admin/post.php", data=update_form, timeout=40, allow_redirects=True)
+                response.raise_for_status()
+                link = self._wordpress_public_url(session, configuration["site_url"], post_id, response.text) if status == "publish" else f"{configuration['site_url']}/wp-admin/post.php?post={post_id}&action=edit"
+                with connection:
+                    cursor = connection.execute("INSERT INTO content_wordpress_publications(project_id,content_asset_id,draft_id,wordpress_post_id,wordpress_url,status) VALUES(?,?,?,?,?,?)", (project_id, asset_id, draft["id"], post_id, link if isinstance(link, str) else None, status))
+                    row = connection.execute("SELECT * FROM content_wordpress_publications WHERE id=?", (cursor.lastrowid,)).fetchone()
+        except requests.HTTPError as error:
+            response = error.response
+            if response is not None and response.status_code == HTTPStatus.FORBIDDEN:
+                detail = self._wordpress_error_summary(response.text)
+                hints = {
+                    "create_draft": "登录成功，但该账号没有创建文章权限；请授予 Author、Editor 或 Administrator（edit_posts）。",
+                    "upload_media": "草稿已创建，但该账号没有上传媒体库权限；请授予 Author、Editor 或 Administrator（upload_files）。",
+                    "save_draft": "该账号不能编辑刚创建的文章；请检查是否拥有 edit_posts / edit_post 权限。",
+                    "publish": "文章与配图已处理，但该账号不能公开发布；请授予 Author、Editor 或 Administrator（publish_posts）。",
+                }
+                stage_names = {"create_draft": "创建草稿", "upload_media": "上传本地配图", "save_draft": "保存草稿", "publish": "公开发布"}
+                stage = wordpress_stage["value"]
+                expired_hint = "WordPress 的文章编辑令牌已过期；系统已自动刷新并重试一次，但仍被拒绝。请重新保存 WordPress 连接配置后再试。" if self._wordpress_link_expired(response) else hints.get(stage, "")
+                self._json(HTTPStatus.BAD_GATEWAY, {"error": f"WordPress 在“{stage_names.get(stage, '发布')}”步骤拒绝了请求（403）。{expired_hint}{' WordPress 提示：' + detail if detail else ''}"}); return
+            self._json(HTTPStatus.BAD_GATEWAY, {"error": f"WordPress publishing failed: HTTP {response.status_code if response is not None else 'error'}: {str(error)[:220]}"}); return
+        except Exception as error:
+            self._json(HTTPStatus.BAD_GATEWAY, {"error": f"WordPress publishing failed: {type(error).__name__}: {str(error)[:300]}"}); return
+        self._json(HTTPStatus.CREATED, dict(row))
+
+    def _publish_wordpress_gutenberg(self, connection: sqlite3.Connection, project_id: int, asset_id: int, draft: sqlite3.Row, session: requests.Session, configuration: Mapping[str, str], status: str, editor_html: str, set_stage: Any) -> tuple[int, str]:
+        """Publish through WordPress's authenticated Gutenberg API when no classic post form exists."""
+        api = self._wordpress_gutenberg_api(editor_html, configuration["site_url"])
+        if api is None:
+            raise ValueError("WordPress uses the block editor but did not provide an authenticated editor API token")
+        headers = {"X-WP-Nonce": api["nonce"], "Referer": f"{configuration['site_url']}/wp-admin/post-new.php", "Origin": configuration["site_url"]}
+        initial_html = self._markdown_to_wordpress_html(str(draft["markdown"]))
+        existing_publication = connection.execute(
+            "SELECT wordpress_post_id FROM content_wordpress_publications WHERE project_id=? AND content_asset_id=? AND status='publish' AND wordpress_post_id IS NOT NULL ORDER BY id DESC LIMIT 1",
+            (project_id, asset_id),
+        ).fetchone()
+        # A direct re-publish is an update to this article's existing public
+        # page.  It prevents a formatting fix from creating a second URL with
+        # the same title, while draft publishing remains non-destructive.
+        if status == "publish" and existing_publication is not None:
+            post_id = int(existing_publication["wordpress_post_id"])
+            set_stage("upload_media")
+            article_html = self._wordpress_article_html(connection, project_id, asset_id, draft, session, configuration, post_id)
+            set_stage("publish")
+            update = session.post(f"{api['root']}posts/{post_id}", json={"title": str(draft["title"]), "content": article_html, "excerpt": str(draft["meta_description"] or ""), "status": "publish"}, headers=headers, timeout=40)
+            update.raise_for_status()
+            updated = update.json()
+            public_link = updated.get("link") if isinstance(updated, Mapping) else None
+            return post_id, public_link if isinstance(public_link, str) else f"{configuration['site_url']}/?p={post_id}"
+        set_stage("create_draft")
+        create = session.post(f"{api['root']}posts", json={"title": str(draft["title"]), "content": initial_html, "excerpt": str(draft["meta_description"] or ""), "status": "draft"}, headers=headers, timeout=40)
+        create.raise_for_status()
+        created = create.json()
+        post_id = created.get("id") if isinstance(created, Mapping) else None
+        if not isinstance(post_id, int):
+            raise ValueError("WordPress Gutenberg API did not return a created post ID")
+        set_stage("upload_media")
+        article_html = self._wordpress_article_html(connection, project_id, asset_id, draft, session, configuration, post_id)
+        set_stage("publish" if status == "publish" else "save_draft")
+        update = session.post(f"{api['root']}posts/{post_id}", json={"title": str(draft["title"]), "content": article_html, "excerpt": str(draft["meta_description"] or ""), "status": status}, headers=headers, timeout=40)
+        update.raise_for_status()
+        updated = update.json()
+        public_link = updated.get("link") if isinstance(updated, Mapping) else None
+        link = public_link if status == "publish" and isinstance(public_link, str) else f"{configuration['site_url']}/wp-admin/post.php?post={post_id}&action=edit"
+        return post_id, link
+
+    @staticmethod
+    def _wordpress_gutenberg_api(editor_html: str, site_url: str) -> dict[str, str] | None:
+        match = re.search(r"wpApiSettings\s*=\s*({.*?});", editor_html, flags=re.DOTALL)
+        if match is None:
+            return None
+        try:
+            settings = json.loads(match.group(1))
+        except json.JSONDecodeError:
+            return None
+        root, nonce, version = settings.get("root"), settings.get("nonce"), settings.get("versionString")
+        if not isinstance(root, str) or not isinstance(nonce, str) or not root or not nonce:
+            return None
+        api_root = urljoin(f"{site_url.rstrip('/')}/", root)
+        if isinstance(version, str) and version:
+            api_root = urljoin(api_root.rstrip("/") + "/", version)
+        return {"root": api_root.rstrip("/") + "/", "nonce": nonce}
+
+    @staticmethod
+    def _wordpress_has_classic_post_form(editor_html: str) -> bool:
+        return re.search(r"<form\b[^>]*\bid=[\"']post[\"']", editor_html, flags=re.IGNORECASE) is not None
+
+    @staticmethod
+    def _wordpress_post_form(nonce: str, *, post_id: int, original_status: str, status: str, title: str, content: str, excerpt: str) -> dict[str, str]:
+        """Build a classic-editor post form for an initial draft or final update."""
+        form = {
+            "action": "editpost", "_wpnonce": nonce,
+            "_wp_http_referer": "/wp-admin/post-new.php" if post_id == 0 else f"/wp-admin/post.php?post={post_id}&action=edit",
+            "post_ID": str(post_id), "post_type": "post", "original_post_status": original_status,
+            "post_status": status, "post_title": title, "content": content, "excerpt": excerpt,
+            "save": "Publish" if status == "publish" else "Save Draft",
+            "post_author": "0", "post_password": "", "visibility": "public",
+        }
+        if status == "publish":
+            form["publish"] = "Publish"
+        return form
+
+    @staticmethod
+    def _wordpress_error_summary(page_html: str) -> str:
+        """Extract WordPress's human error text without leaking its page CSS."""
+        clean_html = re.sub(r"<(?:script|style)\b[^>]*>.*?</(?:script|style)>", " ", page_html, flags=re.IGNORECASE | re.DOTALL)
+        paragraphs = re.findall(r"<p\b[^>]*>(.*?)</p>", clean_html, flags=re.IGNORECASE | re.DOTALL)
+        source = " ".join(paragraphs) if paragraphs else clean_html
+        text = html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", source))).strip()
+        return text[:260]
+
+    @staticmethod
+    def _wordpress_link_expired(response: requests.Response) -> bool:
+        if response.status_code != HTTPStatus.FORBIDDEN:
+            return False
+        text = KeywordDiscoveryRequestHandler._wordpress_error_summary(response.text).lower()
+        return "链接已过期" in text or "link you followed has expired" in text or "nonce" in text
+
+    def _wordpress_article_html(self, connection: sqlite3.Connection, project_id: int, asset_id: int, draft: sqlite3.Row, session: requests.Session, configuration: Mapping[str, str], post_id: int) -> str:
+        """Upload generated local H2 images to WordPress and embed their media URLs."""
+        article_html = self._markdown_to_wordpress_html(str(draft["markdown"]))
+        images = connection.execute(
+            "SELECT section_heading,alt_text,seo_filename,status FROM content_section_images WHERE project_id=? AND content_asset_id=? AND draft_id=? ORDER BY position",
+            (project_id, asset_id, draft["id"]),
+        ).fetchall()
+        for image in images:
+            if str(image["status"]) != "ready" or not image["seo_filename"]:
+                continue
+            file_path = WEB_ROOT / "generated-images" / str(project_id) / str(image["seo_filename"])
+            if not file_path.is_file() or file_path.stat().st_size <= 0:
+                raise ValueError(f"local article image is missing: {image['seo_filename']}")
+            media_url = self._wordpress_upload_media(session, configuration["site_url"], file_path, post_id)
+            heading = html.escape(str(image["section_heading"]))
+            alt_text = html.escape(str(image["alt_text"] or image["section_heading"]), quote=True)
+            figure = f'<figure class="wp-block-image size-large seo-control-section-image" style="width:100%;max-width:800px;margin:24px auto;"><img src="{html.escape(media_url, quote=True)}" alt="{alt_text}" width="800" height="600" loading="lazy" style="display:block;width:100%;max-width:800px;height:auto;object-fit:contain;" /><figcaption style="display:flex;align-items:flex-start;gap:8px;margin-top:9px;color:#64748b;font-size:12px;line-height:1.5;"><span style="display:inline-block;flex:0 0 auto;padding:2px 6px;border-radius:999px;background:#e8f4f1;color:#176b5a;font-size:10px;font-weight:700;letter-spacing:.06em;line-height:1.35;">IMAGE</span><span>{alt_text}</span></figcaption></figure>'
+            article_html = article_html.replace(f"<h2>{heading}</h2>", f"<h2>{heading}</h2>{figure}", 1)
+        references = self._wordpress_authority_references(connection, project_id, asset_id)
+        if references:
+            items = "".join(
+                f'<li><a href="{html.escape(reference["url"], quote=True)}" target="_blank" rel="nofollow noopener noreferrer">{html.escape(reference["title"])}</a><span> — {html.escape(reference["publisher"])}</span></li>'
+                for reference in references
+            )
+            article_html += f'\n<section class="seo-control-authority-references"><h2>Authoritative References</h2><ul>{items}</ul></section>'
+        return article_html
+
+    @staticmethod
+    def _authority_reference_is_relevant(source: Mapping[str, Any], *, keyword: str, article_title: str) -> bool:
+        """Require an exact, section-level topic match before rendering a footer citation."""
+        section_heading = str(source.get("section_heading") or "").strip()
+        claim_topic = str(source.get("claim_topic") or "").strip()
+        if not section_heading and not claim_topic:
+            # Sources attached only to a broad Brief were never verified against
+            # a reader-facing section. They must not become public citations.
+            return False
+        source_title = str(source.get("title") or "").casefold()
+        topic = f"{keyword} {article_title} {section_heading} {claim_topic}".casefold()
+        ignored = {"about", "article", "best", "check", "complete", "guide", "ideas", "inspiring", "light", "lights", "outdoor", "reference", "source", "stair", "stairs", "the", "this", "with"}
+        terms = {
+            item for item in re.findall(r"[a-z][a-z0-9-]*", topic)
+            if len(item) >= 3 and item not in ignored
+        }
+        matches = {term for term in terms if re.search(rf"(?<![a-z0-9]){re.escape(term)}(?![a-z0-9])", source_title)}
+        led_equivalent = ("led" in topic or "lighting" in topic) and ("led" in source_title or "light-emitting diode" in source_title)
+        ip_equivalent = ("ip" in topic or "ingress protection" in topic) and ("ip code" in source_title or "ingress protection" in source_title)
+        return len(matches) >= 2 or (led_equivalent and len(matches) >= 1) or ip_equivalent
+
+    def _wordpress_authority_references(self, connection: sqlite3.Connection, project_id: int, asset_id: int) -> list[dict[str, str]]:
+        rows = connection.execute(
+            """SELECT sources.title,sources.url,sources.publisher,links.section_heading,links.claim_topic,assets.title_snapshot,keywords.keyword
+               FROM content_authority_source_links links
+               JOIN authority_source_library sources ON sources.id=links.authority_source_id
+               JOIN content_assets assets ON assets.id=links.content_asset_id
+               JOIN keywords ON keywords.id=assets.keyword_id
+               WHERE links.project_id=? AND links.content_asset_id=? AND sources.url IS NOT NULL
+                 AND sources.authority_level IN ('primary','authoritative')
+               ORDER BY CASE sources.authority_level WHEN 'primary' THEN 0 WHEN 'authoritative' THEN 1 ELSE 2 END,links.id DESC""",
+            (project_id, asset_id),
+        ).fetchall()
+        result: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for row in rows:
+            source = dict(row); url = str(source.get("url") or "").strip()
+            if not url.startswith(("https://", "http://")) or url in seen or not self._authority_reference_is_relevant(source, keyword=str(source.get("keyword") or ""), article_title=str(source.get("title_snapshot") or "")):
+                continue
+            seen.add(url)
+            result.append({"title": str(source.get("title") or "Reference"), "url": url, "publisher": str(source.get("publisher") or "Source")})
+            if len(result) >= 5:
+                break
+        return result
+
+    @staticmethod
+    def _wordpress_upload_media(session: requests.Session, site_url: str, file_path: Path, post_id: int) -> str:
+        """Use the authenticated WordPress admin uploader; no REST API is used."""
+        media_page = session.get(f"{site_url}/wp-admin/media-new.php", timeout=30)
+        media_page.raise_for_status()
+        nonce = KeywordDiscoveryRequestHandler._wordpress_hidden_value(media_page.text, "_wpnonce")
+        if not nonce:
+            raise ValueError("WordPress media uploader did not provide an upload nonce")
+        mime_type = mimetypes.guess_type(file_path.name)[0] or "application/octet-stream"
+        with file_path.open("rb") as image_file:
+            upload = session.post(
+                f"{site_url}/wp-admin/async-upload.php",
+                data={"action": "upload-attachment", "_wpnonce": nonce, "post_id": str(post_id)},
+                files={"async-upload": (file_path.name, image_file, mime_type)},
+                headers={"X-Requested-With": "XMLHttpRequest", "Referer": f"{site_url}/wp-admin/media-new.php"},
+                timeout=90,
+            )
+        upload.raise_for_status()
+        try:
+            payload = upload.json()
+        except ValueError as error:
+            raise ValueError(f"WordPress media upload returned invalid data: {upload.text[:160]}") from error
+        data = payload.get("data") if isinstance(payload, Mapping) else None
+        media_url = data.get("url") if isinstance(data, Mapping) else None
+        if not isinstance(media_url, str) or not media_url.startswith(("http://", "https://")):
+            reason = data.get("message") if isinstance(data, Mapping) else None
+            raise ValueError(f"WordPress media upload did not return a URL{': ' + str(reason)[:160] if reason else ''}")
+        return media_url
+
+    def _wordpress_configuration(self, project_id: int, payload: Mapping[str, Any]) -> dict[str, str]:
+        with self._database() as connection:
+            row = connection.execute("SELECT * FROM project_wordpress_configs WHERE project_id=?", (project_id,)).fetchone()
+        if row is None: raise ValueError("save this website's WordPress URL, username and backend password first")
+        return {"site_url": row["site_url"], "username": row["username"], "password": self._unprotect_wordpress_password(row["application_password"])}
+
+    @staticmethod
+    def _normalize_wordpress_site_url(site_url: str) -> str:
+        """Accept a site homepage, wp-admin URL, or wp-login URL and store the site root."""
+        value = site_url.strip().rstrip("/")
+        try:
+            parsed = urlsplit(value)
+        except ValueError:
+            return value
+        if not parsed.scheme or not parsed.netloc:
+            return value
+        path = parsed.path.rstrip("/")
+        for suffix in ("/wp-admin", "/wp-login.php"):
+            if path.endswith(suffix):
+                path = path[: -len(suffix)]
+                break
+        return f"{parsed.scheme}://{parsed.netloc}{path}".rstrip("/")
+
+    @staticmethod
+    def _wordpress_admin_session(configuration: Mapping[str, str]) -> tuple[requests.Session, str]:
+        session = requests.Session(); session.headers.update({"User-Agent": "SEOControlPublisher/1.0", "Referer": f"{configuration['site_url']}/wp-login.php"})
+        # WordPress requires its test cookie to be issued from the login page
+        # before it accepts account credentials in this server-side session.
+        login_page = session.get(f"{configuration['site_url']}/wp-login.php", timeout=30)
+        login_page.raise_for_status()
+        login = session.post(f"{configuration['site_url']}/wp-login.php", data={"log": configuration["username"], "pwd": configuration["password"], "wp-submit": "Log In", "redirect_to": f"{configuration['site_url']}/wp-admin/", "testcookie": "1"}, timeout=30, allow_redirects=True)
+        login.raise_for_status()
+        if "wp-login.php" in login.url or "login_error" in login.text:
+            raise ValueError("WordPress rejected the backend login")
+        editor = session.get(f"{configuration['site_url']}/wp-admin/post-new.php?post_type=post", timeout=30)
+        editor.raise_for_status()
+        if "_wpnonce" not in editor.text:
+            raise ValueError("WordPress account cannot access the post editor")
+        return session, editor.text
+
+    @staticmethod
+    def _wordpress_hidden_value(html_text: str, name: str) -> str | None:
+        match = re.search(rf"<input[^>]+name=[\"']{re.escape(name)}[\"'][^>]+value=[\"']([^\"']+)", html_text, flags=re.IGNORECASE)
+        return html.unescape(match.group(1)) if match else None
+
+    @staticmethod
+    def _wordpress_post_nonce(editor_html: str) -> str | None:
+        """Read the nonce from the actual post form, not another admin widget."""
+        form = re.search(r"<form\b[^>]*\bid=[\"']post[\"'][^>]*>(.*?)</form>", editor_html, flags=re.IGNORECASE | re.DOTALL)
+        return KeywordDiscoveryRequestHandler._wordpress_hidden_value(form.group(1), "_wpnonce") if form else None
+
+    @staticmethod
+    def _wordpress_post_id(url: str, html_text: str) -> int | None:
+        match = re.search(r"[?&]post=(\d+)", url) or re.search(r"name=[\"']post_ID[\"'][^>]+value=[\"'](\d+)", html_text, flags=re.IGNORECASE)
+        return int(match.group(1)) if match else None
+
+    @staticmethod
+    def _wordpress_public_url(session: requests.Session, site_url: str, post_id: int, editor_html: str) -> str:
+        """Return the canonical public post URL after WordPress confirms a publish."""
+        view_link = re.search(r"<a[^>]+href=[\"']([^\"']+)[\"'][^>]+id=[\"']view-post-btn[\"']", editor_html, flags=re.IGNORECASE)
+        if view_link is None:
+            view_link = re.search(r"<a[^>]+id=[\"']view-post-btn[\"'][^>]+href=[\"']([^\"']+)[\"']", editor_html, flags=re.IGNORECASE)
+        if view_link is not None:
+            return urljoin(f"{site_url}/", html.unescape(view_link.group(1)))
+        fallback = f"{site_url}/?p={post_id}"
+        try:
+            page = session.get(fallback, timeout=30, allow_redirects=True)
+            if page.ok and "/wp-login.php" not in page.url:
+                return page.url
+        except requests.RequestException:
+            pass
+        return fallback
+
+    @staticmethod
+    def _protect_wordpress_password(password: str) -> str:
+        if win32crypt is None: raise RuntimeError("Windows credential encryption is unavailable")
+        encrypted = win32crypt.CryptProtectData(password.encode("utf-8"), "SEO Control WordPress", None, None, None, 0)
+        return "dpapi:" + base64.b64encode(encrypted).decode("ascii")
+
+    @staticmethod
+    def _unprotect_wordpress_password(value: str) -> str:
+        if not value.startswith("dpapi:") or win32crypt is None: raise RuntimeError("WordPress password needs to be saved again on this Windows user account")
+        return win32crypt.CryptUnprotectData(base64.b64decode(value.removeprefix("dpapi:")), None, None, None, 0)[1].decode("utf-8")
+
+    @staticmethod
+    def _markdown_to_wordpress_html(markdown: str) -> str:
+        """Render the supported writer Markdown as safe, semantic WordPress HTML.
+
+        The writer deliberately uses Markdown tables, links and emphasis for SEO
+        content.  Escaping every line turns all of those into visible syntax in
+        WordPress, so parse that compact subset rather than relying on a theme.
+        """
+        lines = markdown.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        output: list[str] = []
+
+        def inline(value: str) -> str:
+            escaped = html.escape(value, quote=False)
+            escaped = re.sub(
+                r"\[([^\]]+)\]\((https?://[^\s)]+)\)",
+                lambda match: f'<a href="{html.escape(html.unescape(match.group(2)), quote=True)}" target="_blank" rel="noopener noreferrer">{match.group(1)}</a>',
+                escaped,
+            )
+            escaped = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
+            escaped = re.sub(r"`([^`]+)`", r"<code>\1</code>", escaped)
+            return escaped
+
+        def cells(value: str) -> list[str]:
+            trimmed = value.strip().strip("|")
+            return [item.strip() for item in trimmed.split("|")]
+
+        def table_rule(value: str) -> bool:
+            parts = cells(value)
+            return len(parts) >= 2 and all(re.fullmatch(r":?-{3,}:?", part.replace(" ", "")) is not None for part in parts)
+
+        index = 0
+        while index < len(lines):
+            value = lines[index].strip()
+            if not value:
+                index += 1
+                continue
+            heading = re.match(r"^(#{1,3})\s+(.+)$", value)
+            if heading:
+                level = len(heading.group(1)); output.append(f"<h{level}>{inline(heading.group(2).strip())}</h{level}>"); index += 1; continue
+            if "|" in value and index + 1 < len(lines) and table_rule(lines[index + 1]):
+                header = cells(value); index += 2; body: list[list[str]] = []
+                while index < len(lines) and lines[index].strip() and "|" in lines[index]:
+                    row = cells(lines[index])
+                    if len(row) == len(header): body.append(row)
+                    index += 1
+                head_html = "".join(f"<th>{inline(cell)}</th>" for cell in header)
+                body_html = "".join("<tr>" + "".join(f"<td>{inline(cell)}</td>" for cell in row) + "</tr>" for row in body)
+                output.append(f'<figure class="wp-block-table seo-control-table-wrap" style="display:block;width:100%;max-width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch;"><table class="seo-control-table" style="width:100%;min-width:640px;border-collapse:collapse;"><thead><tr>{head_html}</tr></thead><tbody>{body_html}</tbody></table></figure>')
+                continue
+            unordered = re.match(r"^(?:[-*])\s+(.+)$", value)
+            ordered = re.match(r"^\d+[.)]\s+(.+)$", value)
+            if unordered or ordered:
+                tag = "ul" if unordered else "ol"; items: list[str] = []
+                pattern = r"^(?:[-*])\s+(.+)$" if unordered else r"^\d+[.)]\s+(.+)$"
+                while index < len(lines):
+                    item = re.match(pattern, lines[index].strip())
+                    if item is None: break
+                    items.append(f"<li>{inline(item.group(1))}</li>"); index += 1
+                output.append(f"<{tag}>" + "".join(items) + f"</{tag}>")
+                continue
+            paragraph = [value]; index += 1
+            while index < len(lines):
+                next_value = lines[index].strip()
+                if not next_value or re.match(r"^(#{1,3})\s+", next_value) or re.match(r"^(?:[-*])\s+", next_value) or re.match(r"^\d+[.)]\s+", next_value) or ("|" in next_value and index + 1 < len(lines) and table_rule(lines[index + 1])):
+                    break
+                paragraph.append(next_value); index += 1
+            output.append(f"<p>{inline(' '.join(paragraph))}</p>")
+        return "\n".join(output)
 
     @staticmethod
     def _authority_source_type(domain: str) -> str:
@@ -613,6 +2280,12 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 if action == "generate" and payload.get("competitor_research") is True:
                     result["competitor_research"] = self._run_competitor_research(connection, asset, generator, provider, model)
                     asset = self._content_asset(connection, project_id, asset_id)
+                # The project console sends the current website's first-party
+                # knowledge on every generation request.  Refresh only that
+                # source family inside an existing Brief, so an old Brief can
+                # never silently suppress newly collected product/company data.
+                if asset["current_brief_id"] is not None:
+                    self._refresh_current_brief_company_knowledge(connection, asset, payload)
                 # A one-click run respects an existing user-approved Brief.  It only
                 # creates a Brief when there is no fact boundary to carry forward.
                 if action == "generate-brief" or (action == "generate" and (asset["current_brief_id"] is None or payload.get("competitor_research") is True)):
@@ -626,6 +2299,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 result["generation_job"] = self._finish_content_generation_job(connection, job_id, status="completed")
                 refreshed = self._content_asset_detail(connection, project_id, asset_id)
                 result["runs"] = refreshed["generation_runs"]
+                result["asset"] = refreshed
         except (ContentGenerationProtocolError, CompetitorContentProtocolError) as error:
             detail = str(error) or "AI content generation returned invalid JSON."
             stage = "competitor_research" if isinstance(error, CompetitorContentProtocolError) else self._content_failed_stage(detail)
@@ -634,7 +2308,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 with self._database() as connection:
                     job = self._finish_content_generation_job(connection, job_id, status="failed", failed_stage=stage, error_summary=detail)
             if stage == "competitor_research":
-                self._json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": f"Competitor research stopped: {detail}. No provider fallback was used; existing drafts were preserved.", "generation_job": job})
+                self._json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": f"当前标题不适合进入 SEO 竞品学习：{detail}。请返回标题库重选或改写为更自然、更接近搜索需求的标题；本次不会继续生成缺少竞品依据的正文，旧版本已保留。", "generation_job": job})
                 return
             self._json(HTTPStatus.BAD_GATEWAY, {"error": f"{self._content_provider_label(provider)} 内容生成在 {self._content_stage_label(stage)} 阶段失败：{detail}。未切换到其他模型，旧正文已保留。", "generation_job": job})
             return
@@ -720,6 +2394,34 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             row = connection.execute("SELECT * FROM content_briefs WHERE id=?", (cursor.lastrowid,)).fetchone()
         return self._content_brief_payload(row)
 
+    def _refresh_current_brief_company_knowledge(self, connection: sqlite3.Connection, asset: sqlite3.Row, payload: Mapping[str, Any]) -> None:
+        """Replace only current-site knowledge sources in an existing Brief.
+
+        A Brief is intentionally durable for manual research, but the website
+        knowledge base changes as product pages are crawled or edited.  The
+        current generation payload is the scoped bridge from that website to
+        this SQLite content project, so keep its company knowledge fresh while
+        preserving manual, authority, and competitor sources already saved.
+        """
+        raw_sources = payload.get("sources")
+        if not isinstance(raw_sources, list):
+            return
+        incoming = self._content_sources(raw_sources)
+        company_sources = [source for source in incoming if source.get("source_type") == "company_knowledge"]
+        if not company_sources:
+            return
+        brief = self._current_content_brief(connection, asset)
+        existing = self._content_brief_payload(brief)["sources"]
+        preserved = [
+            source for source in existing
+            if not (isinstance(source, Mapping) and source.get("source_type") == "company_knowledge")
+        ]
+        with connection:
+            connection.execute(
+                "UPDATE content_briefs SET sources_json=? WHERE id=?",
+                (json.dumps(preserved + company_sources, ensure_ascii=False), brief["id"]),
+            )
+
     def _authority_sources_for_asset(self, connection: sqlite3.Connection, asset: sqlite3.Row) -> list[dict[str, Any]]:
         rows = connection.execute("SELECT * FROM authority_source_library WHERE project_id=? ORDER BY CASE authority_level WHEN 'primary' THEN 0 WHEN 'authoritative' THEN 1 WHEN 'supporting' THEN 2 ELSE 3 END,updated_at DESC", (asset["project_id"],)).fetchall()
         terms = {term.casefold() for term in re.findall(r"[A-Za-z0-9]+", f"{asset['keyword']} {asset['title_snapshot']}") if len(term) > 2}
@@ -759,29 +2461,77 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         outline_data = {"semantic": semantic, "metadata": metadata, "cta": self._optional_text(payload, "cta") or "", "sources": brief_payload["sources"]}
         if prepared_sections is None:
             outline_json, _run = self._run_content_stage(connection, asset, "outline", outline_data, generator, provider, model, generation_job_id)
+        else:
+            company_sources = [source for source in brief_payload["sources"] if isinstance(source, Mapping) and source.get("source_type") == "company_knowledge"]
+            if company_sources:
+                plan_data = {
+                    "topic": asset["title_snapshot"],
+                    "primary_keyword": asset["keyword"],
+                    "approved_outline": prepared_sections,
+                    "sources": company_sources,
+                    "instruction": "Plan company knowledge placement before H2 drafting; keep the approved competitor outline unchanged.",
+                }
+                company_plan, _run = self._run_content_stage(connection, asset, "company_context_plan", plan_data, generator, provider, model, generation_job_id)
+                outline_json = {**outline_json, "company_context_plan": company_plan}
         sections = outline_json.get("sections")
         if not isinstance(sections, list) or not sections:
             raise ContentGenerationProtocolError("AI content outline returned no usable sections.")
+        sections = self._deduplicate_ai_outline_sections(asset["title_snapshot"], sections)
+        sections = self._apply_ai_company_context_plan(sections, outline_json.get("company_context_plan"), brief_payload["sources"])
+        if not sections:
+            raise ContentGenerationProtocolError("AI content outline contained only the canonical title or duplicate headings; no usable H2 sections remained.")
+        outline_json = dict(outline_json)
+        outline_json["sections"] = sections
         with connection:
             cursor = connection.execute("INSERT INTO content_outlines(content_asset_id,brief_id,status) VALUES(?,?,?)", (asset["id"], brief["id"], "approved"))
-            seen_headings: set[str] = set()
-            canonical_heading = self._outline_heading_key(asset["title_snapshot"])
             for position, section in enumerate(sections, 1):
                 if not isinstance(section, Mapping) or not isinstance(section.get("heading"), str) or not section["heading"].strip():
                     raise ContentGenerationProtocolError("AI content outline has an invalid section.")
                 section_data = self._normalise_outline_section(section, position)
-                heading_key = self._outline_heading_key(section_data["heading"])
-                if heading_key == canonical_heading:
-                    raise ContentGenerationProtocolError("AI content outline repeats the canonical title as an H2.")
-                if heading_key in seen_headings:
-                    raise ContentGenerationProtocolError("AI content outline contains duplicate H2 headings.")
-                seen_headings.add(heading_key)
                 connection.execute("INSERT INTO content_outline_sections(outline_id,position,heading,purpose,word_budget,section_json) VALUES(?,?,?,?,?,?)", (cursor.lastrowid, position, section_data["heading"], section_data["purpose"], 0, json.dumps(section_data, ensure_ascii=False)))
             connection.execute("UPDATE content_assets SET status='outlining',current_outline_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (cursor.lastrowid, asset["id"]))
             row = connection.execute("SELECT * FROM content_outlines WHERE id=?", (cursor.lastrowid,)).fetchone()
         result = self._content_outline_payload(connection, row)
         result["blueprint"] = outline_json
         return result
+
+    @staticmethod
+    def _apply_ai_company_context_plan(sections: list[Mapping[str, Any]], plan: Any, sources: list[Any]) -> list[Mapping[str, Any]]:
+        """Persist a bounded AI-planned company context assignment on its H2."""
+        if not isinstance(plan, Mapping) or not isinstance(plan.get("assignments"), list):
+            return sections
+        company_sources = {
+            str(source.get("source_id")): source
+            for source in sources
+            if isinstance(source, Mapping) and source.get("source_type") == "company_knowledge" and isinstance(source.get("source_id"), str)
+        }
+        by_heading = {KeywordDiscoveryRequestHandler._outline_heading_key(str(section.get("heading") or "")): dict(section) for section in sections}
+        used_sources: set[str] = set()
+        assigned = 0
+        for item in plan["assignments"]:
+            if assigned >= 2 or not isinstance(item, Mapping):
+                break
+            heading = item.get("section_heading")
+            source_ids = item.get("source_ids")
+            if not isinstance(heading, str) or not isinstance(source_ids, list):
+                continue
+            section = by_heading.get(KeywordDiscoveryRequestHandler._outline_heading_key(heading))
+            if section is None:
+                continue
+            allowed = [source_id for source_id in source_ids if isinstance(source_id, str) and source_id in company_sources and source_id not in used_sources]
+            if not allowed:
+                continue
+            source_id = allowed[0]
+            source = company_sources[source_id]
+            expected_url = str(source.get("url") or "")
+            requested_url = item.get("link_url") if isinstance(item.get("link_url"), str) else ""
+            section["company_context_source_ids"] = [source_id]
+            section["company_context_role"] = str(item.get("factual_role") or "Relevant first-party product or brand context.").strip()
+            if expected_url and requested_url == expected_url:
+                section["company_context_link_url"] = expected_url
+            used_sources.add(source_id)
+            assigned += 1
+        return [by_heading[KeywordDiscoveryRequestHandler._outline_heading_key(str(section.get("heading") or ""))] for section in sections]
 
     def _generate_ai_draft(self, connection: sqlite3.Connection, asset: sqlite3.Row, payload: Mapping[str, Any], generator: Any, provider: str, model: str | None, generation_job_id: int) -> dict[str, Any]:
         brief = self._current_content_brief(connection, asset)
@@ -797,14 +2547,35 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         if not isinstance(metadata, Mapping): metadata = {"selected_title": asset["title_snapshot"], "meta_description": ""}
         outline_payload = self._content_outline_payload(connection, outline)
         blueprint = {"sections": outline_payload["sections"]}
+        company_context = self._company_context_for_sections(
+            sections=blueprint["sections"],
+            sources=brief_data["sources"],
+            article_text=f"{asset['title_snapshot']} {asset['keyword'] or ''}",
+        )
+        numbered_list_count = self._numbered_listicle_count(str(asset["title_snapshot"]))
+        canonical_heading_key = self._outline_heading_key(str(asset["title_snapshot"]))
         section_drafts: list[dict[str, Any]] = []
         for section in blueprint["sections"]:
             section_source_ids = set(section.get("source_ids", []))
+            assigned_company_sources = company_context.get(int(section["position"]), [])
+            assigned_company_ids = {str(source.get("source_id")) for source in assigned_company_sources}
             section_sources = [
                 source for source in brief_data["sources"]
-                if isinstance(source, Mapping) and source.get("source_id") in section_source_ids
+                if isinstance(source, Mapping) and (source.get("source_id") in section_source_ids or str(source.get("source_id")) in assigned_company_ids)
             ]
             section_context = {"id": f"s{section['position']}", **section}
+            if numbered_list_count and self._outline_heading_key(str(section.get("heading") or "")) == canonical_heading_key:
+                section_context["numbered_listicle_count"] = numbered_list_count
+                section_context["numbered_listicle_instruction"] = (
+                    f"This is the title-promise listicle chapter. It must present exactly {numbered_list_count} "
+                    "distinct, named ideas as numbered H3 items, each with a best-fit use case and a practical trade-off."
+                )
+            if assigned_company_sources:
+                section_context["company_context_source_ids"] = sorted(assigned_company_ids)
+                section_context["company_context_instruction"] = (
+                    "Use one relevant, source-supported company/product fact naturally in this H2. "
+                    "If a supplied company source has an exact public URL, one natural link to that URL is allowed."
+                )
             chapter_plan_data = {"topic": asset["title_snapshot"], "audience": brief["target_audience"], "intent": semantic.get("intent", {}), "title": metadata.get("selected_title", asset["title_snapshot"]), "current_section": section_context, "article_outline": blueprint, "competitor_learning": competitor_learning, "sources": section_sources, "language": asset["locale"]}
             chapter_plan, _run = self._run_content_stage(connection, asset, "chapter_plan", chapter_plan_data, generator, provider, model, generation_job_id)
             if not isinstance(chapter_plan.get("subtopics"), list) or not chapter_plan["subtopics"]:
@@ -855,23 +2626,191 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 for source_id in claim["source_ids"] if isinstance(source_id, str)
             ))
         compatibility_qa = {"status": "not_run", "checks": [], "unresolved_verify": verification}
+        content_tags = self._generate_content_tags(
+            asset=asset,
+            semantic=semantic,
+            headings=[str(section.get("heading") or "") for section in blueprint["sections"]],
+            markdown=markdown,
+            generator=generator,
+        )
         with connection:
             version = int(connection.execute("SELECT COALESCE(MAX(version),0)+1 FROM content_drafts WHERE content_asset_id=?", (asset["id"],)).fetchone()[0])
             cursor = connection.execute("INSERT INTO content_drafts(project_id,content_asset_id,outline_id,generation_run_id,generation_job_id,version,title,meta_description,markdown,sources_used_json,unresolved_verify_json,qa_json,qa_status,provider,model) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (asset["project_id"], asset["id"], outline["id"], assembly_run["id"], generation_job_id, version, str(article.get("title") or metadata.get("selected_title") or asset["title_snapshot"]), str(article.get("meta_description") or metadata.get("meta_description") or ""), markdown, json.dumps(sources_used, ensure_ascii=False), json.dumps(verification, ensure_ascii=False), json.dumps(compatibility_qa, ensure_ascii=False), "not_run", provider, model))
             source_count = int(connection.execute("SELECT COUNT(*) FROM content_authority_source_links WHERE project_id=? AND content_asset_id=?", (asset["project_id"], asset["id"])).fetchone()[0])
             asset_status = "ready_to_publish" if source_count else "needs_revision"
-            connection.execute("UPDATE content_assets SET status=?,current_draft_id=?,current_generation_run_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (asset_status, cursor.lastrowid, assembly_run["id"], asset["id"]))
+            connection.execute("UPDATE content_assets SET status=?,current_draft_id=?,current_generation_run_id=?,tags_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (asset_status, cursor.lastrowid, assembly_run["id"], json.dumps(content_tags, ensure_ascii=False), asset["id"]))
             draft = connection.execute("SELECT * FROM content_drafts WHERE id=?", (cursor.lastrowid,)).fetchone()
         return self._content_draft_payload(draft)
 
+    @staticmethod
+    def _generate_content_tags(*, asset: sqlite3.Row, semantic: Any, headings: list[str], markdown: str, generator: Any) -> list[str]:
+        """Return a small, stable tag set without making tagging able to fail a draft.
+
+        Tags are a navigation aid, not article evidence.  The content model is
+        asked for precise Chinese labels after the article is complete; a
+        deterministic fallback guarantees that every successful draft still
+        receives two or three useful filters when the model is unavailable.
+        """
+        result: Any = None
+        try:
+            result = generator.run_stage(
+                stage="content_tags",
+                data={
+                    "canonical_title": str(asset["title_snapshot"]),
+                    "primary_keyword": str(asset["keyword"] or ""),
+                    "intent": semantic.get("intent", {}) if isinstance(semantic, Mapping) else {},
+                    "headings": headings[:8],
+                    "article_excerpt": markdown[:5000],
+                },
+            )
+        except Exception:
+            # A tag request must never discard a finished long-form article.
+            result = None
+        raw_tags = result.get("tags") if isinstance(result, Mapping) else None
+        tags = KeywordDiscoveryRequestHandler._normalise_content_tags(raw_tags)
+        return tags if len(tags) >= 2 else KeywordDiscoveryRequestHandler._fallback_content_tags(asset, semantic, markdown)
+
+    @staticmethod
+    def _normalise_content_tags(raw_tags: Any) -> list[str]:
+        if not isinstance(raw_tags, list):
+            return []
+        cleaned: list[str] = []
+        for item in raw_tags:
+            if not isinstance(item, str):
+                continue
+            tag = re.sub(r"[\r\n#]+", " ", item).strip(" -–—·，,。；;:：")
+            if not (2 <= len(tag) <= 18) or tag.casefold() in {value.casefold() for value in cleaned}:
+                continue
+            cleaned.append(tag)
+            if len(cleaned) == 3:
+                break
+        return cleaned
+
+    @staticmethod
+    def _fallback_content_tags(asset: sqlite3.Row, semantic: Any, markdown: str) -> list[str]:
+        """Keep article filtering useful even if its optional tag call fails."""
+        topic = str(asset["keyword"] or asset["title_snapshot"] or "").strip()
+        stop_words = {"a", "an", "all", "and", "are", "for", "how", "of", "the", "to", "what", "with"}
+        topic_tokens = [token for token in re.findall(r"[A-Za-z0-9]+", topic) if token.casefold() not in stop_words]
+        if topic_tokens:
+            topic_words: list[str] = []
+            for token in topic_tokens:
+                word = token.upper() if token.casefold() in {"led", "ip", "seo", "b2b"} else token.capitalize()
+                candidate = " ".join([*topic_words, word])
+                if len(candidate) > 18:
+                    break
+                topic_words.append(word)
+                if len(topic_words) == 3:
+                    break
+            topic_tag = " ".join(topic_words) or "Article Topic"
+        else:
+            topic_tag = "Article Topic"
+        topic_tag = topic_tag[:42]
+        # Categorise from the approved topic/title rather than the full body:
+        # a deep article often mentions installation, comparison and styles in
+        # passing, which would otherwise produce a misleading primary tag.
+        haystack = f"{asset['title_snapshot']} {topic}".casefold()
+        intent = ""
+        if isinstance(semantic, Mapping) and isinstance(semantic.get("intent"), Mapping):
+            intent = str(semantic["intent"].get("dominant") or "").casefold()
+        if any(marker in haystack for marker in ("waterproof", "ip rating", "ip-rated")):
+            format_tag = "Waterproof Ratings"
+        elif re.search(r"\b(?:vs\.?|versus|compare|comparison)\b", haystack):
+            format_tag = "Product Comparison"
+        elif any(marker in haystack for marker in ("idea", "inspiring", "design", "style")):
+            format_tag = "Design Ideas"
+        elif any(marker in haystack for marker in ("install", "installation", "how to")):
+            format_tag = "Installation Guide"
+        elif "step by step" in haystack:
+            format_tag = "Verification Steps"
+        elif any(marker in haystack for marker in ("troubleshoot", "problem", "mistake", "repair")):
+            format_tag = "Troubleshooting"
+        elif "commercial" in intent or "transactional" in intent:
+            format_tag = "Buying Guide"
+        else:
+            format_tag = "Practical Guide"
+        if any(marker in haystack for marker in ("outdoor", "solar", "garden", "deck", "landscape")):
+            context_tag = "Outdoor Lighting"
+        elif any(marker in haystack for marker in ("waterproof", "ip rating", "ip-rated")):
+            context_tag = "Product Safety"
+        elif "commercial" in intent or "transactional" in intent:
+            context_tag = "Buying Decision"
+        else:
+            context_tag = "Industry Knowledge"
+        return KeywordDiscoveryRequestHandler._normalise_content_tags([topic_tag, format_tag, context_tag])
+
+    @staticmethod
+    def _company_context_for_sections(*, sections: list[Mapping[str, Any]], sources: list[Any], article_text: str) -> dict[int, list[Mapping[str, Any]]]:
+        """Select at most two genuinely related first-party sources per article.
+
+        The model receives company knowledge only in the strongest matching
+        H2s.  This gives the article a real brand/product footprint without
+        repeating a sales paragraph throughout the article.
+        """
+        company_sources = [source for source in sources if isinstance(source, Mapping) and source.get("source_type") == "company_knowledge" and str(source.get("content") or "").strip()]
+        if not sections or not company_sources:
+            return {}
+        by_id = {str(source.get("source_id")): source for source in company_sources if str(source.get("source_id") or "")}
+        planned: dict[int, list[Mapping[str, Any]]] = {}
+        used_planned: set[str] = set()
+        for section in sections:
+            if len(used_planned) >= 2:
+                break
+            planned_ids = section.get("company_context_source_ids", [])
+            if not isinstance(planned_ids, list):
+                continue
+            for source_id in planned_ids:
+                if not isinstance(source_id, str) or source_id in used_planned or source_id not in by_id:
+                    continue
+                planned[int(section["position"])] = [by_id[source_id]]
+                used_planned.add(source_id)
+                break
+        if planned:
+            return planned
+        stop_words = {"about", "after", "also", "and", "are", "article", "best", "can", "for", "from", "guide", "into", "its", "led", "light", "lights", "more", "outdoor", "product", "products", "that", "the", "their", "this", "use", "what", "when", "which", "with", "your"}
+
+        def terms(value: str) -> set[str]:
+            return {token.casefold() for token in re.findall(r"[A-Za-z0-9]{3,}", value) if token.casefold() not in stop_words}
+
+        article_terms = terms(article_text)
+        choices: list[tuple[int, int, Mapping[str, Any]]] = []
+        for source in company_sources:
+            source_terms = terms(f"{source.get('title', '')} {str(source.get('content', ''))[:8000]}")
+            article_match = len(source_terms & article_terms)
+            # A first-party source with no subject overlap is not injected just
+            # because it belongs to the site; this prevents unrelated products
+            # from leaking into an article.
+            if not article_match:
+                continue
+            for section in sections:
+                section_text = " ".join(
+                    [str(section.get("heading") or ""), str(section.get("purpose") or ""), str(section.get("reader_question") or ""), *[str(item) for item in section.get("key_points", []) if isinstance(item, str)]]
+                )
+                section_terms = terms(section_text)
+                decision_bonus = 1 if section_terms & {"choose", "comparison", "compare", "installation", "maintenance", "selection", "specification", "supplier", "faq"} else 0
+                score = article_match * 4 + len(source_terms & section_terms) * 5 + decision_bonus
+                choices.append((score, int(section["position"]), source))
+        assignments: dict[int, list[Mapping[str, Any]]] = {}
+        used_source_ids: set[str] = set()
+        for _score, position, source in sorted(choices, key=lambda item: item[0], reverse=True):
+            source_id = str(source.get("source_id") or "")
+            if not source_id or source_id in used_source_ids or len(used_source_ids) >= 2:
+                continue
+            if len(assignments.get(position, [])) >= 1:
+                continue
+            assignments.setdefault(position, []).append(source)
+            used_source_ids.add(source_id)
+        return assignments
+
     def _run_content_stage(self, connection: sqlite3.Connection, asset: sqlite3.Row, stage: str, data: Mapping[str, Any], generator: Any, provider: str, model: str | None, generation_job_id: int) -> tuple[dict[str, Any], dict[str, Any]]:
         # Existing local SQLite databases constrain the persisted stage column
-        # to the original stage family. Preserve chapter-plan audit data in
+        # to the original stage family. Preserve planning-only audit data in
         # input_json while storing it under that compatible outline family.
-        stored_stage = "outline" if stage == "chapter_plan" else stage
+        # The API restores workflow_stage for the UI, so no detail is lost.
+        stored_stage = "outline" if stage in {"chapter_plan", "company_context_plan"} else stage
         logged_input = dict(data)
-        if stage == "chapter_plan":
-            logged_input["workflow_stage"] = "chapter_plan"
+        if stage in {"chapter_plan", "company_context_plan"}:
+            logged_input["workflow_stage"] = stage
         with connection:
             cursor = connection.execute("INSERT INTO content_generation_runs(project_id,content_asset_id,stage,provider,model,generation_job_id,status,input_json,prompt_version) VALUES(?,?,?,?,?,?,'running',?,?)", (asset["project_id"], asset["id"], stored_stage, provider, model, generation_job_id, json.dumps(logged_input, ensure_ascii=False), PROMPT_VERSION))
             run_id = int(cursor.lastrowid)
@@ -897,6 +2836,50 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         return value, {"id": run_id, "stage": stage, "status": "completed"}
 
     @staticmethod
+    def _deduplicate_ai_outline_sections(canonical_title: str, sections: list[Any]) -> list[Mapping[str, Any]]:
+        """Drop a model's accidental H1 echo and duplicate H2s before save.
+
+        The selected title is always rendered as the sole H1 by assembly.  A
+        repeated title from an otherwise valid AI outline is recoverable model
+        formatting noise, not a reason to discard the entire content task.
+        """
+        canonical_key = KeywordDiscoveryRequestHandler._outline_heading_key(canonical_title)
+        numbered_list_title = KeywordDiscoveryRequestHandler._numbered_listicle_count(canonical_title) is not None
+        seen: set[str] = set()
+        usable: list[Mapping[str, Any]] = []
+        for section in sections:
+            if not isinstance(section, Mapping):
+                raise ContentGenerationProtocolError("AI content outline has an invalid section.")
+            heading = section.get("heading")
+            if not isinstance(heading, str) or not heading.strip():
+                raise ContentGenerationProtocolError("AI content outline has an invalid section.")
+            heading_key = KeywordDiscoveryRequestHandler._outline_heading_key(heading)
+            # A normal canonical-title H2 is formatting noise because assembly
+            # already creates the H1. A numbered listicle is different: its
+            # first H2 is the promised list itself (for example, “10 ideas”),
+            # and removing it produces a generic guide that never fulfils the
+            # user-approved title.
+            if (heading_key == canonical_key and not numbered_list_title) or heading_key in seen:
+                continue
+            seen.add(heading_key)
+            usable.append(section)
+        return usable
+
+    @staticmethod
+    def _numbered_listicle_count(title: str) -> int | None:
+        """Return the promised item count for a real numbered ideas/list title."""
+        match = re.match(r"^\s*(\d{1,2})\b", title)
+        if not match:
+            return None
+        count = int(match.group(1))
+        if not 1 <= count <= 50:
+            return None
+        normalized = title.casefold()
+        english_list_words = r"\b(?:idea|ideas|way|ways|tip|tips|example|examples|design|designs|style|styles|option|options)\b"
+        chinese_list_words = r"(?:个|种|条).{0,12}(?:创意|点子|方法|技巧|方案|设计)"
+        return count if re.search(english_list_words, normalized) or re.search(chinese_list_words, title) else None
+
+    @staticmethod
     def _normalise_outline_section(section: Mapping[str, Any], position: int) -> dict[str, Any]:
         heading = section.get("heading")
         if not isinstance(heading, str) or not heading.strip():
@@ -913,6 +2896,9 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             "reader_question": section.get("reader_question") if isinstance(section.get("reader_question"), str) else "",
             "purpose": purpose.strip(), "key_points": strings("key_points"), "source_ids": strings("source_ids"),
             "evidence_gaps": strings("evidence_gaps"), "format": format_value,
+            "company_context_source_ids": strings("company_context_source_ids"),
+            "company_context_role": section.get("company_context_role") if isinstance(section.get("company_context_role"), str) else "",
+            "company_context_link_url": section.get("company_context_link_url") if isinstance(section.get("company_context_link_url"), str) else "",
         }
 
     @staticmethod
@@ -1015,9 +3001,12 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             return
         country = self._optional_text(payload, "country_code") or "US"
         language = self._optional_text(payload, "language_code") or "en"
+        industry = self._optional_text(payload, "industry") or ""
+        site_url = self._optional_text(payload, "site_url") or name
         try:
             with self._database() as connection:
                 project_id = KeywordImportService(connection).create_project(name, country, language)
+                connection.execute("UPDATE projects SET industry=?, site_url=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (industry, site_url, project_id))
         except (sqlite3.Error, ValueError) as error:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
             return
@@ -1026,9 +3015,200 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
     def _list_projects(self) -> None:
         with self._database() as connection:
             rows = connection.execute(
-                "SELECT id,name,site_url,default_country,default_language,created_at FROM projects ORDER BY id DESC"
+                "SELECT id,name,site_url,industry,default_country,default_language,created_at,updated_at FROM projects ORDER BY id DESC"
             ).fetchall()
         self._json(HTTPStatus.OK, [dict(row) for row in rows])
+
+    def _list_project_summaries(self) -> None:
+        with self._database() as connection:
+            rows = connection.execute(
+                """SELECT projects.id,projects.name,projects.site_url,projects.industry,projects.default_country,projects.default_language,projects.created_at,projects.updated_at,
+                    (SELECT COUNT(*) FROM keywords WHERE project_id=projects.id AND deleted_at IS NULL) AS keyword_count,
+                    (SELECT COUNT(*) FROM keyword_title_candidates WHERE project_id=projects.id AND status='selected' AND deleted_at IS NULL) AS selected_title_count,
+                    (SELECT COUNT(*) FROM content_assets WHERE project_id=projects.id AND deleted_at IS NULL) AS content_count,
+                    (SELECT COUNT(*) FROM project_knowledge_documents WHERE project_id=projects.id AND status='ready') AS knowledge_count,
+                    (SELECT status FROM content_assets WHERE project_id=projects.id AND deleted_at IS NULL ORDER BY updated_at DESC,id DESC LIMIT 1) AS latest_content_status
+                    FROM projects ORDER BY projects.updated_at DESC,projects.id DESC"""
+            ).fetchall()
+        self._json(HTTPStatus.OK, [dict(row) for row in rows])
+
+    def _list_system_tasks(self) -> None:
+        with self._database() as connection:
+            rows = connection.execute(
+                """SELECT 'keyword' AS task_type,id,project_id,status,COALESCE(updated_at,created_at) AS updated_at,COALESCE(failure_reason,'') AS message FROM keyword_research_tasks
+                   UNION ALL SELECT 'title',id,project_id,status,COALESCE(completed_at,started_at,created_at),COALESCE(error_summary,'') FROM title_generation_jobs
+                   UNION ALL SELECT 'content',id,project_id,status,COALESCE(completed_at,started_at,''),COALESCE(error_summary,'') FROM content_generation_runs
+                   UNION ALL SELECT 'website_crawl',id,project_id,status,COALESCE(completed_at,created_at),COALESCE(failure_reason,message,'') FROM project_knowledge_crawl_runs
+                   UNION ALL SELECT 'wordpress_publish',id,project_id,status,created_at,COALESCE(error_summary,'') FROM content_wordpress_publications
+                   ORDER BY updated_at DESC LIMIT 100"""
+            ).fetchall()
+            project_names = {row["id"]: row["name"] for row in connection.execute("SELECT id,name FROM projects").fetchall()}
+        payload = [{**dict(row), "project_name": project_names.get(row["project_id"], f"项目 #{row['project_id']}")} for row in rows]
+        self._json(HTTPStatus.OK, payload)
+
+    def _update_project(self, project_id: int, payload: Mapping[str, Any]) -> None:
+        fields = {"name": self._optional_text(payload, "name"), "site_url": self._optional_text(payload, "site_url"), "industry": self._optional_text(payload, "industry"), "default_country": self._optional_text(payload, "country_code"), "default_language": self._optional_text(payload, "language_code")}
+        updates = [(key, value) for key, value in fields.items() if value is not None]
+        if not updates:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "At least one project field is required."})
+            return
+        statement = ",".join(f"{key}=?" for key, _value in updates) + ",updated_at=CURRENT_TIMESTAMP"
+        try:
+            with self._database() as connection:
+                cursor = connection.execute(f"UPDATE projects SET {statement} WHERE id=?", (*[value for _key, value in updates], project_id))
+                if cursor.rowcount != 1:
+                    raise ValueError("project does not exist")
+                row = connection.execute("SELECT id,name,site_url,industry,default_country,default_language,created_at,updated_at FROM projects WHERE id=?", (project_id,)).fetchone()
+        except (sqlite3.Error, ValueError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        self._json(HTTPStatus.OK, dict(row))
+
+    def _delete_project(self, project_id: int) -> None:
+        try:
+            with self._database() as connection:
+                cursor = connection.execute("DELETE FROM projects WHERE id=?", (project_id,))
+                if cursor.rowcount != 1:
+                    raise ValueError("project does not exist")
+        except (sqlite3.Error, ValueError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        self._json(HTTPStatus.OK, {"deleted": project_id})
+
+    def _project_exists(self, connection: sqlite3.Connection, project_id: int) -> None:
+        if connection.execute("SELECT 1 FROM projects WHERE id=?", (project_id,)).fetchone() is None:
+            raise ValueError("project does not exist")
+
+    def _list_project_knowledge(self, project_id: int) -> None:
+        try:
+            with self._database() as connection, connection:
+                self._project_exists(connection, project_id)
+                rows = connection.execute(
+                    """SELECT id,project_id,title,source_type,url,content,knowledge_type,status,created_at,updated_at
+                       FROM project_knowledge_documents WHERE project_id=? ORDER BY updated_at DESC,id DESC""",
+                    (project_id,),
+                ).fetchall()
+        except (sqlite3.Error, ValueError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        self._json(HTTPStatus.OK, [dict(row) for row in rows])
+
+    def _create_project_knowledge(self, project_id: int, payload: Mapping[str, Any]) -> None:
+        title = self._text(payload, "title")
+        content = self._text(payload, "content")
+        if title is None or content is None:
+            return
+        source_type = self._optional_text(payload, "source_type") or "manual"
+        knowledge_type = self._optional_text(payload, "knowledge_type") or "other"
+        url = self._optional_text(payload, "url") or ""
+        try:
+            with self._database() as connection, connection:
+                self._project_exists(connection, project_id)
+                cursor = connection.execute(
+                    """INSERT INTO project_knowledge_documents(project_id,title,source_type,url,content,knowledge_type,status)
+                       VALUES(?,?,?,?,?,?, 'ready')""",
+                    (project_id, title[:300], source_type[:40], url[:2000], content[:100000], knowledge_type[:40]),
+                )
+                row = connection.execute("SELECT * FROM project_knowledge_documents WHERE id=?", (cursor.lastrowid,)).fetchone()
+        except (sqlite3.Error, ValueError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        self._json(HTTPStatus.CREATED, dict(row))
+
+    def _delete_project_knowledge(self, project_id: int, document_id: int) -> None:
+        try:
+            with self._database() as connection, connection:
+                cursor = connection.execute("DELETE FROM project_knowledge_documents WHERE id=? AND project_id=?", (document_id, project_id))
+                if cursor.rowcount != 1:
+                    raise ValueError("knowledge document does not exist in this project")
+        except (sqlite3.Error, ValueError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        self._json(HTTPStatus.OK, {"deleted": document_id})
+
+    def _crawl_project_knowledge(self, project_id: int, payload: Mapping[str, Any]) -> None:
+        """Crawl a first-party site synchronously and preserve every page outcome.
+
+        This handler intentionally stays in the single local service rather than
+        calling platform_api over HTTP.  The crawler itself does concurrent page
+        fetches, while this route records successful, skipped and failed pages.
+        """
+        max_pages = payload.get("max_pages", 20)
+        if not isinstance(max_pages, int) or isinstance(max_pages, bool) or not 1 <= max_pages <= 80:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "max_pages must be an integer from 1 to 80."})
+            return
+        try:
+            with self._database() as connection, connection:
+                project = connection.execute("SELECT site_url,name FROM projects WHERE id=?", (project_id,)).fetchone()
+                if project is None:
+                    raise ValueError("project does not exist")
+                site_url = str(project["site_url"] or project["name"] or "").strip()
+                if not site_url:
+                    raise ValueError("set a website address in project settings before crawling")
+                cursor = connection.execute(
+                    "INSERT INTO project_knowledge_crawl_runs(project_id,status,max_pages,message) VALUES(?, 'running', ?, 'Collecting first-party product and company pages.')",
+                    (project_id, max_pages),
+                )
+                run_id = int(cursor.lastrowid)
+            pages = crawl_site(site_url, max_pages)
+            accepted = skipped = failed = 0
+            with self._database() as connection, connection:
+                for page in pages:
+                    status = str(page.get("status") or "failed")
+                    url = str(page.get("url") or "")[:2000]
+                    if not url:
+                        continue
+                    title = str(page.get("title") or url)[:300]
+                    kind = str(page.get("knowledge_type") or "other")[:40]
+                    reason = str(page.get("reason") or "")[:1000]
+                    connection.execute(
+                        """INSERT INTO project_knowledge_crawl_pages(crawl_run_id,url,title,knowledge_type,status,reason)
+                           VALUES(?,?,?,?,?,?) ON CONFLICT(crawl_run_id,url) DO UPDATE SET title=excluded.title,knowledge_type=excluded.knowledge_type,status=excluded.status,reason=excluded.reason""",
+                        (run_id, url, title, kind, status, reason),
+                    )
+                    if status == "ready" and str(page.get("content") or "").strip():
+                        existing = connection.execute("SELECT id FROM project_knowledge_documents WHERE project_id=? AND url=?", (project_id, url)).fetchone()
+                        if existing:
+                            connection.execute(
+                                """UPDATE project_knowledge_documents SET title=?,source_type='website_crawl',content=?,knowledge_type=?,status='ready',updated_at=CURRENT_TIMESTAMP
+                                   WHERE id=?""",
+                                (title, str(page["content"])[:100000], kind, existing["id"]),
+                            )
+                        else:
+                            connection.execute(
+                                """INSERT INTO project_knowledge_documents(project_id,title,source_type,url,content,knowledge_type,status)
+                                   VALUES(?,?,?,?,?,?, 'ready')""",
+                                (project_id, title, "website_crawl", url, str(page["content"])[:100000], kind),
+                            )
+                        accepted += 1
+                    elif status == "skipped":
+                        skipped += 1
+                    else:
+                        failed += 1
+                connection.execute(
+                    """UPDATE project_knowledge_crawl_runs SET status='completed',discovered_count=?,accepted_count=?,skipped_count=?,failed_count=?,
+                       message=?,completed_at=CURRENT_TIMESTAMP WHERE id=?""",
+                    (len(pages), accepted, skipped, failed, f"Collected {accepted} usable first-party knowledge pages.", run_id),
+                )
+        except Exception as error:
+            if 'run_id' in locals():
+                with self._database() as connection, connection:
+                    connection.execute("UPDATE project_knowledge_crawl_runs SET status='failed',message='Website crawl failed.',failure_reason=?,completed_at=CURRENT_TIMESTAMP WHERE id=?", (str(error)[:1000], run_id))
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        self._get_knowledge_crawl_run(project_id, run_id)
+
+    def _get_knowledge_crawl_run(self, project_id: int, run_id: int) -> None:
+        try:
+            with self._database() as connection:
+                run = connection.execute("SELECT * FROM project_knowledge_crawl_runs WHERE id=? AND project_id=?", (run_id, project_id)).fetchone()
+                if run is None:
+                    raise ValueError("knowledge crawl run does not exist in this project")
+                pages = connection.execute("SELECT url,title,knowledge_type,status,reason FROM project_knowledge_crawl_pages WHERE crawl_run_id=? ORDER BY id", (run_id,)).fetchall()
+        except (sqlite3.Error, ValueError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        self._json(HTTPStatus.OK, {**dict(run), "pages": [dict(page) for page in pages]})
 
     def _get_ai_settings(self) -> None:
         assignments = _ai_assignments(self.server.ai_settings_path)
@@ -1040,6 +3220,82 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         _key, base_url, model = configuration
         provider = assignments["keyword_review"]
         self._json(HTTPStatus.OK, {"configured": True, "base_url": base_url, "model": model, "provider": provider, "providers": providers, "assignments": assignments})
+
+    def _get_serper_settings(self) -> None:
+        self._json(HTTPStatus.OK, {"configured": _serper_api_key(self.server.ai_settings_path) is not None, "provider": "Serper.dev", "website": "https://serper.dev/"})
+
+    def _get_image_generation_settings(self) -> None:
+        configuration = _image_generation_configuration(self.server.ai_settings_path)
+        image = _image_generation_settings(self.server.ai_settings_path)
+        provider = _image_generation_provider(self.server.ai_settings_path)
+        labels = {"openai": "ChatGPT 中转", "siliconflow": "硅基流动 Kolors"}
+        self._json(HTTPStatus.OK, {
+            "configured": configuration is not None,
+            "base_url": configuration[2] if configuration else (SILICONFLOW_IMAGE_BASE_URL if provider == "siliconflow" else None),
+            "model": _image_generation_model(self.server.ai_settings_path),
+            "provider": provider,
+            "provider_label": labels[provider],
+            "api_key_saved": isinstance(image.get("api_key"), str) and bool(str(image.get("api_key")).strip()),
+        })
+
+    def _save_image_generation_settings(self, payload: Mapping[str, Any]) -> None:
+        provider = self._text(payload, "provider")
+        model = self._text(payload, "model")
+        if provider is None or model is None: return
+        if provider not in IMAGE_GENERATION_PROVIDERS:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "unsupported image provider"}); return
+        try:
+            document = dict(_ai_settings_document(self.server.ai_settings_path))
+            integrations = dict(document.get("integrations")) if isinstance(document.get("integrations"), Mapping) else {}
+            previous = integrations.get("image_generation") if isinstance(integrations.get("image_generation"), Mapping) else {}
+            image_settings: dict[str, Any] = {"provider": provider, "model": model}
+            if provider == "siliconflow":
+                api_key = self._optional_text(payload, "api_key") or previous.get("api_key")
+                if not isinstance(api_key, str) or not api_key.strip():
+                    self._json(HTTPStatus.BAD_REQUEST, {"error": "硅基流动 API Key is required the first time you save this provider."}); return
+                image_settings["api_key"] = api_key.strip()
+            integrations["image_generation"] = image_settings
+            document["integrations"] = integrations
+            self.server.ai_settings_path.parent.mkdir(parents=True, exist_ok=True)
+            self.server.ai_settings_path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+        except OSError as error:
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(error)}); return
+        self._get_image_generation_settings()
+
+    def _test_image_generation_settings(self, _payload: Mapping[str, Any]) -> None:
+        configuration = _image_generation_configuration(self.server.ai_settings_path)
+        if configuration is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "Please save the selected image provider configuration first."}); return
+        provider, _api_key, base_url, model = configuration
+        self._json(HTTPStatus.OK, {"status": "图片服务配置已就绪", "provider": provider, "base_url": base_url, "model": model})
+
+    def _save_serper_settings(self, payload: Mapping[str, Any]) -> None:
+        api_key = self._text(payload, "api_key")
+        if api_key is None:
+            return
+        try:
+            document = dict(_ai_settings_document(self.server.ai_settings_path))
+            integrations = dict(document.get("integrations")) if isinstance(document.get("integrations"), Mapping) else {}
+            integrations["serper"] = {"api_key": api_key}
+            document["integrations"] = integrations
+            self.server.ai_settings_path.parent.mkdir(parents=True, exist_ok=True)
+            self.server.ai_settings_path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+        except OSError as error:
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": str(error)})
+            return
+        self._get_serper_settings()
+
+    def _test_serper_settings(self, payload: Mapping[str, Any]) -> None:
+        api_key = self._optional_text(payload, "api_key") or _serper_api_key(self.server.ai_settings_path)
+        if api_key is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "Please save a Serper API key first."})
+            return
+        try:
+            results = SerperSearchClient(api_key).search(query="apple inc", max_results=1)
+        except SerperSearchProtocolError as error:
+            self._json(HTTPStatus.BAD_GATEWAY, {"error": str(error)})
+            return
+        self._json(HTTPStatus.OK, {"status": "connected", "provider": "Serper.dev", "website": "https://serper.dev/", "sample_title": results[0]["title"]})
 
     def _save_ai_settings(self, payload: Mapping[str, Any]) -> None:
         if "providers" in payload:
@@ -1060,7 +3316,8 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 provider = "openai"
             assignments = _ai_assignments(self.server.ai_settings_path)
             assignments.update({"keyword_review": provider, "title_generation": provider})
-            document = {"providers": {provider: {"api_key": api_key, "base_url": base_url.rstrip("/"), "model": model}}, "assignments": assignments}
+            document = dict(_ai_settings_document(self.server.ai_settings_path))
+            document.update({"providers": {provider: {"api_key": api_key, "base_url": base_url.rstrip("/"), "model": model}}, "assignments": assignments})
             self.server.ai_settings_path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
             self.server.keyword_reviewer = _default_keyword_reviewer(self.server.ai_settings_path)
             self.server.title_generator = _default_title_generator(self.server.ai_settings_path)
@@ -1108,8 +3365,10 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 self._json(HTTPStatus.BAD_REQUEST, {"error": f"Complete API Key, endpoint and model for {provider}."})
                 return
             profiles[provider] = {"api_key": api_key, "base_url": base_url, "model": model}
+        document = dict(_ai_settings_document(self.server.ai_settings_path))
+        document.update({"providers": profiles, "assignments": assignments})
         self.server.ai_settings_path.parent.mkdir(parents=True, exist_ok=True)
-        self.server.ai_settings_path.write_text(json.dumps({"providers": profiles, "assignments": assignments}, ensure_ascii=False), encoding="utf-8")
+        self.server.ai_settings_path.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
         self.server.keyword_reviewer = _default_keyword_reviewer(self.server.ai_settings_path)
         self.server.title_generator = _default_title_generator(self.server.ai_settings_path)
         self._get_ai_settings()
@@ -1772,7 +4031,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
     @staticmethod
     def _content_asset_action_path(path: str) -> tuple[int, str] | None:
         parts = path.strip("/").split("/")
-        if len(parts) != 4 or parts[:2] != ["api", "content-assets"] or parts[3] not in {"briefs", "outlines", "generate", "generate-brief", "generate-outline", "generate-draft", "research-competitors"}: return None
+        if len(parts) != 4 or parts[:2] != ["api", "content-assets"] or parts[3] not in {"briefs", "outlines", "generate", "generate-brief", "generate-outline", "generate-draft", "research-competitors", "image-prompts", "generate-images", "publish-wordpress"}: return None
         try: return int(parts[2]), parts[3]
         except ValueError: return None
 
@@ -1803,11 +4062,32 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         }
 
     @classmethod
-    def _content_asset_payload(cls, row: sqlite3.Row) -> dict[str, Any]:
-        return dict(row) | cls._workflow_status_payload(row)
+    def _content_asset_payload(cls, row: Mapping[str, Any]) -> dict[str, Any]:
+        value = dict(row)
+        value["tags"] = cls._normalise_content_tags(json.loads(value.pop("tags_json", "[]") or "[]"))
+        return value | cls._workflow_status_payload(row)
+
+    @classmethod
+    def _ensure_content_asset_tags(cls, connection: sqlite3.Connection, row: sqlite3.Row) -> Mapping[str, Any]:
+        """Backfill legacy completed articles without charging another AI call."""
+        existing = cls._normalise_content_tags(json.loads(str(row["tags_json"] or "[]")))
+        if existing or row["current_draft_id"] is None:
+            return row
+        draft = connection.execute("SELECT markdown FROM content_drafts WHERE id=?", (row["current_draft_id"],)).fetchone()
+        if draft is None:
+            return row
+        brief = connection.execute("SELECT brief_json FROM content_briefs WHERE id=?", (row["current_brief_id"],)).fetchone() if row["current_brief_id"] else None
+        brief_json = json.loads(str(brief["brief_json"] or "{}")) if brief else {}
+        semantic = brief_json.get("semantic") if isinstance(brief_json, Mapping) else {}
+        tags = cls._fallback_content_tags(row, semantic, str(draft["markdown"] or ""))
+        with connection:
+            connection.execute("UPDATE content_assets SET tags_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (json.dumps(tags, ensure_ascii=False), row["id"]))
+        value = dict(row)
+        value["tags_json"] = json.dumps(tags, ensure_ascii=False)
+        return value
 
     def _content_asset_detail(self, connection: sqlite3.Connection, project_id: int, asset_id: int) -> dict[str, Any]:
-        row = self._content_asset(connection, project_id, asset_id)
+        row = self._ensure_content_asset_tags(connection, self._content_asset(connection, project_id, asset_id))
         payload = self._content_asset_payload(row)
         brief = connection.execute("SELECT * FROM content_briefs WHERE content_asset_id=? AND status='current' ORDER BY id DESC LIMIT 1", (asset_id,)).fetchone()
         outline = connection.execute("SELECT * FROM content_outlines WHERE content_asset_id=? ORDER BY id DESC LIMIT 1", (asset_id,)).fetchone()
@@ -1823,7 +4103,11 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                ORDER BY links.id DESC""",
             (project_id, asset_id),
         ).fetchall()
+        latest_authority_search = connection.execute("SELECT search_run_id FROM authority_search_results WHERE project_id=? AND content_asset_id=? ORDER BY id DESC LIMIT 1", (project_id, asset_id)).fetchone()
+        authority_search_results = connection.execute("SELECT * FROM authority_search_results WHERE project_id=? AND content_asset_id=? AND search_run_id=? ORDER BY id", (project_id, asset_id, latest_authority_search["search_run_id"])).fetchall() if latest_authority_search else []
         current_draft = connection.execute("SELECT * FROM content_drafts WHERE id=?", (row["current_draft_id"],)).fetchone() if row["current_draft_id"] is not None else None
+        images = connection.execute("SELECT * FROM content_section_images WHERE project_id=? AND content_asset_id=? AND draft_id=? ORDER BY position", (project_id, asset_id, current_draft["id"])).fetchall() if current_draft else []
+        publications = connection.execute("SELECT * FROM content_wordpress_publications WHERE project_id=? AND content_asset_id=? ORDER BY id DESC", (project_id, asset_id)).fetchall()
         payload["brief"] = self._content_brief_payload(brief) if brief else None
         payload["outline"] = self._content_outline_payload(connection, outline) if outline else None
         payload["drafts"] = [self._content_draft_payload(draft) for draft in drafts]
@@ -1832,6 +4116,9 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         payload["generation_jobs"] = [dict(job) for job in jobs]
         payload["competitor_research"] = self._competitor_research_payload(connection, research["id"]) if research else None
         payload["authority_sources"] = [self._authority_source_payload(source) for source in authority_sources]
+        payload["authority_search_results"] = [dict(result) for result in authority_search_results]
+        payload["section_images"] = [dict(image) for image in images]
+        payload["wordpress_publications"] = [dict(publication) for publication in publications]
         # Kept as a compact compatibility alias for the first content-system UI.
         payload["runs"] = payload["generation_runs"]
         return payload
@@ -1866,8 +4153,9 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
     def _content_run_payload(row: sqlite3.Row) -> dict[str, Any]:
         value = dict(row)
         value["input"] = json.loads(value.pop("input_json") or "{}")
-        if value["input"].get("workflow_stage") == "chapter_plan":
-            value["stage"] = "chapter_plan"
+        workflow_stage = value["input"].get("workflow_stage")
+        if workflow_stage in {"chapter_plan", "company_context_plan"}:
+            value["stage"] = workflow_stage
         raw_output = value.pop("output_json")
         value["output"] = json.loads(raw_output) if raw_output else None
         return value
@@ -2160,7 +4448,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         self.send_response(status); self.send_header("Content-Type", "application/json; charset=utf-8"); self.send_header("Content-Length", str(len(content))); self.end_headers(); self.wfile.write(content)
 
 
-def create_server(host: str = "127.0.0.1", port: int = 0, database_path: str | Path = ":memory:", suggest_client: Any | None = None, keyword_reviewer: Any | None = None, title_generator: Any | None = None, serp_title_client: Any | None = None, ai_settings_path: Path | None = None, content_generator: Any | None = None, competitor_content_client: Any | None = None) -> KeywordDiscoveryServer:
+def create_server(host: str = "127.0.0.1", port: int = 0, database_path: str | Path = ":memory:", suggest_client: Any | None = None, keyword_reviewer: Any | None = None, title_generator: Any | None = None, serp_title_client: Any | None = None, ai_settings_path: Path | None = None, content_generator: Any | None = None, competitor_content_client: Any | None = None, competitor_search_client: Any | None = None) -> KeywordDiscoveryServer:
     server = KeywordDiscoveryServer((host, port), KeywordDiscoveryRequestHandler)
     server.database_path = database_path
     server.ai_settings_path = ai_settings_path or AI_SETTINGS_FILE
@@ -2172,6 +4460,11 @@ def create_server(host: str = "127.0.0.1", port: int = 0, database_path: str | P
     server.content_generator = content_generator
     server.serp_title_client = serp_title_client or BrowserSerpTitleClient()
     server.competitor_content_client = competitor_content_client or BrowserCompetitorContentClient(server.serp_title_client)
+    # Content-page extraction is independent HTTP parsing; only the Google SERP
+    # discovery path is delegated to Serper.dev in production.
+    server.competitor_search_client = competitor_search_client
+    server.gsc_oauth_states = {}
+    server.gsc_browser_client = GscBrowserCaptureClient()
     return server
 
 
@@ -2194,6 +4487,40 @@ def _default_title_generator(ai_settings_path: Path = AI_SETTINGS_FILE) -> Any:
 def _ai_configuration(ai_settings_path: Path = AI_SETTINGS_FILE, *, purpose: str = "keyword_review") -> tuple[str, str, str] | None:
     provider = _ai_assignments(ai_settings_path).get(purpose, "openai")
     return _provider_configuration(ai_settings_path, provider)
+
+
+def _image_generation_settings(path: Path = AI_SETTINGS_FILE) -> Mapping[str, Any]:
+    document = _ai_settings_document(path)
+    integrations = document.get("integrations")
+    image = integrations.get("image_generation") if isinstance(integrations, Mapping) else None
+    return image if isinstance(image, Mapping) else {}
+
+
+def _image_generation_provider(path: Path = AI_SETTINGS_FILE) -> str:
+    provider = _image_generation_settings(path).get("provider")
+    return provider if provider in IMAGE_GENERATION_PROVIDERS else "openai"
+
+
+def _image_generation_model(path: Path = AI_SETTINGS_FILE) -> str:
+    image = _image_generation_settings(path)
+    model = image.get("model") if isinstance(image, Mapping) else None
+    default = "Kwai-Kolors/Kolors" if _image_generation_provider(path) == "siliconflow" else "gpt-image-2"
+    return model.strip() if isinstance(model, str) and model.strip() else default
+
+
+def _image_generation_configuration(path: Path = AI_SETTINGS_FILE) -> tuple[str, str, str, str] | None:
+    provider = _image_generation_provider(path)
+    model = _image_generation_model(path)
+    if provider == "siliconflow":
+        api_key = _image_generation_settings(path).get("api_key")
+        if isinstance(api_key, str) and api_key.strip():
+            return provider, api_key.strip(), SILICONFLOW_IMAGE_BASE_URL, model
+        return None
+    configuration = _provider_configuration(path, "openai")
+    if configuration is None:
+        return None
+    api_key, base_url, _text_model = configuration
+    return provider, api_key, base_url, model
 
 
 def _provider_configuration(ai_settings_path: Path, provider: str | None) -> tuple[str, str, str] | None:
@@ -2232,6 +4559,22 @@ def _ai_settings_document(path: Path) -> Mapping[str, Any]:
     except (OSError, ValueError, json.JSONDecodeError):
         return {}
     return value if isinstance(value, Mapping) else {}
+
+
+def _gsc_settings(path: Path) -> dict[str, str]:
+    integrations = _ai_settings_document(path).get("integrations")
+    configuration = integrations.get("gsc") if isinstance(integrations, Mapping) else {}
+    return {
+        "client_id": str(configuration.get("client_id") or "") if isinstance(configuration, Mapping) else "",
+        "client_secret": str(configuration.get("client_secret") or "") if isinstance(configuration, Mapping) else "",
+    }
+
+
+def _serper_api_key(path: Path) -> str | None:
+    integrations = _ai_settings_document(path).get("integrations")
+    raw = integrations.get("serper") if isinstance(integrations, Mapping) else None
+    value = raw.get("api_key") if isinstance(raw, Mapping) else None
+    return value.strip() if isinstance(value, str) and value.strip() else None
 
 
 def _ai_assignments(path: Path) -> dict[str, str]:

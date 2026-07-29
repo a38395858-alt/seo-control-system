@@ -48,7 +48,17 @@ def initialize_platform_schema() -> None:
         )
         cursor.execute("""CREATE TABLE IF NOT EXISTS site_terms (id BIGSERIAL PRIMARY KEY,site_id BIGINT NOT NULL REFERENCES websites(id) ON DELETE CASCADE,term TEXT NOT NULL,kind TEXT NOT NULL,definition TEXT NOT NULL DEFAULT '',source_note TEXT NOT NULL DEFAULT '',created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),UNIQUE(site_id,term,kind))""")
         cursor.execute("""CREATE TABLE IF NOT EXISTS site_facts (id BIGSERIAL PRIMARY KEY,site_id BIGINT NOT NULL REFERENCES websites(id) ON DELETE CASCADE,title TEXT NOT NULL,kind TEXT NOT NULL,detail TEXT NOT NULL,source_note TEXT NOT NULL DEFAULT '',created_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
-        cursor.execute("""CREATE TABLE IF NOT EXISTS site_knowledge_documents (id BIGSERIAL PRIMARY KEY,site_id BIGINT NOT NULL REFERENCES websites(id) ON DELETE CASCADE,title TEXT NOT NULL,source_type TEXT NOT NULL,url TEXT NOT NULL DEFAULT '',content TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'ready',created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),UNIQUE(site_id,title))""")
+        cursor.execute("""CREATE TABLE IF NOT EXISTS site_knowledge_documents (id BIGSERIAL PRIMARY KEY,site_id BIGINT NOT NULL REFERENCES websites(id) ON DELETE CASCADE,title TEXT NOT NULL,source_type TEXT NOT NULL,url TEXT NOT NULL DEFAULT '',content TEXT NOT NULL DEFAULT '',knowledge_type TEXT NOT NULL DEFAULT 'other',status TEXT NOT NULL DEFAULT 'ready',created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),UNIQUE(site_id,title))""")
+        # A crawled document is identified by its canonical page URL, not by a
+        # page title (many product pages intentionally share a title template).
+        # Remove the early title-only constraint during upgrade and make URL
+        # uniqueness apply only to online documents; hand-entered notes may
+        # still leave the URL blank.
+        cursor.execute("ALTER TABLE site_knowledge_documents DROP CONSTRAINT IF EXISTS site_knowledge_documents_site_id_title_key")
+        cursor.execute("ALTER TABLE site_knowledge_documents ADD COLUMN IF NOT EXISTS knowledge_type TEXT NOT NULL DEFAULT 'other'")
+        cursor.execute("CREATE UNIQUE INDEX IF NOT EXISTS uq_site_knowledge_document_url ON site_knowledge_documents(site_id,url) WHERE url <> ''")
+        cursor.execute("""CREATE TABLE IF NOT EXISTS site_knowledge_crawl_runs (id BIGSERIAL PRIMARY KEY,site_id BIGINT NOT NULL REFERENCES websites(id) ON DELETE CASCADE,status TEXT NOT NULL DEFAULT 'queued',max_pages INTEGER NOT NULL,discovered_count INTEGER NOT NULL DEFAULT 0,accepted_count INTEGER NOT NULL DEFAULT 0,skipped_count INTEGER NOT NULL DEFAULT 0,failed_count INTEGER NOT NULL DEFAULT 0,message TEXT NOT NULL DEFAULT '',failure_reason TEXT NOT NULL DEFAULT '',celery_task_id TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),completed_at TIMESTAMPTZ)""")
+        cursor.execute("""CREATE TABLE IF NOT EXISTS site_knowledge_crawl_pages (id BIGSERIAL PRIMARY KEY,crawl_run_id BIGINT NOT NULL REFERENCES site_knowledge_crawl_runs(id) ON DELETE CASCADE,url TEXT NOT NULL,title TEXT NOT NULL DEFAULT '',knowledge_type TEXT NOT NULL DEFAULT 'other',status TEXT NOT NULL,reason TEXT NOT NULL DEFAULT '',UNIQUE(crawl_run_id,url))""")
         cursor.execute("""CREATE TABLE IF NOT EXISTS seo_tasks (id BIGSERIAL PRIMARY KEY,website_id BIGINT NOT NULL REFERENCES websites(id) ON DELETE CASCADE,target_keyword TEXT NOT NULL,title TEXT NOT NULL DEFAULT '',status TEXT NOT NULL DEFAULT 'queued',stage TEXT NOT NULL DEFAULT 'task_initialization',progress SMALLINT NOT NULL DEFAULT 0 CHECK(progress BETWEEN 0 AND 100),message TEXT NOT NULL DEFAULT '',celery_task_id TEXT,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())""")
         for statement in (
             "ALTER TABLE seo_tasks ADD COLUMN IF NOT EXISTS task_type TEXT NOT NULL DEFAULT 'content'",
@@ -172,6 +182,85 @@ def add_knowledge(site_id: int, value: Mapping[str, str]) -> dict[str, Any]:
         return _one(cursor)
 
 
+def upsert_crawled_knowledge(site_id: int, pages: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    """Persist accepted first-party HTML pages without mixing website spaces."""
+    saved: list[dict[str, Any]] = []
+    with connection() as database, database.cursor() as cursor:
+        _site(cursor, site_id)
+        for page in pages:
+            if page.get("status") != "ready" or not page.get("content") or not page.get("url"):
+                continue
+            cursor.execute(
+                """INSERT INTO site_knowledge_documents(site_id,title,source_type,url,content,knowledge_type,status)
+                   VALUES(%s,%s,'domain',%s,%s,%s,'ready')
+                   ON CONFLICT(site_id,url) WHERE url <> '' DO UPDATE SET
+                     title=EXCLUDED.title,content=EXCLUDED.content,knowledge_type=EXCLUDED.knowledge_type,status='ready',created_at=NOW()
+                   RETURNING *""",
+                (site_id, str(page.get("title") or page["url"])[:300], str(page["url"]), str(page["content"])[:100000], str(page.get("knowledge_type") or "other")[:40]),
+            )
+            saved.append(_one(cursor))
+    return {"saved": saved}
+
+
+def create_knowledge_crawl_run(site_id: int, max_pages: int) -> dict[str, Any]:
+    with connection() as database, database.cursor() as cursor:
+        _site(cursor, site_id)
+        cursor.execute(
+            """INSERT INTO site_knowledge_crawl_runs(site_id,max_pages,status,message)
+               VALUES(%s,%s,'queued','Waiting for the knowledge crawler worker.') RETURNING *""",
+            (site_id, max_pages),
+        )
+        return _one(cursor)
+
+
+def set_knowledge_crawl_celery_id(run_id: int, celery_task_id: str) -> None:
+    with connection() as database, database.cursor() as cursor:
+        cursor.execute("UPDATE site_knowledge_crawl_runs SET celery_task_id=%s WHERE id=%s", (celery_task_id, run_id))
+
+
+def complete_knowledge_crawl_run(run_id: int, pages: Iterable[Mapping[str, Any]]) -> dict[str, Any]:
+    page_list = list(pages)
+    with connection() as database, database.cursor() as cursor:
+        cursor.execute("SELECT site_id,max_pages FROM site_knowledge_crawl_runs WHERE id=%s FOR UPDATE", (run_id,))
+        run = _one(cursor)
+        for page in page_list:
+            cursor.execute(
+                """INSERT INTO site_knowledge_crawl_pages(crawl_run_id,url,title,knowledge_type,status,reason)
+                   VALUES(%s,%s,%s,%s,%s,%s) ON CONFLICT(crawl_run_id,url) DO UPDATE SET
+                     title=EXCLUDED.title,knowledge_type=EXCLUDED.knowledge_type,status=EXCLUDED.status,reason=EXCLUDED.reason""",
+                (run_id, str(page.get("url") or ""), str(page.get("title") or "")[:300], str(page.get("knowledge_type") or "other")[:40], str(page.get("status") or "failed"), str(page.get("reason") or "")[:500]),
+            )
+        accepted = sum(1 for page in page_list if page.get("status") == "ready")
+        skipped = sum(1 for page in page_list if page.get("status") == "skipped")
+        failed = sum(1 for page in page_list if page.get("status") == "failed")
+        reached_limit = len(page_list) >= int(run["max_pages"])
+        message = f"Full scan completed: {accepted} pages added or updated."
+        if reached_limit:
+            message += f" Reached the safety limit of {run['max_pages']} pages; run again with a larger limit to continue."
+        cursor.execute(
+            """UPDATE site_knowledge_crawl_runs SET status='completed',discovered_count=%s,accepted_count=%s,skipped_count=%s,failed_count=%s,message=%s,completed_at=NOW() WHERE id=%s""",
+            (len(page_list), accepted, skipped, failed, message, run_id),
+        )
+    # Keep the document write separate from run bookkeeping so a long page body
+    # never leaves a transaction open while the crawler is working.
+    upsert_crawled_knowledge(int(run["site_id"]), page_list)
+    return get_knowledge_crawl_run(int(run["site_id"]), run_id)
+
+
+def fail_knowledge_crawl_run(run_id: int, error: Exception) -> None:
+    with connection() as database, database.cursor() as cursor:
+        cursor.execute("UPDATE site_knowledge_crawl_runs SET status='failed',message='Knowledge crawl failed.',failure_reason=%s,completed_at=NOW() WHERE id=%s", (str(error)[:1000], run_id))
+
+
+def get_knowledge_crawl_run(site_id: int, run_id: int) -> dict[str, Any]:
+    with connection() as database, database.cursor() as cursor:
+        cursor.execute("SELECT * FROM site_knowledge_crawl_runs WHERE id=%s AND site_id=%s", (run_id, site_id))
+        run = _one(cursor)
+        cursor.execute("SELECT url,title,knowledge_type,status,reason FROM site_knowledge_crawl_pages WHERE crawl_run_id=%s ORDER BY id", (run_id,))
+        run["pages"] = _rows(cursor)
+        return run
+
+
 def delete_knowledge(site_id: int, document_id: int) -> None:
     with connection() as database, database.cursor() as cursor:
         cursor.execute("DELETE FROM site_knowledge_documents WHERE id=%s AND site_id=%s", (document_id, site_id))
@@ -181,7 +270,7 @@ def delete_knowledge(site_id: int, document_id: int) -> None:
 
 def knowledge_context(site_id: int) -> dict[str, Any]:
     documents = list_knowledge(site_id)
-    content = "\n\n---\n\n".join(f"[Knowledge: {item['title']}]\n{item['content']}" for item in reversed(documents) if item["status"] == "ready" and item["content"])
+    content = "\n\n---\n\n".join(f"[Company knowledge · {item.get('knowledge_type') or 'other'} · {item['title']}]\n{item['content']}" for item in reversed(documents) if item["status"] == "ready" and item["content"])
     return {"site_id": site_id, "documents": documents, "content": content}
 
 
