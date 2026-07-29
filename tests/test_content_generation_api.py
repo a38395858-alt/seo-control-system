@@ -45,7 +45,9 @@ class FakeContentGenerator:
         if stage == "content_tags":
             return {"tags": ["SEO Tools", "Product Comparison", "Buying Guide"]}
         if stage == "qa":
-            return {"status": "needs_verification", "checks": [{"name": "factual support", "status": "verify", "note": "No sources supplied"}], "final_markdown": data["article"]["markdown"], "unresolved_verify": ["No sources supplied"]}
+            return {"status": "needs_verification", "checks": [{"name": "factual support", "status": "verify", "note": "No sources supplied"}], "targeted_rewrite": [{"target": "How to compare options", "issue": "Add one practical check", "instruction": "Add one concise verification check without changing other sections."}], "final_markdown": data["article"]["markdown"], "unresolved_verify": ["No sources supplied"]}
+        if stage == "targeted_rewrite":
+            return {"markdown": data["article"]["markdown"] + "\n\nPractical verification: confirm the evidence before deciding.", "meta_description": data["article"]["meta_description"], "applied_targets": [item["target"] for item in data["instructions"]], "verify": ["No sources supplied"]}
         raise AssertionError(stage)
 
 
@@ -120,6 +122,8 @@ class ContentGenerationApiTests(unittest.TestCase):
         self.assertEqual(201, self.request("POST", f"/api/content-assets/{asset_id}/generate", request)[0])
         _, detail = self.request("GET", f"/api/content-assets/{asset_id}?project_id={project_id}")
         self.assertEqual([1, 2], [draft["version"] for draft in detail["drafts"]])  # type: ignore[index]
+        self.assertIsNone(detail["drafts"][0]["parent_draft_id"])  # type: ignore[index]
+        self.assertEqual(detail["drafts"][0]["id"], detail["drafts"][1]["parent_draft_id"])  # type: ignore[index]
 
     def test_selected_provider_is_locked_for_every_stage_and_saved_as_one_generation_job(self) -> None:
         project_id, asset_id = self.asset()
@@ -133,9 +137,88 @@ class ContentGenerationApiTests(unittest.TestCase):
         job = generated["generation_job"]  # type: ignore[index]
         self.assertEqual("openai", job["provider"])
         self.assertEqual("fake-content-model", job["model"])
+        self.assertEqual("openai", job["reviewer_provider"])
+        self.assertEqual("fake-content-model", job["reviewer_model"])
         self.assertEqual("completed", job["status"])
         self.assertTrue(all(run["provider"] == "openai" and run["generation_job_id"] == job["id"] for run in generated["runs"]))  # type: ignore[index]
         self.assertEqual("openai", generated["draft"]["provider"])  # type: ignore[index]
+
+    def test_requested_reviewer_route_is_saved_without_replacing_the_writer(self) -> None:
+        project_id, asset_id = self.asset()
+        status, generated = self.request(
+            "POST",
+            f"/api/content-assets/{asset_id}/generate",
+            {
+                "project_id": project_id,
+                "provider": "openai",
+                "reviewer_provider": "deepseek",
+                "reviewer_model": "deepseek-review-v1",
+                "target_audience": "US buyers",
+                "business_goal": "commercial",
+                "sources": [],
+            },
+        )
+
+        self.assertEqual(201, status)
+        job = generated["generation_job"]  # type: ignore[index]
+        self.assertEqual("openai", job["provider"])
+        self.assertEqual("deepseek", job["reviewer_provider"])
+        self.assertEqual("deepseek-review-v1", job["reviewer_model"])
+        self.assertEqual("openai", generated["draft"]["provider"])  # type: ignore[index]
+
+    def test_auto_collaboration_keeps_auditable_gpt_writer_and_deepseek_reviewer_route(self) -> None:
+        project_id, asset_id = self.asset()
+        status, generated = self.request(
+            "POST",
+            f"/api/content-assets/{asset_id}/generate",
+            {
+                "project_id": project_id,
+                "routing_mode": "auto_collaborate",
+                "target_audience": "US buyers",
+                "business_goal": "commercial",
+                "sources": [],
+            },
+        )
+
+        self.assertEqual(201, status)
+        job = generated["generation_job"]  # type: ignore[index]
+        self.assertEqual("auto_collaborate", job["routing_mode"])
+        self.assertEqual("openai", job["provider"])
+        self.assertEqual("deepseek", job["reviewer_provider"])
+        self.assertIn("DeepSeek", job["routing_summary"])
+        self.assertIn("ChatGPT", job["routing_summary"])
+        self.assertIn("qa", self.generator.stages)
+        self.assertEqual("needs_verification", generated["draft"]["qa_status"])  # type: ignore[index]
+
+    def test_generation_uses_only_relevant_project_learning_memory_and_records_the_link(self) -> None:
+        project_id, asset_id = self.asset()
+        status, memory = self.request(
+            "POST",
+            "/api/content-learning-memories",
+            {
+                "project_id": project_id,
+                "memory_type": "style",
+                "topic": "SEO tools comparison",
+                "summary": "Open with a buyer scenario and use a comparison table for SEO tools.",
+                "quality_score": 0.9,
+                "evidence": {"source": "reviewed competitor structure"},
+            },
+        )
+        self.assertEqual(201, status)
+
+        status, _generated = self.request(
+            "POST",
+            f"/api/content-assets/{asset_id}/generate",
+            {"project_id": project_id, "target_audience": "US buyers", "business_goal": "commercial", "sources": []},
+        )
+
+        self.assertEqual(201, status)
+        learned = self.generator.stage_inputs["semantic"][0]["learning_memories"]
+        self.assertEqual(memory["id"], learned[0]["memory_id"])  # type: ignore[index]
+        self.assertNotIn("content", learned[0])
+        _, detail = self.request("GET", f"/api/content-assets/{asset_id}?project_id={project_id}")
+        self.assertEqual(memory["id"], detail["learning_memories"][0]["id"])  # type: ignore[index]
+        self.assertEqual("style", detail["learning_memories"][0]["role"])  # type: ignore[index]
 
     def test_selected_provider_failure_never_falls_back_or_overwrites_a_previous_draft(self) -> None:
         project_id, asset_id = self.asset()
@@ -198,3 +281,42 @@ class ContentGenerationApiTests(unittest.TestCase):
         self.assertNotIn("qa", self.generator.stages)
         self.assertEqual("not_run", generated["draft"]["qa_status"])  # type: ignore[index]
         self.assertEqual("openai", generated["draft"]["provider"])  # type: ignore[index]
+
+    def test_quality_review_uses_the_selected_reviewer_route_and_keeps_draft_version(self) -> None:
+        project_id, asset_id = self.asset()
+        request = {"project_id": project_id, "provider": "openai", "target_audience": "US buyers", "business_goal": "commercial", "sources": []}
+        self.assertEqual(201, self.request("POST", f"/api/content-assets/{asset_id}/generate", request)[0])
+        self.generator.stages.clear()
+
+        status, reviewed = self.request(
+            "POST",
+            f"/api/content-assets/{asset_id}/review-quality",
+            {**request, "reviewer_provider": "openai", "reviewer_model": "fake-content-model"},
+        )
+
+        self.assertEqual(201, status)
+        self.assertEqual(["qa"], self.generator.stages)
+        self.assertEqual("needs_verification", reviewed["draft"]["qa_status"])  # type: ignore[index]
+        self.assertEqual("openai", reviewed["quality_review"]["review"]["reviewer"]["provider"])  # type: ignore[index]
+        self.assertEqual("fake-content-model", reviewed["quality_review"]["review"]["reviewer"]["model"])  # type: ignore[index]
+        _, detail = self.request("GET", f"/api/content-assets/{asset_id}?project_id={project_id}")
+        self.assertEqual(1, len(detail["drafts"]))  # type: ignore[index]
+        self.assertEqual("needs_verification", detail["current_draft"]["qa_status"])  # type: ignore[index]
+        self.assertTrue(any(run["stage"] == "qa" for run in detail["generation_runs"]))  # type: ignore[index]
+
+    def test_targeted_rewrite_creates_a_linked_new_version_and_preserves_the_previous_draft(self) -> None:
+        project_id, asset_id = self.asset()
+        request = {"project_id": project_id, "provider": "openai", "target_audience": "US buyers", "business_goal": "commercial", "sources": []}
+        self.assertEqual(201, self.request("POST", f"/api/content-assets/{asset_id}/generate", request)[0])
+        self.assertEqual(201, self.request("POST", f"/api/content-assets/{asset_id}/review-quality", request)[0])
+        self.generator.stages.clear()
+
+        status, rewritten = self.request("POST", f"/api/content-assets/{asset_id}/rewrite-targeted", request)
+
+        self.assertEqual(201, status)
+        self.assertEqual(["targeted_rewrite"], self.generator.stages)
+        self.assertEqual(2, rewritten["draft"]["version"])  # type: ignore[index]
+        self.assertIn("Practical verification", rewritten["draft"]["markdown"])  # type: ignore[index]
+        _, detail = self.request("GET", f"/api/content-assets/{asset_id}?project_id={project_id}")
+        self.assertEqual(2, len(detail["drafts"]))  # type: ignore[index]
+        self.assertEqual(detail["drafts"][0]["id"], detail["drafts"][1]["parent_draft_id"])  # type: ignore[index]

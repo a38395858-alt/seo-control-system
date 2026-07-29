@@ -1,0 +1,2 @@
+# LangGraph is used only by the durable SEO content-agent workflow layer.
+langgraph==1.2.10

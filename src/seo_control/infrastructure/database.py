@@ -791,6 +791,298 @@ _MIGRATIONS: tuple[Migration, ...] = (
             "ALTER TABLE content_assets ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]'",
         ),
     ),
+    (
+        23,
+        "durable content agent jobs",
+        (
+            """
+            CREATE TABLE IF NOT EXISTS agent_jobs (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                content_asset_id INTEGER,
+                requested_action TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN (
+                    'queued','planning','running','waiting_input','waiting_approval',
+                    'retrying','completed','failed','cancelled'
+                )),
+                current_node TEXT NOT NULL DEFAULT 'created',
+                workflow_version TEXT NOT NULL DEFAULT 'content-agent-v1',
+                input_json TEXT NOT NULL DEFAULT '{}',
+                result_json TEXT NOT NULL DEFAULT '{}',
+                error_summary TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                started_at TEXT,
+                completed_at TEXT,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY(content_asset_id) REFERENCES content_assets(id) ON DELETE SET NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS agent_steps (
+                id INTEGER PRIMARY KEY,
+                job_id INTEGER NOT NULL,
+                node_name TEXT NOT NULL,
+                attempt INTEGER NOT NULL DEFAULT 1,
+                status TEXT NOT NULL CHECK(status IN ('queued','running','completed','failed','skipped','cancelled')),
+                model_provider TEXT,
+                model TEXT,
+                input_summary TEXT NOT NULL DEFAULT '',
+                output_json TEXT NOT NULL DEFAULT '{}',
+                error_summary TEXT,
+                started_at TEXT,
+                completed_at TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(job_id) REFERENCES agent_jobs(id) ON DELETE CASCADE
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS agent_approval_requests (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                job_id INTEGER NOT NULL,
+                approval_type TEXT NOT NULL CHECK(approval_type IN ('blueprint','publish')),
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','approved','rejected','expired')),
+                decided_by TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                decided_at TEXT,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY(job_id) REFERENCES agent_jobs(id) ON DELETE CASCADE
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_agent_jobs_project ON agent_jobs(project_id, updated_at DESC, id DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_agent_steps_job ON agent_steps(job_id, id)",
+            "CREATE INDEX IF NOT EXISTS idx_agent_approvals_project ON agent_approval_requests(project_id, status, id DESC)",
+        ),
+    ),
+    (
+        24,
+        "project scoped content learning memories",
+        (
+            """
+            CREATE TABLE IF NOT EXISTS content_learning_memories (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                memory_type TEXT NOT NULL CHECK(memory_type IN ('style','brand','fact','performance','editorial')),
+                topic TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                evidence_json TEXT NOT NULL DEFAULT '{}',
+                source_url TEXT NOT NULL DEFAULT '',
+                source_content_hash TEXT NOT NULL DEFAULT '',
+                quality_score REAL NOT NULL DEFAULT 0 CHECK(quality_score >= 0 AND quality_score <= 1),
+                status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','disabled','superseded')),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS content_memory_links (
+                id INTEGER PRIMARY KEY,
+                content_asset_id INTEGER NOT NULL,
+                memory_id INTEGER NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('style','brand','fact','performance')),
+                relevance_score REAL NOT NULL DEFAULT 0 CHECK(relevance_score >= 0 AND relevance_score <= 1),
+                selected_by_model INTEGER NOT NULL DEFAULT 0,
+                selected_by_user INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(content_asset_id) REFERENCES content_assets(id) ON DELETE CASCADE,
+                FOREIGN KEY(memory_id) REFERENCES content_learning_memories(id) ON DELETE CASCADE,
+                UNIQUE(content_asset_id, memory_id, role)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_content_learning_memories_project ON content_learning_memories(project_id,status,memory_type,updated_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_content_memory_links_asset ON content_memory_links(content_asset_id,relevance_score DESC)",
+        ),
+    ),
+    (
+        25,
+        "content model routing and draft lineage",
+        (
+            "ALTER TABLE content_generation_jobs ADD COLUMN reviewer_provider TEXT",
+            "ALTER TABLE content_generation_jobs ADD COLUMN reviewer_model TEXT",
+            "ALTER TABLE content_drafts ADD COLUMN parent_draft_id INTEGER REFERENCES content_drafts(id) ON DELETE SET NULL",
+            "CREATE INDEX IF NOT EXISTS idx_content_drafts_parent ON content_drafts(parent_draft_id)",
+        ),
+    ),
+    (
+        26,
+        "wordpress publish approval gates",
+        (
+            "ALTER TABLE project_wordpress_configs ADD COLUMN last_tested_at TEXT",
+            "ALTER TABLE agent_approval_requests ADD COLUMN consumed_at TEXT",
+            """
+            CREATE TABLE IF NOT EXISTS content_publish_gate_reports (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                content_asset_id INTEGER NOT NULL,
+                draft_id INTEGER NOT NULL,
+                requested_status TEXT NOT NULL CHECK(requested_status IN ('draft','publish')),
+                report_json TEXT NOT NULL DEFAULT '{}',
+                status TEXT NOT NULL CHECK(status IN ('ready','blocked')),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY(content_asset_id) REFERENCES content_assets(id) ON DELETE CASCADE,
+                FOREIGN KEY(draft_id) REFERENCES content_drafts(id) ON DELETE CASCADE
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_content_publish_gate_reports_asset ON content_publish_gate_reports(project_id, content_asset_id, draft_id, id DESC)",
+        ),
+    ),
+    (
+        27,
+        "published content gsc learning snapshots",
+        (
+            """
+            CREATE TABLE IF NOT EXISTS content_gsc_performance_snapshots (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                content_asset_id INTEGER NOT NULL,
+                draft_id INTEGER,
+                published_url TEXT NOT NULL,
+                window_days INTEGER NOT NULL DEFAULT 7,
+                clicks REAL NOT NULL DEFAULT 0,
+                impressions REAL NOT NULL DEFAULT 0,
+                ctr REAL NOT NULL DEFAULT 0,
+                average_position REAL NOT NULL DEFAULT 0,
+                query_count INTEGER NOT NULL DEFAULT 0,
+                learning_status TEXT NOT NULL CHECK(learning_status IN ('observing','qualified','insufficient')),
+                summary TEXT NOT NULL DEFAULT '',
+                collected_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY(content_asset_id) REFERENCES content_assets(id) ON DELETE CASCADE,
+                FOREIGN KEY(draft_id) REFERENCES content_drafts(id) ON DELETE SET NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS content_gsc_performance_rows (
+                id INTEGER PRIMARY KEY,
+                snapshot_id INTEGER NOT NULL,
+                query TEXT NOT NULL,
+                page_url TEXT NOT NULL,
+                clicks REAL NOT NULL DEFAULT 0,
+                impressions REAL NOT NULL DEFAULT 0,
+                ctr REAL NOT NULL DEFAULT 0,
+                position REAL NOT NULL DEFAULT 0,
+                FOREIGN KEY(snapshot_id) REFERENCES content_gsc_performance_snapshots(id) ON DELETE CASCADE,
+                UNIQUE(snapshot_id, query, page_url)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_content_gsc_snapshots_asset ON content_gsc_performance_snapshots(project_id, content_asset_id, collected_at DESC, id DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_content_gsc_rows_snapshot ON content_gsc_performance_rows(snapshot_id, impressions DESC, clicks DESC)",
+        ),
+    ),
+    (
+        28,
+        "learning memory management and human feedback",
+        (
+            "ALTER TABLE content_learning_memories ADD COLUMN manual_priority INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE content_learning_memories ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE content_learning_memories ADD COLUMN positive_feedback_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE content_learning_memories ADD COLUMN negative_feedback_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE content_learning_memories ADD COLUMN last_feedback_at TEXT",
+            """
+            CREATE TABLE IF NOT EXISTS content_learning_memory_feedback (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                memory_id INTEGER NOT NULL,
+                decision TEXT NOT NULL CHECK(decision IN ('useful','not_useful')),
+                note TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY(memory_id) REFERENCES content_learning_memories(id) ON DELETE CASCADE
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_content_learning_memory_feedback_memory ON content_learning_memory_feedback(project_id, memory_id, id DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_content_learning_memories_selection ON content_learning_memories(project_id, status, pinned DESC, manual_priority DESC, quality_score DESC)",
+        ),
+    ),
+    (
+        29,
+        "periodic competitor learning and style cards",
+        (
+            """
+            CREATE TABLE IF NOT EXISTS competitor_learning_schedules (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL UNIQUE,
+                topics_json TEXT NOT NULL DEFAULT '[]',
+                interval_days INTEGER NOT NULL DEFAULT 14 CHECK(interval_days BETWEEN 7 AND 90),
+                enabled INTEGER NOT NULL DEFAULT 0,
+                provider TEXT,
+                model TEXT,
+                last_run_at TEXT,
+                next_run_at TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS competitor_learning_runs (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                schedule_id INTEGER,
+                content_asset_id INTEGER,
+                topic TEXT NOT NULL,
+                trigger_type TEXT NOT NULL CHECK(trigger_type IN ('manual','scheduled')),
+                status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','completed','insufficient','failed')),
+                source_count INTEGER NOT NULL DEFAULT 0,
+                cards_created INTEGER NOT NULL DEFAULT 0,
+                error_summary TEXT,
+                started_at TEXT,
+                completed_at TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY(schedule_id) REFERENCES competitor_learning_schedules(id) ON DELETE SET NULL,
+                FOREIGN KEY(content_asset_id) REFERENCES content_assets(id) ON DELETE SET NULL
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS competitor_style_cards (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                schedule_id INTEGER,
+                learning_run_id INTEGER,
+                topic TEXT NOT NULL,
+                card_title TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                evidence_json TEXT NOT NULL DEFAULT '{}',
+                source_signature TEXT NOT NULL,
+                quality_score REAL NOT NULL DEFAULT 0 CHECK(quality_score >= 0 AND quality_score <= 1),
+                status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','disabled','superseded')),
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY(schedule_id) REFERENCES competitor_learning_schedules(id) ON DELETE SET NULL,
+                FOREIGN KEY(learning_run_id) REFERENCES competitor_learning_runs(id) ON DELETE SET NULL,
+                UNIQUE(project_id, source_signature, card_title)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_competitor_learning_runs_project ON competitor_learning_runs(project_id, created_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_competitor_style_cards_project ON competitor_style_cards(project_id, status, updated_at DESC)",
+            "CREATE INDEX IF NOT EXISTS idx_competitor_learning_schedule_due ON competitor_learning_schedules(enabled, next_run_at)",
+        ),
+    ),
+    (
+        30,
+        "auditable GPT DeepSeek collaboration routes",
+        (
+            "ALTER TABLE content_generation_jobs ADD COLUMN routing_mode TEXT NOT NULL DEFAULT 'manual' CHECK(routing_mode IN ('manual','auto_collaborate'))",
+            "ALTER TABLE content_generation_jobs ADD COLUMN routing_summary TEXT NOT NULL DEFAULT ''",
+        ),
+    ),
+    (
+        31,
+        "DeepSeek organization metadata for first-party knowledge",
+        (
+            "ALTER TABLE project_knowledge_documents ADD COLUMN summary TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE project_knowledge_documents ADD COLUMN tags_json TEXT NOT NULL DEFAULT '[]'",
+            "ALTER TABLE project_knowledge_documents ADD COLUMN classification_json TEXT NOT NULL DEFAULT '{}'",
+            "ALTER TABLE project_knowledge_documents ADD COLUMN organizer_provider TEXT",
+            "ALTER TABLE project_knowledge_documents ADD COLUMN organizer_model TEXT",
+        ),
+    ),
 )
 
 
