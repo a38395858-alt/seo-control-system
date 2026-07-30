@@ -1083,6 +1083,94 @@ _MIGRATIONS: tuple[Migration, ...] = (
             "ALTER TABLE project_knowledge_documents ADD COLUMN organizer_model TEXT",
         ),
     ),
+    (
+        32,
+        "persistent robots-blocked competitor URL archive",
+        (
+            """
+            CREATE TABLE IF NOT EXISTS competitor_url_archive (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                normalized_url TEXT NOT NULL,
+                url TEXT NOT NULL,
+                domain TEXT NOT NULL DEFAULT '',
+                search_title TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL CHECK(status IN ('robots_blocked')),
+                last_rank INTEGER,
+                last_query TEXT NOT NULL DEFAULT '',
+                error_summary TEXT NOT NULL DEFAULT '',
+                discovered_count INTEGER NOT NULL DEFAULT 1,
+                first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                UNIQUE(project_id, normalized_url, status)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_competitor_url_archive_project ON competitor_url_archive(project_id, status, last_seen_at DESC)",
+        ),
+    ),
+    (
+        33,
+        "backfill historical robots-blocked competitor URLs",
+        (
+            """INSERT OR IGNORE INTO competitor_url_archive(
+                    project_id,normalized_url,url,domain,search_title,status,last_rank,last_query,error_summary
+                )
+                SELECT runs.project_id,lower(rtrim(items.url, '/')),items.url,items.domain,items.search_title,
+                       'robots_blocked',items.rank,runs.query,items.error_summary
+                FROM competitor_research_items items
+                JOIN competitor_research_runs runs ON runs.id=items.research_run_id
+                WHERE lower(items.error_summary) LIKE '%robot%'""",
+        ),
+    ),
+    (
+        34,
+        "project-scoped competitor URL catalog",
+        (
+            """
+            CREATE TABLE IF NOT EXISTS competitor_url_catalog (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                normalized_url TEXT NOT NULL,
+                url TEXT NOT NULL,
+                domain TEXT NOT NULL DEFAULT '',
+                search_title TEXT NOT NULL DEFAULT '',
+                collection_status TEXT NOT NULL DEFAULT 'discovered' CHECK(collection_status IN (
+                    'discovered','queued','collected','excluded','robots_blocked','failed'
+                )),
+                exclusion_reason TEXT NOT NULL DEFAULT '',
+                last_rank INTEGER,
+                last_query TEXT NOT NULL DEFAULT '',
+                memory_id INTEGER,
+                discovered_count INTEGER NOT NULL DEFAULT 1,
+                first_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_seen_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                last_collected_at TEXT,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY(memory_id) REFERENCES competitor_content_memory(id) ON DELETE SET NULL,
+                UNIQUE(project_id, normalized_url)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_competitor_url_catalog_project ON competitor_url_catalog(project_id, collection_status, last_seen_at DESC)",
+        ),
+    ),
+    (
+        35,
+        "backfill all historical competitor discovery URLs",
+        (
+            """INSERT OR IGNORE INTO competitor_url_catalog(
+                    project_id,normalized_url,url,domain,search_title,collection_status,exclusion_reason,last_rank,last_query,memory_id
+                )
+                SELECT runs.project_id,lower(rtrim(items.url, '/')),items.url,items.domain,items.search_title,
+                       CASE WHEN lower(COALESCE(items.error_summary,'')) LIKE '%robot%' THEN 'robots_blocked'
+                            WHEN items.status='selected' THEN 'collected'
+                            WHEN items.status='skipped' THEN 'excluded'
+                            ELSE 'failed' END,
+                       COALESCE(items.error_summary,''),items.rank,runs.query,items.memory_id
+                FROM competitor_research_items items
+                JOIN competitor_research_runs runs ON runs.id=items.research_run_id""",
+        ),
+    ),
 )
 
 

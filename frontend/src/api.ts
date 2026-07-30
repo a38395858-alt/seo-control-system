@@ -1,4 +1,4 @@
-import type { AuthoritySource, CompetitorResearch, ContentAsset, ContentAssetDetail, ContentBrief, ContentGenerationResult, ContentMemoryItem, ContentOutline, ExpansionResult, LibraryKeyword, Review, Score, SerpTitle, SerpTitleMemory, TitleCandidate, TitleGenerationJob } from "./types";
+import type { AuthoritySource, CompetitorResearch, CompetitorUrlArchiveItem, ContentAsset, ContentAssetDetail, ContentBrief, ContentGenerationResult, ContentMemoryItem, ContentOutline, ExpansionResult, LibraryKeyword, Review, Score, SerpTitle, SerpTitleMemory, TitleCandidate, TitleGenerationJob } from "./types";
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, options);
@@ -91,6 +91,7 @@ export const api = {
   generateContent: (assetId: number, body: object) => request<ContentGenerationResult>(`/api/content-assets/${assetId}/generate`, json(body)),
   researchCompetitors: (assetId: number, body: object) => request<CompetitorResearch>(`/api/content-assets/${assetId}/research-competitors`, json(body)),
   listContentMemory: (projectId: number, query = "") => request<ContentMemoryItem[]>(`/api/content-memory?project_id=${projectId}&q=${encodeURIComponent(query)}`),
+  listCompetitorUrlArchive: (projectId: number) => request<CompetitorUrlArchiveItem[]>(`/api/competitor-url-archive?project_id=${projectId}`),
   deleteContentMemory: (memoryId: number, body: object) => request<{ deleted: number }>(`/api/content-memory/${memoryId}`, { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
   createContentLearningMemory: (body: { project_id: number; memory_type: "style" | "brand" | "fact" | "performance" | "editorial"; topic: string; summary: string; quality_score: number; evidence: Record<string, unknown> }) => request<import("./types").ContentLearningMemory>("/api/content-learning-memories", json(body)),
   listContentLearningMemories: (projectId: number) => request<import("./types").ContentLearningMemory[]>(`/api/content-learning-memories?project_id=${projectId}`),

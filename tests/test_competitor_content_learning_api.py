@@ -148,7 +148,7 @@ class CompetitorContentLearningApiTests(unittest.TestCase):
         _, memory = self.request("GET", f"/api/content-memory?project_id={project_id}")
         self.assertEqual(5, len(memory))  # type: ignore[arg-type]
 
-    def test_irrelevant_competitor_pages_are_skipped_before_memory_or_analysis(self) -> None:
+    def test_irrelevant_competitor_pages_are_saved_but_skipped_by_the_analysis_pack(self) -> None:
         self.generator.reject_urls = {"https://competitor-4.example/guide", "https://competitor-5.example/guide"}
         project_id, asset_id = self.asset()
         status, body = self.request("POST", f"/api/content-assets/{asset_id}/generate", {"project_id": project_id, "provider": "openai", "competitor_research": True})
@@ -158,7 +158,7 @@ class CompetitorContentLearningApiTests(unittest.TestCase):
         self.assertEqual(2, len(skipped))
         self.assertTrue(all(item["memory_id"] is None for item in skipped))
         _, memory = self.request("GET", f"/api/content-memory?project_id={project_id}")
-        self.assertEqual(3, len(memory))  # type: ignore[arg-type]
+        self.assertEqual(5, len(memory))  # type: ignore[arg-type]
 
     def test_memory_is_never_visible_to_another_website_project(self) -> None:
         project_a, asset_a = self.asset("A")
@@ -187,12 +187,12 @@ class CompetitorContentLearningApiTests(unittest.TestCase):
         self.assertIsNone(detail["current_draft"])  # type: ignore[index]
         self.assertEqual("insufficient", detail["competitor_research"]["status"])  # type: ignore[index]
 
-    def test_pages_beyond_the_top_five_are_not_crawled_for_this_analysis_run(self) -> None:
+    def test_all_eligible_result_urls_are_collected_while_analysis_remains_bounded(self) -> None:
         self.server.competitor_content_client = PageTwoRecoveryClient(); self.server.competitor_search_client = self.server.competitor_content_client
         project_id, asset_id = self.asset()
         status, body = self.request("POST", f"/api/content-assets/{asset_id}/generate", {"project_id": project_id, "provider": "openai", "competitor_research": True})
         self.assertEqual(201, status, body)
-        self.assertEqual(2, body["competitor_research"]["usable_count"])  # type: ignore[index]
+        self.assertEqual(3, body["competitor_research"]["usable_count"])  # type: ignore[index]
 
     def test_google_content_research_uses_top_thirty_without_bing(self) -> None:
         client = GoogleThenBingClient(); client.count = 7; self.server.competitor_content_client = client; self.server.competitor_search_client = client
@@ -205,7 +205,7 @@ class CompetitorContentLearningApiTests(unittest.TestCase):
         self.assertEqual([], client.bing_queries)
         self.assertEqual(5, body["competitor_research"]["usable_count"])  # type: ignore[index]
 
-    def test_only_the_top_five_readable_article_pages_are_saved_and_analyzed(self) -> None:
+    def test_all_readable_article_pages_are_saved_and_the_analysis_pack_is_top_five(self) -> None:
         self.server.competitor_content_client = FakeCompetitorClient(count=7); self.server.competitor_search_client = self.server.competitor_content_client
         project_id, asset_id = self.asset()
 
@@ -214,7 +214,10 @@ class CompetitorContentLearningApiTests(unittest.TestCase):
         self.assertEqual(201, status, body)
         self.assertEqual(5, body["competitor_research"]["usable_count"])  # type: ignore[index]
         _, memory = self.request("GET", f"/api/content-memory?project_id={project_id}")
-        self.assertEqual(5, len(memory))  # type: ignore[arg-type]
+        self.assertEqual(7, len(memory))  # type: ignore[arg-type]
+        _, catalog = self.request("GET", f"/api/competitor-url-catalog?project_id={project_id}")
+        self.assertEqual(7, len(catalog))  # type: ignore[arg-type]
+        self.assertTrue(all(item["collection_status"] == "collected" for item in catalog))  # type: ignore[index]
         analysis_input = self.generator.stage_inputs["competitor_analysis"][-1]
         self.assertEqual(5, len(analysis_input["competitors_content"]))
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -14,7 +15,7 @@ SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from seo_control.web import create_server  # noqa: E402
+from seo_control.web import competitor_candidate_exclusion_reason, create_server  # noqa: E402
 
 
 class FakeContentGenerator:
@@ -114,6 +115,41 @@ class ContentGenerationApiTests(unittest.TestCase):
         self.assertEqual(1, len(detail["drafts"]))  # type: ignore[index]
         self.assertEqual(["SEO Tools", "Product Comparison", "Buying Guide"], detail["tags"])  # type: ignore[index]
         self.assertEqual("completed", detail["runs"][-1]["status"])  # type: ignore[index]
+
+    def test_robots_blocked_competitor_url_is_preserved_without_body(self) -> None:
+        project_id, _asset_id = self.asset()
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            self.server.RequestHandlerClass._archive_robots_blocked_url(  # type: ignore[attr-defined]
+                connection,
+                project_id,
+                {
+                    "url": "https://example.com/competitor-guide",
+                    "domain": "example.com",
+                    "title": "Competitor guide",
+                    "rank": 4,
+                    "search_query": "outdoor stair lighting",
+                },
+                RuntimeError("robots.txt disallows automated content extraction"),
+            )
+        finally:
+            connection.close()
+        status, archive = self.request("GET", f"/api/competitor-url-archive?project_id={project_id}")
+        self.assertEqual(200, status)
+        self.assertEqual(1, len(archive))  # type: ignore[arg-type]
+        entry = archive[0]  # type: ignore[index]
+        self.assertEqual("robots_blocked", entry["status"])
+        self.assertEqual("https://example.com/competitor-guide", entry["url"])
+        self.assertEqual("outdoor stair lighting", entry["last_query"])
+
+    def test_major_social_platforms_are_skipped_before_competitor_crawling(self) -> None:
+        for domain in ("reddit.com", "pinterest.com", "linkedin.com", "x.com", "quora.com"):
+            reason = competitor_candidate_exclusion_reason(
+                {"domain": domain, "url": f"https://www.{domain}/example", "title": "Community post"},
+                "ledsteplight.com",
+            )
+            self.assertIsNotNone(reason, domain)
+            self.assertIn("excluded", reason or "")
 
     def test_each_generation_creates_a_new_version_without_overwriting_history(self) -> None:
         project_id, asset_id = self.asset()

@@ -6,6 +6,7 @@ import sys
 import threading
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
@@ -92,6 +93,13 @@ class CompetitorContentClientTests(unittest.TestCase):
         result = client.extract_many(["https://example.test/ok", "https://example.test/blocked"])
         self.assertIsInstance(result["https://example.test/blocked"], Exception)
         self.assertIsInstance(result["https://example.test/ok"], dict)
+
+    def test_robots_disallowed_page_is_never_requested_or_rendered(self) -> None:
+        client = BrowserCompetitorContentClient(browser=object())  # type: ignore[arg-type]
+        with patch("seo_control.application.browser_competitor_content_client._robots_allows", return_value=False), patch.object(client, "_fetch_static_html") as fetch:
+            with self.assertRaisesRegex(Exception, "blocked by robots"):
+                client.extract(url="https://blocked.example/article")
+        fetch.assert_not_called()
 
 
 if __name__ == "__main__": unittest.main()

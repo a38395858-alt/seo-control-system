@@ -68,7 +68,13 @@ DEFAULT_AI_ASSIGNMENTS = {"keyword_review": "openai", "title_generation": "opena
 CONTENT_PROVIDER_LABELS = {"openai": "ChatGPT", "gemini": "Gemini", "deepseek": "DeepSeek"}
 AUTHORITY_SEARCH_FILE_EXCLUSIONS = "-filetype:pdf -filetype:doc -filetype:docx -filetype:xls -filetype:xlsx -filetype:ppt -filetype:pptx -filetype:csv -filetype:zip"
 AUTHORITY_NON_ARTICLE_PATH_MARKERS = ("/documentcenter/", "/docview", "/pdfjsviewer/", "/virtual-library/", "/weblink/", "/records/", "/download/", "/bidopportunities/")
-COMPETITOR_NON_ARTICLE_DOMAINS = ("pinterest.com", "youtube.com", "youtu.be", "instagram.com", "facebook.com", "tiktok.com")
+# Social platforms are discovery noise rather than reusable editorial sources.
+# Keep them visible only as skipped search results; never crawl or learn from them.
+COMPETITOR_NON_ARTICLE_DOMAINS = (
+    "reddit.com", "pinterest.com", "youtube.com", "youtu.be", "instagram.com",
+    "facebook.com", "tiktok.com", "twitter.com", "x.com", "linkedin.com",
+    "threads.net", "snapchat.com", "tumblr.com", "quora.com",
+)
 COMPETITOR_MARKETPLACE_DOMAINS = ("amazon.com", "ebay.com", "aliexpress.com", "temu.com", "walmart.com", "etsy.com", "wayfair.com")
 COMPETITOR_PRODUCT_PATH_MARKERS = ("/product/", "/products/", "/collections/", "/category/", "/categories/", "/shop/", "/store/", "/dp/", "/best-sellers/")
 
@@ -179,7 +185,7 @@ def competitor_candidate_exclusion_reason(item: Mapping[str, Any], own_domain: s
     if own_domain and (domain == own_domain or domain.endswith("." + own_domain)):
         return "Current website page is excluded from competitor research."
     if any(domain == blocked or domain.endswith("." + blocked) for blocked in COMPETITOR_NON_ARTICLE_DOMAINS):
-        return "Visual/social/video result is excluded because it is not a reusable editorial article source."
+        return "Social, community, visual, or video platform result is excluded from competitor crawling and learning."
     if any(domain == marketplace or domain.endswith("." + marketplace) for marketplace in COMPETITOR_MARKETPLACE_DOMAINS):
         return "Marketplace listing is excluded before crawling because it is not an editorial article."
     if any(marker in url for marker in COMPETITOR_PRODUCT_PATH_MARKERS):
@@ -283,6 +289,10 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             self._list_content_library()
         elif path == "/api/content-memory":
             self._list_content_memory()
+        elif path == "/api/competitor-url-archive":
+            self._list_competitor_url_archive()
+        elif path == "/api/competitor-url-catalog":
+            self._list_competitor_url_catalog()
         elif path == "/api/authority-sources":
             self._list_authority_sources()
         elif self._content_asset_path(path) is not None:
@@ -633,6 +643,19 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 raise CompetitorContentProtocolError(message)
             selected: list[dict[str, Any]] = []
             own_domain = self._project_domain(connection, asset["project_id"])
+            # The catalog is the durable local record of every organic URL
+            # discovered for this project.  It intentionally includes URLs
+            # later excluded from crawling, so the user can inspect the full
+            # search landscape without retaining prohibited page bodies.
+            for item in results:
+                reason = competitor_candidate_exclusion_reason(item, own_domain)
+                self._upsert_competitor_url_catalog(
+                    connection,
+                    asset["project_id"],
+                    item,
+                    collection_status="excluded" if reason else "queued",
+                    reason=reason or "",
+                )
             # Search covers Google's first two pages.  We probe all returned
             # organic candidates, but retain only the first five usable
             # articles.  Limiting the probe to page one caused legitimate
@@ -651,20 +674,34 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                     candidates.append(item)
                 return candidates
 
-            # Crawl only the highest-ranking five non-product/article
-            # candidates. The AI relevance stage receives their extracted
-            # bodies, never search snippets or a large scraped corpus.
-            candidates = editorial_candidates(results)[:5]
-            batch = self.server.competitor_content_client.extract_many([str(item["url"]) for item in candidates], max_workers=5, respect_robots=False) if callable(getattr(self.server.competitor_content_client, "extract_many", None)) else {}
-            extracted_pages: list[tuple[Mapping[str, Any], Mapping[str, Any]]] = []
+            # Save and collect every eligible editorial URL from this search
+            # run.  The AI is still given a deliberate five-source evidence
+            # pack later, while the complete permitted corpus remains in the
+            # project-local memory for long-term learning.
+            # Write the discovery batch first, then read the queued rows back
+            # from the project-local catalog.  This makes the catalog the
+            # single source of truth for later collection/retry work rather
+            # than relying on transient search-response objects.
+            editorial_candidates(results)
+            candidates = self._queued_competitor_catalog_candidates(
+                connection,
+                asset["project_id"],
+                google_query,
+            )
+            batch = self.server.competitor_content_client.extract_many([str(item["url"]) for item in candidates], max_workers=5, respect_robots=True) if callable(getattr(self.server.competitor_content_client, "extract_many", None)) else {}
+            extracted_pages: list[tuple[Mapping[str, Any], Mapping[str, Any], int]] = []
             for result in candidates:
                 try:
                     fetched = batch.get(str(result["url"])) if batch else None
                     if isinstance(fetched, Exception):
                         raise fetched
                     page = fetched if isinstance(fetched, Mapping) else self._extract_competitor_content(url=str(result["url"]))
-                    extracted_pages.append((result, page))
+                    memory_id = self._upsert_competitor_memory(connection, asset["project_id"], result, page)
+                    self._upsert_competitor_url_catalog(connection, asset["project_id"], result, collection_status="collected", memory_id=memory_id)
+                    extracted_pages.append((result, page, memory_id))
                 except Exception as error:
+                    self._archive_robots_blocked_url(connection, asset["project_id"], result, error)
+                    self._upsert_competitor_url_catalog(connection, asset["project_id"], result, collection_status="robots_blocked" if "robot" in str(error).casefold() else "failed", reason=str(error))
                     with connection:
                         connection.execute(
                             "INSERT INTO competitor_research_items(research_run_id,rank,search_title,url,domain,status,error_summary) VALUES(?,?,?,?,?, 'failed',?)",
@@ -697,15 +734,19 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                     with connection:
                         connection.execute("UPDATE competitor_research_runs SET query=? WHERE id=?", (f"Serper.dev · Google API: {' → '.join(queries)} | Bing fallback: {bing_query}", run_id))
                     bing_candidates = editorial_candidates(bing_results)
-                    bing_batch = self.server.competitor_content_client.extract_many([str(item["url"]) for item in bing_candidates], max_workers=5, respect_robots=False) if callable(getattr(self.server.competitor_content_client, "extract_many", None)) else {}
+                    bing_batch = self.server.competitor_content_client.extract_many([str(item["url"]) for item in bing_candidates], max_workers=5, respect_robots=True) if callable(getattr(self.server.competitor_content_client, "extract_many", None)) else {}
                     for result in bing_candidates:
                         try:
                             fetched = bing_batch.get(str(result["url"])) if bing_batch else None
                             if isinstance(fetched, Exception):
                                 raise fetched
                             page = fetched if isinstance(fetched, Mapping) else self._extract_competitor_content(url=str(result["url"]))
-                            extracted_pages.append((result, page))
+                            memory_id = self._upsert_competitor_memory(connection, asset["project_id"], result, page)
+                            self._upsert_competitor_url_catalog(connection, asset["project_id"], result, collection_status="collected", memory_id=memory_id)
+                            extracted_pages.append((result, page, memory_id))
                         except Exception as error:
+                            self._archive_robots_blocked_url(connection, asset["project_id"], result, error)
+                            self._upsert_competitor_url_catalog(connection, asset["project_id"], result, collection_status="robots_blocked" if "robot" in str(error).casefold() else "failed", reason=str(error))
                             with connection:
                                 connection.execute(
                                     "INSERT INTO competitor_research_items(research_run_id,rank,search_title,url,domain,status,error_summary) VALUES(?,?,?,?,?, 'failed',?)",
@@ -717,7 +758,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 "locale": asset["locale"],
                 "pages": [
                     {"url": result["url"], "search_query": result.get("search_query", ""), "search_title": result["title"], "page_title": page.get("title", ""), "domain": page.get("domain", result["domain"]), "content_excerpt": str(page.get("content", ""))[:6000]}
-                    for result, page in extracted_pages
+                    for result, page, _memory_id in extracted_pages[:5]
                 ],
             }
             if not relevance_data["pages"]:
@@ -737,7 +778,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 if isinstance(item, Mapping) and item.get("decision") in {"accept", "reject"} and isinstance(item.get("url"), str)
             }
             product_like_rejections = 0
-            for result, page in extracted_pages:
+            for result, page, memory_id in extracted_pages[:5]:
                 decision = decisions.get(str(result["url"]))
                 accepted = bool(decision and decision.get("decision") == "accept")
                 reason = str(decision.get("reason") or "Did not match the selected title and search intent.") if decision else "No relevance decision returned for this page."
@@ -767,7 +808,6 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                             (run_id, result["rank"], result["title"], result["url"], result["domain"], reason),
                         )
                     continue
-                memory_id = self._upsert_competitor_memory(connection, asset["project_id"], result, page)
                 with connection:
                     connection.execute(
                         "INSERT INTO competitor_research_items(research_run_id,memory_id,rank,search_title,url,domain,status,error_summary) VALUES(?,?,?,?,?,?, 'selected', ?)",
@@ -821,15 +861,14 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         return urlparse(str(value)).hostname.removeprefix("www.") if isinstance(value, str) and urlparse(str(value)).hostname else ""
 
     def _extract_competitor_content(self, *, url: str) -> Mapping[str, Any]:
-        """Fetch public article HTML without treating robots.txt as a hard block.
+        """Fetch a public article only after its robots policy allows it.
 
-        The caller still rejects login walls, CAPTCHAs, non-HTML files, thin
-        pages and irrelevant content. The TypeError fallback keeps injected
-        test clients compatible with the older ``extract(url=...)`` contract.
+        The TypeError fallback keeps injected test clients compatible with the
+        older ``extract(url=...)`` contract.
         """
         extractor = self.server.competitor_content_client.extract
         try:
-            return extractor(url=url, respect_robots=False)
+            return extractor(url=url, respect_robots=True)
         except TypeError as error:
             if "respect_robots" not in str(error):
                 raise
@@ -880,6 +919,88 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         return memory_id
 
     @staticmethod
+    def _upsert_competitor_url_catalog(
+        connection: sqlite3.Connection,
+        project_id: int,
+        result: Mapping[str, Any],
+        *,
+        collection_status: str,
+        reason: str = "",
+        memory_id: int | None = None,
+    ) -> None:
+        """Persist every discovered URL; bodies are linked only when allowed."""
+        url = str(result.get("url") or "").strip()
+        normalized = url.split("#", 1)[0].rstrip("/").casefold()
+        if not normalized:
+            return
+        with connection:
+            connection.execute(
+                """INSERT INTO competitor_url_catalog(
+                       project_id,normalized_url,url,domain,search_title,collection_status,exclusion_reason,last_rank,last_query,memory_id,last_collected_at
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,CASE WHEN ?='collected' THEN CURRENT_TIMESTAMP ELSE NULL END)
+                   ON CONFLICT(project_id,normalized_url) DO UPDATE SET
+                       url=excluded.url,domain=excluded.domain,search_title=excluded.search_title,
+                       collection_status=excluded.collection_status,exclusion_reason=excluded.exclusion_reason,
+                       last_rank=excluded.last_rank,last_query=excluded.last_query,
+                       memory_id=COALESCE(excluded.memory_id,competitor_url_catalog.memory_id),
+                       discovered_count=competitor_url_catalog.discovered_count+1,last_seen_at=CURRENT_TIMESTAMP,
+                       last_collected_at=CASE WHEN excluded.collection_status='collected' THEN CURRENT_TIMESTAMP ELSE competitor_url_catalog.last_collected_at END""",
+                (
+                    project_id, normalized, url, str(result.get("domain") or ""), str(result.get("title") or ""),
+                    collection_status, reason[:1200], int(result.get("rank") or 0) or None,
+                    str(result.get("search_query") or ""), memory_id, collection_status,
+                ),
+            )
+
+    @staticmethod
+    def _queued_competitor_catalog_candidates(
+        connection: sqlite3.Connection,
+        project_id: int,
+        query: str,
+    ) -> list[dict[str, Any]]:
+        rows = connection.execute(
+            """SELECT url,domain,search_title,last_rank,last_query
+               FROM competitor_url_catalog
+               WHERE project_id=? AND collection_status='queued' AND last_query=?
+               ORDER BY last_rank ASC,id ASC""",
+            (project_id, query),
+        ).fetchall()
+        return [
+            {
+                "url": str(row["url"]),
+                "domain": str(row["domain"]),
+                "title": str(row["search_title"]),
+                "rank": int(row["last_rank"] or 0),
+                "search_query": str(row["last_query"]),
+            }
+            for row in rows
+        ]
+
+    @staticmethod
+    def _archive_robots_blocked_url(connection: sqlite3.Connection, project_id: int, result: Mapping[str, Any], error: Exception) -> None:
+        """Keep the discovery URL and failure reason without retaining inaccessible text."""
+        message = str(error).strip()
+        if "robot" not in message.casefold():
+            return
+        url = str(result.get("url") or "").strip()
+        normalized = url.split("#", 1)[0].rstrip("/").casefold()
+        if not normalized:
+            return
+        with connection:
+            connection.execute(
+                """INSERT INTO competitor_url_archive(project_id,normalized_url,url,domain,search_title,status,last_rank,last_query,error_summary)
+                   VALUES(?,?,?,?,?,'robots_blocked',?,?,?)
+                   ON CONFLICT(project_id,normalized_url,status) DO UPDATE SET
+                     url=excluded.url,domain=excluded.domain,search_title=excluded.search_title,
+                     last_rank=excluded.last_rank,last_query=excluded.last_query,error_summary=excluded.error_summary,
+                     discovered_count=competitor_url_archive.discovered_count+1,last_seen_at=CURRENT_TIMESTAMP""",
+                (
+                    project_id, normalized, url, str(result.get("domain") or ""), str(result.get("title") or ""),
+                    int(result.get("rank") or 0) or None, str(result.get("search_query") or ""), message[:1200],
+                ),
+            )
+
+    @staticmethod
     def _content_chunks(content: str, size: int = 2400) -> list[str]:
         return [content[index:index + size] for index in range(0, len(content), size)] or [content]
 
@@ -913,6 +1034,44 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 sql += " AND (page_title LIKE ? OR content LIKE ?)"; args.extend([f"%{query}%", f"%{query}%"])
             rows = connection.execute(sql + " ORDER BY last_captured_at DESC", args).fetchall()
         self._json(HTTPStatus.OK, [{**dict(row), "structure": json.loads(row["structure_json"] or "{}") } for row in rows])
+
+    def _list_competitor_url_archive(self) -> None:
+        project_id = self._query_project_id()
+        if project_id is None:
+            return
+        try:
+            with self._database() as connection:
+                self._project_exists(connection, project_id)
+                rows = connection.execute(
+                    """SELECT id,url,domain,search_title,status,last_rank,last_query,error_summary,
+                              discovered_count,first_seen_at,last_seen_at
+                       FROM competitor_url_archive WHERE project_id=?
+                       ORDER BY last_seen_at DESC,id DESC""",
+                    (project_id,),
+                ).fetchall()
+        except (sqlite3.Error, ValueError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        self._json(HTTPStatus.OK, [dict(row) for row in rows])
+
+    def _list_competitor_url_catalog(self) -> None:
+        project_id = self._query_project_id()
+        if project_id is None:
+            return
+        try:
+            with self._database() as connection:
+                self._project_exists(connection, project_id)
+                rows = connection.execute(
+                    """SELECT id,url,domain,search_title,collection_status,exclusion_reason,last_rank,last_query,
+                              memory_id,discovered_count,first_seen_at,last_seen_at,last_collected_at
+                       FROM competitor_url_catalog WHERE project_id=?
+                       ORDER BY last_seen_at DESC,id DESC""",
+                    (project_id,),
+                ).fetchall()
+        except (sqlite3.Error, ValueError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        self._json(HTTPStatus.OK, [dict(row) for row in rows])
 
     def _get_competitor_learning(self, project_id: int, *, include_runs: bool) -> None:
         try:
@@ -1475,11 +1634,9 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                     self._save_authority_search_audit(connection, search_run_id, project_id, asset_id, audit_rows)
                     for rank, candidate in enumerate(candidates, 1):
                         connection.execute("INSERT INTO authority_search_results(search_run_id,project_id,content_asset_id,section_heading,claim_topic,search_query,rank,title,url,domain,status) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (search_run_id, project_id, asset_id, candidate["section_heading"], candidate["claim_topic"], "Gemini authority recommendation", rank, candidate["title"], candidate["url"], candidate["domain"], "pending"))
-                # This is a user-triggered citation check for a public URL,
-                # not a competitor crawl. The user explicitly allows an
-                # accessible reference page to be assessed even when its
-                # robots policy disallows automated indexing.
-                batch = self.server.competitor_content_client.extract_many([item["url"] for item in candidates], max_workers=5, respect_robots=False)
+                # References follow the same robots policy as competitor
+                # learning. A blocked page may be saved as a URL, never read.
+                batch = self.server.competitor_content_client.extract_many([item["url"] for item in candidates], max_workers=5, respect_robots=True)
                 accepted: list[dict[str, Any]] = []
                 for candidate in candidates:
                     url = candidate["url"]

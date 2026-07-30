@@ -1,0 +1,8 @@
+# Compliant crawler stack for competitor/content-learning jobs. The core
+# service has a dependency-free fallback, but production should install this
+# file for Scrapy scheduling and high-quality article extraction.
+scrapy==2.17.0
+trafilatura==2.1.0
+# Trafilatura/Justext on lxml 6+ requires this package separately.
+lxml_html_clean>=0.4.3
+playwright==1.61.0

@@ -3,12 +3,20 @@
 from __future__ import annotations
 
 import base64
+import asyncio
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
 from html.parser import HTMLParser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse
 from urllib.robotparser import RobotFileParser
 from urllib.request import Request, urlopen
+
+import requests
 
 from seo_control.application.browser_serp_title_client import (
     BrowserSerpTitleClient,
@@ -207,12 +215,19 @@ class _BingResultParser(HTMLParser):
 
 
 class BrowserCompetitorContentClient:
-    """Read up to two Google result pages then extract accessible public pages.
+    """Read Google results then extract accessible public pages compliantly.
 
     Google is only queried in a visible local Chrome profile.  Competitor
-    pages are then fetched over HTTP concurrently: this is materially faster
-    than opening five Chrome tabs and avoids rendering scripts that are not
-    part of the article evidence.
+    pages first use the lightweight HTTP stage (the same static-first pattern
+    used by Scrapy jobs).  When the optional crawler dependencies are
+    installed, Trafilatura extracts clean article text, Playwright is a
+    JavaScript-rendering fallback, and Crawl4AI is the last structured-content
+    fallback.  Every stage runs only after the robots policy permits it.
+
+    Scrapy remains the recommended scheduler for future site-wide/background
+    crawl jobs.  This request/response client deliberately does not start a
+    Scrapy reactor for each five-page research job: doing so from a running
+    web server is unsafe and slower than bounded concurrent HTTP requests.
     """
 
     def __init__(self, browser: BrowserSerpTitleClient | None = None, *, max_page_chars: int = 60_000, timeout: int = 8, max_workers: int = 5) -> None:
@@ -292,23 +307,58 @@ class BrowserCompetitorContentClient:
             allowed = _robots_allows(url, timeout=self.timeout)
             if allowed is False:
                 raise CompetitorContentProtocolError("Competitor page is blocked by robots.txt.")
-        request = Request(url, headers={"User-Agent": "SEOContentResearchBot/1.0 (+local content research)"})
         try:
-            with urlopen(request, timeout=self.timeout) as response:  # nosec B310 - user-triggered public competitor URL
-                content_type = response.headers.get_content_type()
-                if content_type not in {"text/html", "application/xhtml+xml"}:
-                    raise CompetitorContentProtocolError("Competitor URL is not an HTML content page.")
-                charset = response.headers.get_content_charset() or "utf-8"
-                # Modern editorial themes can put a megabyte of mega-menu
-                # markup ahead of the article (Lumens is one example). Keep
-                # the stored evidence capped below, but read enough HTML to
-                # actually reach a late-rendered guide instead of falsely
-                # classifying it as an empty page.
-                html = response.read(max(self.max_page_chars * 12, 2_500_000)).decode(charset, errors="replace")
+            html = self._fetch_static_html(url)
         except CompetitorContentProtocolError:
             raise
         except Exception as error:
             raise CompetitorContentProtocolError(f"Competitor HTTP fetch failed: {type(error).__name__}.") from error
+        title, content, extractor = self._extract_article(html, parsed.hostname)
+        if len(content) < 500:
+            rendered = self._render_with_playwright(url)
+            if rendered:
+                rendered_title, rendered_content, rendered_extractor = self._extract_article(rendered, parsed.hostname)
+                if len(rendered_content) > len(content):
+                    title, content, extractor = rendered_title, rendered_content, rendered_extractor
+        if len(content) < 500:
+            crawl4ai = self._extract_with_crawl4ai(url)
+            if crawl4ai and len(crawl4ai) > len(content):
+                content, extractor = crawl4ai[: self.max_page_chars], "crawl4ai"
+        if len(content) < 500:
+            raise CompetitorContentProtocolError("Competitor page is not a usable article page.")
+        return {"title": title or parsed.hostname, "content": content, "domain": parsed.hostname.removeprefix("www."), "extractor": extractor}
+
+    def _fetch_static_html(self, url: str) -> str:
+        """Static collection stage used by small research batches.
+
+        This is intentionally cache-free and bounded.  Site-wide recurring
+        jobs should use the separate Scrapy scheduler, where AutoThrottle,
+        persistent de-duplication and per-domain queues are available.
+        """
+        response = requests.get(
+            url,
+            headers={"User-Agent": "SEOContentResearchBot/1.0 (+local-content-research)"},
+            timeout=(4, self.timeout),
+            allow_redirects=True,
+        )
+        response.raise_for_status()
+        content_type = response.headers.get("Content-Type", "").split(";", 1)[0].casefold()
+        if content_type not in {"text/html", "application/xhtml+xml"}:
+            raise CompetitorContentProtocolError("Competitor URL is not an HTML content page.")
+        return response.content[: max(self.max_page_chars * 12, 2_500_000)].decode(response.encoding or "utf-8", errors="replace")
+
+    def _extract_article(self, html: str, hostname: str) -> tuple[str, str, str]:
+        """Use Trafilatura when available, then the dependency-free parser."""
+        try:
+            import trafilatura
+
+            extracted = trafilatura.extract(html, output_format="txt", include_comments=False, include_tables=True, favor_precision=True)
+            metadata = trafilatura.extract_metadata(html)
+            text = "\n\n".join(str(extracted or "").splitlines()).strip()[: self.max_page_chars]
+            if len(text) >= 500:
+                return " ".join(str(getattr(metadata, "title", "") or hostname).split()), text, "trafilatura"
+        except (ImportError, ValueError, TypeError):
+            pass
         parser = _ArticleTextParser(); parser.feed(html)
         content = "\n\n".join(parser.blocks).strip()[: self.max_page_chars]
         if len(content) < 500 or len(parser.blocks) < 3:
@@ -321,15 +371,68 @@ class BrowserCompetitorContentClient:
             loose_content = "\n\n".join(loose.blocks).strip()[: self.max_page_chars]
             if len(loose_content) > len(content):
                 parser, content = loose, loose_content
-        if len(content) < 500 or len(parser.blocks) < 3:
-            raise CompetitorContentProtocolError("Competitor page is not a usable article page.")
-        return {"title": " ".join(parser.title.split()) or parsed.hostname, "content": content, "domain": parsed.hostname.removeprefix("www.")}
+        return " ".join(parser.title.split()) or hostname, content, "html-parser"
+
+    def _render_with_playwright(self, url: str) -> str | None:
+        """Render a permitted JavaScript article only when static text failed."""
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True)
+                try:
+                    page = browser.new_page(user_agent="SEOContentResearchBot/1.0 (+local-content-research)")
+                    page.goto(url, wait_until="domcontentloaded", timeout=self.timeout * 1000)
+                    page.wait_for_timeout(350)
+                    return page.content()
+                finally:
+                    browser.close()
+        except Exception:
+            return None
+
+    def _extract_with_crawl4ai(self, url: str) -> str | None:
+        """Last fallback for optional Crawl4AI Markdown extraction.
+
+        Crawl4AI is never used for robots-blocked URLs because ``extract``
+        performs the policy check before entering this method.
+        """
+        try:
+            from crawl4ai import AsyncWebCrawler
+
+            async def collect() -> str | None:
+                async with AsyncWebCrawler() as crawler:
+                    result = await crawler.arun(url=url)
+                    markdown = getattr(result, "markdown", None)
+                    value = getattr(markdown, "fit_markdown", None) or getattr(markdown, "raw_markdown", None) or markdown
+                    return str(value).strip() if value else None
+
+            try:
+                asyncio.get_running_loop()
+                return None
+            except RuntimeError:
+                return asyncio.run(collect())
+        except Exception:
+            return None
 
     def extract_many(self, urls: list[str], *, max_workers: int | None = None, respect_robots: bool = True) -> dict[str, dict[str, str] | Exception]:
-        """Fetch independent competitor URLs concurrently while preserving errors."""
+        """Fetch independent competitor URLs concurrently while preserving errors.
+
+        When Scrapy is installed, a bounded, one-shot worker handles the
+        complete batch with ``ROBOTSTXT_OBEY`` and per-domain AutoThrottle.
+        Starting Scrapy in a worker process avoids a Twisted reactor inside
+        this long-running HTTP server.  If the optional worker is unavailable,
+        the normal per-URL path keeps the same strict robots behaviour.
+        """
         unique = list(dict.fromkeys(urls))
         if not unique:
             return {}
+        # Test doubles and integrations sometimes replace ``extract`` on an
+        # instance. Preserve that contract instead of silently sending their
+        # URLs to the independent Scrapy subprocess.
+        default_extractor = getattr(self.extract, "__func__", None) is BrowserCompetitorContentClient.extract
+        if respect_robots and default_extractor:
+            scrapy_batch = self._scrapy_fetch_many(unique)
+            if scrapy_batch is not None:
+                return self._parse_scrapy_batch(scrapy_batch)
         result: dict[str, dict[str, str] | Exception] = {}
         with ThreadPoolExecutor(max_workers=min(max_workers or self.max_workers, len(unique))) as executor:
             if respect_robots:
@@ -344,4 +447,61 @@ class BrowserCompetitorContentClient:
                     result[url] = future.result()
                 except Exception as error:  # retained for the research-run log
                     result[url] = error
+        return result
+
+    def _scrapy_fetch_many(self, urls: list[str]) -> dict[str, dict[str, str]] | None:
+        """Run the optional Scrapy worker; ``None`` means use the fallback."""
+        try:
+            import scrapy  # noqa: F401 - verifies the optional worker can import Scrapy
+        except ImportError:
+            return None
+        environment = dict(os.environ)
+        source_root = str(Path(__file__).resolve().parents[2])
+        environment["PYTHONPATH"] = source_root + os.pathsep + environment.get("PYTHONPATH", "")
+        try:
+            completed = subprocess.run(
+                [sys.executable, "-m", "seo_control.application.competitor_scrapy_worker"],
+                input=json.dumps({"urls": urls, "timeout": self.timeout, "max_bytes": max(self.max_page_chars * 12, 2_500_000)}),
+                text=True,
+                capture_output=True,
+                timeout=max(20, self.timeout * len(urls) + 12),
+                env=environment,
+                check=False,
+            )
+            if completed.returncode != 0:
+                return None
+            payload = json.loads(completed.stdout)
+            rows = payload.get("items") if isinstance(payload, dict) else None
+            if not isinstance(rows, list):
+                return None
+            return {
+                str(row["url"]): {str(key): str(value) for key, value in row.items() if key != "url"}
+                for row in rows
+                if isinstance(row, dict) and isinstance(row.get("url"), str)
+            }
+        except (OSError, ValueError, subprocess.SubprocessError, json.JSONDecodeError):
+            return None
+
+    def _parse_scrapy_batch(self, batch: dict[str, dict[str, str]]) -> dict[str, dict[str, str] | Exception]:
+        result: dict[str, dict[str, str] | Exception] = {}
+        for url, row in batch.items():
+            if row.get("status") != "ok":
+                result[url] = CompetitorContentProtocolError(row.get("error") or "Scrapy could not collect this public page.")
+                continue
+            try:
+                parsed = urlparse(row.get("final_url") or url)
+                title, content, extractor = self._extract_article(row.get("html") or "", parsed.hostname or "")
+                if len(content) < 500:
+                    rendered = self._render_with_playwright(url)
+                    if rendered:
+                        title, content, extractor = self._extract_article(rendered, parsed.hostname or "")
+                if len(content) < 500:
+                    crawl4ai = self._extract_with_crawl4ai(url)
+                    if crawl4ai:
+                        content, extractor = crawl4ai[: self.max_page_chars], "crawl4ai"
+                if len(content) < 500:
+                    raise CompetitorContentProtocolError("Competitor page is not a usable article page.")
+                result[url] = {"title": title or parsed.hostname or "Article", "content": content, "domain": (parsed.hostname or "").removeprefix("www."), "extractor": extractor}
+            except Exception as error:
+                result[url] = error
         return result

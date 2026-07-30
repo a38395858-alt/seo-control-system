@@ -93,6 +93,27 @@ button.danger, button.link.danger { color: #bb3a3a; }.link { min-height: 0; padd
 .content-memory-grid article { padding: 1rem; border: 1px solid #dbe4f0; border-radius: 0.8rem; background: #fff; display: grid; gap: 0.45rem; }
 .content-memory-grid article > span { color: #2563eb; font-size: 0.8rem; font-weight: 700; }
 .content-memory-grid h3 { margin: 0; font-size: 1rem; }
+.collected-content-list { display: grid; gap: 0; margin-top: 0.9rem; border-top: 1px solid #dfe7e6; background: #fff; }
+.collected-content-list article { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 13px 2px; border-bottom: 1px solid #dfe7e6; }
+.collected-content-list article > div { min-width: 0; }
+.collected-content-title { display: block; overflow: hidden; color: #143e3a; font-size: 0.92rem; font-weight: 780; line-height: 1.4; text-decoration: none; text-overflow: ellipsis; white-space: nowrap; }
+.collected-content-title:hover { color: #087d73; text-decoration: underline; }
+.collected-content-list p { overflow: hidden; margin: 4px 0 0; color: #5d7775; font-size: 0.76rem; line-height: 1.45; text-overflow: ellipsis; white-space: nowrap; }
+.collected-content-list p a { color: #42766f; text-decoration: none; }
+.collected-content-list p a:hover { text-decoration: underline; }
+.collected-content-list small { display: block; margin-top: 2px; color: #7a8c8b; font-size: 0.7rem; }
+.collected-content-list article > button { flex: 0 0 auto; }
+.collected-content-list article.is-blocked { background: #fffdf7; }
+.collected-content-list article.is-blocked .collected-content-title { color: #7a5819; }
+.collected-content-list article.is-blocked details { margin-top: 6px; color: #725f35; font-size: 0.75rem; }
+.collected-content-list article.is-blocked details p { overflow: visible; text-overflow: clip; white-space: normal; }
+.competitor-url-archive { margin: 1.1rem 0; padding: 1rem; border: 1px solid #ecd8a7; border-radius: 0.8rem; background: #fffcf4; }
+.competitor-url-archive h3 { margin: 0; color: #765719; font-size: 1rem; }
+.competitor-url-archive > div > p { margin: 0.35rem 0 0; color: #785f2d; font-size: 0.88rem; }
+.content-memory-grid article.is-blocked { border-color: #ecd8a7; background: #fffdf7; }
+.content-memory-grid article.is-blocked > span { color: #9a6810; }
+.content-memory-grid article.is-blocked details { font-size: 0.82rem; color: #735e35; }
+.content-memory-grid article.is-blocked details p { margin: 0.45rem 0 0; overflow-wrap: anywhere; }
 .markdown-preview .article-section-image { width: min(620px, 88%); margin: 1.1em auto 1.55em; overflow: hidden; border: 1px solid #dde5f0; border-radius: 12px; background: #f5f8fc; box-shadow: 0 8px 22px rgba(38, 61, 98, .08); }.markdown-preview .article-section-image img { display: block; width: 100%; aspect-ratio: 3 / 2; object-fit: cover; }.markdown-preview .article-section-image figcaption { display: flex; align-items: flex-start; gap: 7px; padding: 8px 10px 9px; color: #63758b; font-size: 11px; line-height: 1.45; }.markdown-preview .article-image-caption-label { display: inline-block; flex: 0 0 auto; padding: 2px 6px; border-radius: 999px; color: #176b5a; background: #e2f2ee; font-size: 10px; font-weight: 750; line-height: 1.35; white-space: nowrap; }
 
 /* Product-wide visual system: shared by projects, research, titles, content and settings. */
