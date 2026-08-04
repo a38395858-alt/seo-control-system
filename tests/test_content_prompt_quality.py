@@ -90,6 +90,11 @@ class ContentPromptQualityTests(unittest.TestCase):
         self.assertIn("h2_reviews", _schema_for("qa"))
         self.assertIn("repetition_control", _schema_for("qa"))
 
+    def test_full_article_prompt_keeps_a_closed_outline_and_safe_source_free_mode(self) -> None:
+        instruction = _stage_instruction("full_article")
+        for text in ("approved H2 set is closed", "exactly once", "sources is empty", "electrical values"):
+            self.assertIn(text, instruction)
+
     def test_source_roles_keep_gsc_private_and_competitors_non_evidentiary(self) -> None:
         from seo_control.application.content_generator import _stage_instruction  # noqa: E402
 
