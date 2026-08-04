@@ -1,0 +1,4 @@
+# Optional production delivery backend. The default local worker needs no
+# additional queue package.
+celery==5.5.2
+redis==6.1.0

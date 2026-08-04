@@ -6,6 +6,7 @@ import json
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from urllib.error import HTTPError
@@ -36,6 +37,15 @@ class GscPerformanceLearningApiTests(unittest.TestCase):
             with urlopen(request) as response: return response.status, json.loads(response.read())
         except HTTPError as error: return error.code, json.loads(error.read())
 
+    def wait_for_job(self, project_id: int, job_id: int) -> dict:
+        for _attempt in range(100):
+            status, value = self.request("GET", f"/api/agent-jobs/{job_id}?project_id={project_id}")
+            self.assertEqual(200, status)
+            if value["status"] in {"completed", "failed", "cancelled"}:  # type: ignore[index]
+                return value  # type: ignore[return-value]
+            time.sleep(0.05)
+        self.fail("GSC feedback job did not complete")
+
     def published_asset(self) -> tuple[int, int, str]:
         _, project = self.request("POST", "/api/projects", {"name": "GSC learning", "country_code": "US", "language_code": "en"})
         project_id = project["id"]  # type: ignore[index]
@@ -59,10 +69,19 @@ class GscPerformanceLearningApiTests(unittest.TestCase):
 
     def test_first_snapshot_observes_and_second_valid_snapshot_creates_performance_memory(self) -> None:
         project_id, asset_id, _url = self.published_asset()
-        status, first = self.request("POST", f"/api/projects/{project_id}/gsc/learn-content", {"days": 7})
-        self.assertEqual(200, status)
+        status, queued_first = self.request("POST", f"/api/projects/{project_id}/gsc/learn-content", {"days": 7})
+        self.assertEqual(202, status)
+        first_job = self.wait_for_job(project_id, queued_first["job_id"])  # type: ignore[index]
+        first = {**first_job["result"], "job_id": first_job["id"], "workflow_version": first_job["workflow_version"]}
+        self.assertIsInstance(first["job_id"], int)
+        self.assertEqual("gsc-feedback-v1", first["workflow_version"])
         self.assertEqual("observing", first["snapshots"][0]["learning_status"])  # type: ignore[index]
         self.assertEqual(0, first["memories_created"])  # type: ignore[index]
+        self.assertEqual("completed", first_job["status"])
+        self.assertEqual("gsc_feedback_learning", first_job["requested_action"])
+        expected_tools = ["load_project_context", "capture_gsc_performance", "update_memory_governance"]
+        self.assertEqual(expected_tools, [step["node_name"] for step in first_job["steps"]])  # type: ignore[index]
+        self.assertEqual(expected_tools, [audit["tool_name"] for audit in first_job["tool_audits"]])  # type: ignore[index]
         status, observing_effectiveness = self.request("GET", f"/api/projects/{project_id}/gsc/content-effectiveness")
         self.assertEqual(200, status)
         observing_article = observing_effectiveness["articles"][0]  # type: ignore[index]
@@ -70,6 +89,9 @@ class GscPerformanceLearningApiTests(unittest.TestCase):
         self.assertEqual("observing", observing_article["performance_status"])
         self.assertIsNone(observing_article["performance_score"])
         self.assertIsNone(observing_article["combined_score"])
+        self.assertFalse(observing_article["memory_assisted"])
+        self.assertEqual("no_memory_baseline", observing_article["evaluation_group"])
+        self.assertEqual([], observing_article["used_memories"])
         self.assertIsNone(observing_effectiveness["summary"]["spearman_correlation"])  # type: ignore[index]
         self.assertEqual("insufficient", observing_effectiveness["summary"]["correlation_state"])  # type: ignore[index]
 
@@ -77,8 +99,10 @@ class GscPerformanceLearningApiTests(unittest.TestCase):
         try:
             with connection: connection.execute("UPDATE content_gsc_performance_snapshots SET collected_at=datetime('now','-8 days') WHERE project_id=? AND content_asset_id=?", (project_id, asset_id))
         finally: connection.close()
-        status, second = self.request("POST", f"/api/projects/{project_id}/gsc/learn-content", {"days": 7})
-        self.assertEqual(200, status)
+        status, queued_second = self.request("POST", f"/api/projects/{project_id}/gsc/learn-content", {"days": 7})
+        self.assertEqual(202, status)
+        second_job = self.wait_for_job(project_id, queued_second["job_id"])  # type: ignore[index]
+        second = {**second_job["result"], "job_id": second_job["id"]}
         self.assertEqual("qualified", second["snapshots"][0]["learning_status"])  # type: ignore[index]
         self.assertEqual(1, second["memories_created"])  # type: ignore[index]
         _, memories = self.request("GET", f"/api/content-learning-memories?project_id={project_id}")
@@ -86,12 +110,24 @@ class GscPerformanceLearningApiTests(unittest.TestCase):
         self.assertEqual(1, len(performance))
         self.assertEqual("Google Search Console", performance[0]["evidence"]["source"])
         self.assertEqual("descriptive_only", performance[0]["evidence"]["causality"])
+        self.assertEqual("performance", performance[0]["card_type"])
+        self.assertEqual("observed", performance[0]["inference_level"])
+        self.assertGreater(performance[0]["evidence_count"], 0)
+        _, memory_detail = self.request("GET", f"/api/content-learning-memories/{performance[0]['id']}?project_id={project_id}")
+        self.assertEqual("gsc", memory_detail["sources"][0]["source_type"])  # type: ignore[index]
+        self.assertEqual(str(second["snapshots"][0]["snapshot_id"]), memory_detail["sources"][0]["source_id"])  # type: ignore[index]
+        self.assertEqual([], memory_detail["content_links"])  # type: ignore[index]
+        audit_text = json.dumps(second_job, ensure_ascii=False).casefold()
+        self.assertNotIn("authorization", audit_text)
+        self.assertNotIn("refresh_token", audit_text)
+        self.assertNotIn("cookie", audit_text)
         status, qualified_effectiveness = self.request("GET", f"/api/projects/{project_id}/gsc/content-effectiveness")
         self.assertEqual(200, status)
         qualified_article = qualified_effectiveness["articles"][0]  # type: ignore[index]
         self.assertEqual("qualified", qualified_article["performance_status"])
         self.assertIsInstance(qualified_article["performance_score"], int)
         self.assertIsInstance(qualified_article["combined_score"], int)
+        self.assertFalse(qualified_article["memory_assisted"])
 
     def test_only_the_current_project_can_read_its_snapshots(self) -> None:
         project_id, _asset_id, _url = self.published_asset()

@@ -7,6 +7,7 @@ import sys
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+from urllib.error import URLError
 
 
 SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
@@ -56,6 +57,13 @@ class ContentGeneratorTests(unittest.TestCase):
         self.assertEqual(["company-knowledge-7"], assigned_ids)
         self.assertEqual([1], list(assignments))
 
+    def test_primary_keyword_emphasis_is_normalised_to_one_body_occurrence(self) -> None:
+        markdown = "# How Does an Automatic LED Stair Light Controller Work?\n\nAn **automatic LED stair light controller** coordinates the system.\n\n## Components\n\nAn **automatic LED stair light controller** evaluates inputs."
+        result = KeywordDiscoveryRequestHandler._normalise_primary_keyword_emphasis(markdown, "automatic led stair light controller")
+        self.assertEqual(1, KeywordDiscoveryRequestHandler._bold_primary_keyword_count(result, "automatic led stair light controller"))
+        self.assertIn("# How Does an Automatic LED Stair Light Controller Work?", result)
+        self.assertIn("An automatic LED stair light controller evaluates inputs.", result)
+
     def test_ai_outline_plan_keeps_only_verified_company_source_and_exact_url(self) -> None:
         sections = [{"heading": "How to choose flood lights", "purpose": "Evaluate product fit"}, {"heading": "Maintenance", "purpose": "Plan checks"}]
         planned = KeywordDiscoveryRequestHandler._apply_ai_company_context_plan(
@@ -76,6 +84,22 @@ class ContentGeneratorTests(unittest.TestCase):
             with self.assertRaisesRegex(ContentGenerationProtocolError, r"assembly timed out after 90 seconds"):
                 generator.run_stage(stage="assembly", data={})
 
+    def test_transient_network_error_is_retried_before_success(self) -> None:
+        generator = OpenAICompatibleContentGenerator("test-key", "https://example.test/v1", "gpt-test", provider="openai")
+        response = MagicMock()
+        response.read.return_value = json.dumps({"choices": [{"message": {"content": '{"tags":["Stair Lighting","Guide"]}'}}]}).encode("utf-8")
+        context = MagicMock()
+        context.__enter__.return_value = response
+        context.__exit__.return_value = False
+        with patch("seo_control.application.content_generator.time.sleep"), patch(
+            "seo_control.application.content_generator.urlopen",
+            side_effect=[URLError("connection reset"), context],
+        ) as request_mock:
+            result = generator.run_stage(stage="content_tags", data={})
+
+        self.assertEqual(["Stair Lighting", "Guide"], result["tags"])
+        self.assertEqual(2, request_mock.call_count)
+
     def test_stage_request_sends_the_versioned_instruction_and_json_contract(self) -> None:
         generator = OpenAICompatibleContentGenerator("test-key", "https://example.test/v1", "gpt-5.4", provider="openai")
         response = MagicMock()
@@ -95,7 +119,7 @@ class ContentGeneratorTests(unittest.TestCase):
         self.assertIn("source IDs", contract["instruction"])
         self.assertIn("Source column", contract["instruction"])
         self.assertIn("sections", contract["output_schema"])
-        self.assertEqual("content_competitor_learning_v15", PROMPT_VERSION)
+        self.assertEqual("people_first_evidence_routed_v20", PROMPT_VERSION)
         self.assertIn("company_knowledge", contract["instruction"])
         self.assertIn("exact public product/company URL", contract["instruction"])
         self.assertIn("company_context_plan", contract["output_schema"])

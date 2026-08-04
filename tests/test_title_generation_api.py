@@ -14,6 +14,8 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import MagicMock, patch
+from urllib.error import URLError
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -23,6 +25,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from seo_control.application.browser_serp_title_client import GoogleSerpVerificationRequired  # noqa: E402
+from seo_control.application.ai_title_generator import OpenAICompatibleTitleGenerator, TitleGenerationProtocolError  # noqa: E402
 from seo_control.web import create_server  # noqa: E402
 
 
@@ -92,6 +95,14 @@ class ProviderTitleGenerator:
 class VerificationBrowserSerpClient:
     def fetch_titles(self, **_request: object) -> list[dict[str, object]]:
         raise GoogleSerpVerificationRequired("Google 要求浏览器验证。", "base64-captcha-image")
+
+
+class FailingOpenAITitleGenerator(OpenAICompatibleTitleGenerator):
+    def __init__(self) -> None:
+        super().__init__("hidden-key", "https://example.test/v1", "test-model")
+
+    def generate(self, **_request: object) -> str:
+        raise TitleGenerationProtocolError("AI title generation network connection failed after 3 attempts.")
 
 
 class TitleGenerationApiTests(unittest.TestCase):
@@ -205,6 +216,40 @@ class TitleGenerationApiTests(unittest.TestCase):
         self.assertEqual(2, len(candidates))
         self.assertTrue(all(candidate["source_type"] == "ai" for candidate in candidates))
         self.assertEqual(job["id"], candidates[0]["generation_job_id"])  # type: ignore[index]
+
+    def test_transient_title_provider_failure_is_retried(self) -> None:
+        generator = OpenAICompatibleTitleGenerator("hidden-key", "https://example.test/v1", "test-model")
+        response = MagicMock()
+        response.read.return_value = json.dumps({"choices": [{"message": {"content": '{"candidates":[{"title":"Recovered title"}]}'}}]}).encode("utf-8")
+        context = MagicMock()
+        context.__enter__.return_value = response
+        context.__exit__.return_value = False
+        with patch("seo_control.application.ai_title_generator.time.sleep"), patch(
+            "seo_control.application.ai_title_generator.urlopen", side_effect=[URLError("temporary reset"), context]
+        ) as request_mock:
+            result = generator.generate(keyword="seo tools", locale="en-US", count=1)
+        self.assertIn("Recovered title", result)
+        self.assertEqual(2, request_mock.call_count)
+
+    def test_failed_provider_request_keeps_a_durable_title_job_log(self) -> None:
+        project_id, keyword_id = self.create_project_and_keyword()
+        self.server.title_generator = FailingOpenAITitleGenerator()
+        status, payload = self.request_json(
+            "POST", "/api/title-generation-jobs",
+            {"project_id": project_id, "keyword_id": keyword_id, "locale": "en-US", "count": 2},
+        )
+        self.assertEqual(502, status)
+        self.assertIn("3 attempts", payload["error"])  # type: ignore[index]
+        connection = sqlite3.connect(self.database_path)
+        connection.row_factory = sqlite3.Row
+        try:
+            job = connection.execute("SELECT status,error_code,error_summary FROM title_generation_jobs WHERE id=?", (payload["job_id"],)).fetchone()  # type: ignore[index]
+        finally:
+            connection.close()
+        self.assertIsNotNone(job)
+        self.assertEqual("failed", job["status"])
+        self.assertEqual("provider_error", job["error_code"])
+        self.assertNotIn("hidden-key", job["error_summary"])
 
     def test_ai_can_extract_up_to_twenty_serp_titles_for_one_approved_keyword(self) -> None:
         project_id, keyword_id = self.create_project_and_keyword()

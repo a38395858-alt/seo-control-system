@@ -44,15 +44,58 @@ class ContentPromptQualityTests(unittest.TestCase):
         self.assertIn("chapter_plan is binding", _stage_instruction("section"))
         self.assertIn("subtopics", _schema_for("chapter_plan"))
 
-    def test_all_active_stages_are_explicit_and_avoid_qa_or_length_constraints(self) -> None:
+    def test_industry_policy_is_dynamic_without_weakening_fixed_evidence_rules(self) -> None:
+        from seo_control.application.content_generator import FIXED_CONTENT_SAFETY_RULES, _schema_for  # noqa: E402
+
+        instruction = _stage_instruction("industry_rules")
+        for text in ("explicit project industry", "provisional industry", "YMYL", "SaaS", "never weaken fixed_safety_rules"):
+            self.assertIn(text, instruction)
+        schema = _schema_for("industry_rules")
+        for field in ("industry_confidence", "industry_basis", "evidence_policy", "high_risk_claims", "localization_rules"):
+            self.assertIn(field, schema)
+        self.assertTrue(any("another project" in rule for rule in FIXED_CONTENT_SAFETY_RULES))
+        self.assertIn("fixed_safety_rules always have higher priority", SYSTEM_PROMPT)
+
+    def test_all_active_stages_are_explicit_and_avoid_fixed_length_constraints(self) -> None:
         from seo_control.application.content_generator import _schema_for, _stage_instruction  # noqa: E402
 
-        for stage in ("competitor_relevance", "semantic", "title", "outline", "chapter_plan", "section", "assembly"):
+        for stage in ("competitor_relevance", "industry_rules", "semantic", "title", "outline", "chapter_plan", "section", "assembly"):
             self.assertTrue(_stage_instruction(stage))
             self.assertTrue(_schema_for(stage))
-        self.assertEqual("{}", _schema_for("qa"))
+        qa_schema = _schema_for("qa")
+        for field in ("status", "scores", "targeted_rewrite", "unresolved_verify"):
+            self.assertIn(field, qa_schema)
         self.assertNotIn("word_budget", _schema_for("outline"))
         self.assertNotIn("target length", _stage_instruction("outline").lower())
+
+    def test_reader_markdown_contract_prevents_recurring_table_and_list_defects(self) -> None:
+        for stage in ("section", "assembly", "qa", "targeted_rewrite"):
+            instruction = _stage_instruction(stage)
+            for text in ("never output raw HTML", "Markdown header row", "explicit consecutive markers", "- [ ]"):
+                self.assertIn(text, instruction)
+
+    def test_h2_prompts_expand_information_gain_instead_of_word_count(self) -> None:
+        from seo_control.application.content_generator import PROMPT_VERSION, _schema_for  # noqa: E402
+
+        self.assertEqual("people_first_evidence_routed_v20", PROMPT_VERSION)
+        for stage in ("outline", "chapter_plan", "section", "qa", "targeted_rewrite"):
+            instruction = _stage_instruction(stage)
+            for text in ("new reader value", "unique information gain", "three to five non-overlapping", "never pad", "one concise statement"):
+                self.assertIn(text, instruction)
+        chapter_schema = _schema_for("chapter_plan")
+        for field in ("unique_information_gain", "reader_takeaway", "decision_value", "mechanism_or_reason", "practical_condition_or_example", "action_or_verification_rule", "evidence_shortfall_action"):
+            self.assertIn(field, chapter_schema)
+        self.assertIn("h2_reviews", _schema_for("qa"))
+        self.assertIn("repetition_control", _schema_for("qa"))
+
+    def test_source_roles_keep_gsc_private_and_competitors_non_evidentiary(self) -> None:
+        from seo_control.application.content_generator import _stage_instruction  # noqa: E402
+
+        for stage in ("semantic", "outline", "chapter_plan", "section", "assembly", "qa", "targeted_rewrite"):
+            instruction = _stage_instruction(stage)
+            self.assertIn("source_type=gsc_performance", instruction)
+            self.assertIn("private search-demand intelligence", instruction)
+            self.assertIn("competitor pages, competitor analysis, and learning memories", instruction)
 
 
 if __name__ == "__main__":

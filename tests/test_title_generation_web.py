@@ -97,6 +97,12 @@ class TitleGenerationWebTests(unittest.TestCase):
         self.assertIn("selectLibraryTitle", self.app)
         self.assertIn("onSelectTitle", self.app)
 
+    def test_title_library_can_select_and_create_content_from_any_candidate(self) -> None:
+        self.assertIn("selectAndCreateContentFromTitle", self.app)
+        self.assertIn("onSelectAndCreateContent", self.app)
+        self.assertIn("confirm_replace", self.app)
+        self.assertIn("选定并加入内容", self.app)
+
     def test_content_page_does_not_offer_duplicate_asset_creation(self) -> None:
         self.assertIn("createdByTitle", self.app)
         self.assertIn("asset ?", self.app)

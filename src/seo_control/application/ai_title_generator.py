@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import socket
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -44,23 +46,14 @@ class OpenAICompatibleTitleGenerator:
                         "You write SEO article title candidates. Return JSON only with a candidates array. "
                         "For en-US, use natural American English search language, avoid clickbait and unsupported claims. "
                         "When competitor_titles are supplied, use them only to infer search intent and content patterns; never copy or lightly rewrite a competitor title. "
+                        "When research_recovery is true, the failed_title produced a shopping-heavy SERP without usable editorial articles. Generate durable informational titles that retain the keyword but use a clear guide, how-to, comparison, installation, selection, maintenance, or troubleshooting angle; avoid product/category, collection, pure inspiration, and marketing-headline formats. "
                         "Each item needs title, title_type, primary_keyword_included, search_intent, and reason."
                     ),
                 },
                 {"role": "user", "content": json.dumps(request, ensure_ascii=False)},
             ],
         }
-        http_request = Request(
-            f"{self._base_url}/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {self._api_key}"},
-            method="POST",
-        )
-        try:
-            with urlopen(http_request, timeout=self._timeout) as response:
-                body = json.loads(response.read().decode("utf-8"))
-        except (HTTPError, URLError, OSError, ValueError) as error:
-            raise TitleGenerationProtocolError("AI title generation request failed.") from error
+        body = self._post_chat_json(payload, operation="AI title generation")
         try:
             content = body["choices"][0]["message"]["content"]
         except (KeyError, IndexError, TypeError) as error:
@@ -89,21 +82,53 @@ class OpenAICompatibleTitleGenerator:
                 {"role": "user", "content": f"抓取谷歌关键词 {keyword} 前20排名标题。目标市场：{locale}。"},
             ],
         }
+        body = self._post_chat_json(payload, operation="AI SERP title research")
+        try:
+            content = body["choices"][0]["message"]["content"]
+        except (KeyError, IndexError, TypeError) as error:
+            raise TitleGenerationProtocolError("AI SERP title research returned an invalid response.") from error
+        if not isinstance(content, str):
+            raise TitleGenerationProtocolError("AI SERP title research returned non-text content.")
+        return content
+
+    def _post_chat_json(self, payload: dict[str, Any], *, operation: str) -> dict[str, Any]:
+        """POST once normally, but recover from bounded transient upstream failures."""
         http_request = Request(
             f"{self._base_url}/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json", "Authorization": f"Bearer {self._api_key}"},
             method="POST",
         )
-        try:
-            with urlopen(http_request, timeout=self._timeout) as response:
-                body = json.loads(response.read().decode("utf-8"))
-            content = body["choices"][0]["message"]["content"]
-        except (HTTPError, URLError, OSError, ValueError, KeyError, IndexError, TypeError) as error:
-            raise TitleGenerationProtocolError("AI SERP title research request failed.") from error
-        if not isinstance(content, str):
-            raise TitleGenerationProtocolError("AI SERP title research returned non-text content.")
-        return content
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                with urlopen(http_request, timeout=self._timeout) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+                if not isinstance(body, dict):
+                    raise TitleGenerationProtocolError(f"{operation} returned an invalid JSON object.")
+                return body
+            except HTTPError as error:
+                if error.code == 429 or 500 <= error.code < 600:
+                    if attempt + 1 < max_attempts:
+                        time.sleep(1.25 * (2**attempt))
+                        continue
+                raise TitleGenerationProtocolError(f"{operation} upstream HTTP {error.code}.") from error
+            except (TimeoutError, socket.timeout) as error:
+                if attempt + 1 < max_attempts:
+                    time.sleep(1.25 * (2**attempt))
+                    continue
+                raise TitleGenerationProtocolError(f"{operation} timed out after {int(self._timeout)} seconds.") from error
+            except URLError as error:
+                if attempt + 1 < max_attempts:
+                    time.sleep(1.25 * (2**attempt))
+                    continue
+                raise TitleGenerationProtocolError(f"{operation} network connection failed after {max_attempts} attempts.") from error
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+                if isinstance(error, OSError) and attempt + 1 < max_attempts:
+                    time.sleep(1.25 * (2**attempt))
+                    continue
+                raise TitleGenerationProtocolError(f"{operation} returned an unreadable response.") from error
+        raise TitleGenerationProtocolError(f"{operation} request failed after {max_attempts} attempts.")
 
 
 class RuleBasedTitleGenerator:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -19,17 +20,35 @@ class SerperSearchClient:
         self.api_key = api_key.strip()
         self.timeout = timeout
 
-    def search(self, *, query: str, locale: str = "en-US", max_results: int = 10) -> list[dict[str, Any]]:
+    def search(self, *, query: str, locale: str = "en-US", max_results: int = 10, page: int = 1, tbs: str | None = None) -> list[dict[str, Any]]:
         if not self.api_key:
             raise SerperSearchProtocolError("Serper API key is not configured.")
         language, country = (locale.split("-", 1) + ["US"])[:2] if "-" in locale else ("en", "US")
-        payload = json.dumps({"q": query, "num": max_results, "gl": country.lower(), "hl": language}).encode("utf-8")
+        request_payload: dict[str, Any] = {
+            "q": query,
+            "num": max(1, min(int(max_results), 10)),
+            "page": max(1, int(page)),
+            "gl": country.lower(),
+            "hl": language,
+        }
+        if tbs:
+            request_payload["tbs"] = tbs
+        payload = json.dumps(request_payload).encode("utf-8")
         request = Request(self.endpoint, data=payload, headers={"X-API-KEY": self.api_key, "Content-Type": "application/json"}, method="POST")
-        try:
-            with urlopen(request, timeout=self.timeout) as response:  # nosec B310 - configured Serper HTTPS endpoint
-                raw = response.read().decode("utf-8")
-        except Exception as error:
-            raise SerperSearchProtocolError(f"Serper request failed: {type(error).__name__}.") from error
+        raw = ""
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                with urlopen(request, timeout=self.timeout) as response:  # nosec B310 - configured Serper HTTPS endpoint
+                    raw = response.read().decode("utf-8")
+                last_error = None
+                break
+            except Exception as error:
+                last_error = error
+                if attempt < 2:
+                    time.sleep(0.6 * (attempt + 1))
+        if last_error is not None:
+            raise SerperSearchProtocolError(f"Serper request failed after 3 attempts: {type(last_error).__name__}.") from last_error
         try:
             document = json.loads(raw)
         except json.JSONDecodeError as error:

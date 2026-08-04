@@ -81,6 +81,8 @@ class ContentSystemWebTests(unittest.TestCase):
             self.assertIn(tag, self.app)
         self.assertIn(".content-reader", self.styles)
         self.assertIn(".markdown-preview table", self.styles)
+        for value in ("renderSafeHtmlTableBlock", "markdown-table-scroll", "renderChecklistItem", "task-list-item"):
+            self.assertIn(value, self.app + self.styles)
 
     def test_content_reader_supports_word_count_and_standalone_html_download(self) -> None:
         for value in ("articleWordCount", "words ·", "downloadArticleHtml", "下载 HTML", "text/html;charset=utf-8"):

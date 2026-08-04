@@ -1,0 +1,2 @@
+# Optional during staged SQLite -> PostgreSQL repository migration.
+psycopg[binary]==3.2.9

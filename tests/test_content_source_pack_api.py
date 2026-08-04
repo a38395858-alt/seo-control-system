@@ -35,6 +35,8 @@ class CapturingSemanticGenerator:
 
     def generate(self, **request: object) -> dict[str, object]:
         stage = request.get("stage")
+        if stage == "industry_rules":
+            return {"industry": "SEO software", "industry_confidence": 0.9, "industry_basis": "inferred", "audience_language": "US English", "tone_rules": ["Practical"], "structure_rules": ["Decision-led"], "terminology_rules": [], "evidence_policy": {"risk_level": "standard", "preferred_sources": ["Official documentation"], "high_risk_claims": ["Pricing"], "required_disclosures": []}, "content_patterns": [], "prohibited_claims": [], "conversion_rules": [], "localization_rules": []}
         if stage == "semantic":
             self.semantic_sources = request["sources"]  # type: ignore[assignment]
             self.stage_sources["semantic"] = request["sources"]  # type: ignore[assignment]

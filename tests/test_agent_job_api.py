@@ -57,7 +57,15 @@ class AgentJobApiTests(unittest.TestCase):
         job_id = created["id"]  # type: ignore[index]
         status, detail = self.request("GET", f"/api/agent-jobs/{job_id}?project_id={first}")
         self.assertEqual(200, status)
-        self.assertEqual(["validate_project_context", "prepare_workflow"], [step["node_name"] for step in detail["steps"]])  # type: ignore[index]
+        self.assertEqual(
+            ["validate_project_context", "load_project_context", "retrieve_project_memories", "prepare_workflow"],
+            [step["node_name"] for step in detail["steps"]],  # type: ignore[index]
+        )
+        self.assertEqual(
+            ["load_project_context", "retrieve_project_memories"],
+            [audit["tool_name"] for audit in detail["tool_audits"]],  # type: ignore[index]
+        )
+        self.assertEqual(first, detail["checkpoint"]["project_context"]["project"]["id"])  # type: ignore[index]
         self.assertEqual(400, self.request("GET", f"/api/agent-jobs/{job_id}?project_id={second}")[0])
 
     def test_job_keeps_explicit_writer_and_reviewer_routes_for_later_nodes(self) -> None:
@@ -103,6 +111,56 @@ class AgentJobApiTests(unittest.TestCase):
         status, retried = self.request("POST", f"/api/agent-jobs/{job_id}/retry", {"project_id": project_id})
         self.assertEqual(200, status)
         self.assertEqual("queued", retried["status"])  # type: ignore[index]
+        self.assertEqual("prepare_workflow", retried["current_node"])  # type: ignore[index]
+        self.assertEqual("prepare_workflow", retried["checkpoint"]["current_node"])  # type: ignore[index]
+
+    def test_user_can_pause_and_resume_from_durable_checkpoint(self) -> None:
+        project_id = self.project("pause and resume")
+        _status, created = self.request(
+            "POST",
+            "/api/agent-jobs",
+            {"project_id": project_id, "requested_action": "content_blueprint"},
+        )
+        job_id = created["id"]  # type: ignore[index]
+        resume_node = created["current_node"]  # type: ignore[index]
+
+        status, paused = self.request(
+            "POST", f"/api/agent-jobs/{job_id}/pause", {"project_id": project_id}
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("waiting_input", paused["status"])  # type: ignore[index]
+        self.assertEqual("paused", paused["lifecycle_state"])  # type: ignore[index]
+        self.assertEqual(resume_node, paused["checkpoint"]["pause"]["resume_node"])  # type: ignore[index]
+
+        status, resumed = self.request(
+            "POST", f"/api/agent-jobs/{job_id}/resume", {"project_id": project_id}
+        )
+        self.assertEqual(200, status)
+        self.assertEqual("queued", resumed["status"])  # type: ignore[index]
+        self.assertEqual(resume_node, resumed["current_node"])  # type: ignore[index]
+        self.assertNotIn("pause", resumed["checkpoint"])  # type: ignore[index]
+
+        status, detail = self.request("GET", f"/api/agent-jobs/{job_id}?project_id={project_id}")
+        self.assertEqual(200, status)
+        self.assertEqual(
+            ["pause_requested", "resume_requested"],
+            [step["node_name"] for step in detail["steps"][-2:]],  # type: ignore[index]
+        )
+
+    def test_pause_and_resume_recheck_project_scope_and_state(self) -> None:
+        first, second = self.project("pause first"), self.project("pause second")
+        _status, created = self.request(
+            "POST", "/api/agent-jobs", {"project_id": first, "requested_action": "content_blueprint"}
+        )
+        job_id = created["id"]  # type: ignore[index]
+        self.assertEqual(
+            400,
+            self.request("POST", f"/api/agent-jobs/{job_id}/pause", {"project_id": second})[0],
+        )
+        self.assertEqual(
+            400,
+            self.request("POST", f"/api/agent-jobs/{job_id}/resume", {"project_id": first})[0],
+        )
 
 
 if __name__ == "__main__":

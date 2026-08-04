@@ -50,14 +50,23 @@ class PublishGateApiTests(unittest.TestCase):
         _, asset = self.request("POST", "/api/content-assets", {"project_id": project_id, "selected_title_candidate_id": title["id"]})  # type: ignore[index]
         return project_id, asset["id"]  # type: ignore[index]
 
-    def make_publishable(self, project_id: int, asset_id: int, *, qa_status: str = "approved", unresolved: list[str] | None = None) -> int:
+    def make_publishable(
+        self,
+        project_id: int,
+        asset_id: int,
+        *,
+        qa_status: str = "approved",
+        unresolved: list[str] | None = None,
+        markdown: str = "## Selection table\n\n| Factor | Check |\n| --- | --- |\n| IP rating | Verify |",
+        meta_description: str = "A practical LED stair lighting guide covering selection, placement, safety checks, and installation planning.",
+    ) -> int:
         connection = initialize_database(self.database_path)
         try:
             with connection:
                 cursor = connection.execute(
-                    """INSERT INTO content_drafts(project_id,content_asset_id,version,title,markdown,qa_status,unresolved_verify_json,provider)
-                       VALUES(?,?,1,'LED Stair Lights Guide','## Selection table\n\n| Factor | Check |\n| --- | --- |\n| IP rating | Verify |',?,?, 'openai')""",
-                    (project_id, asset_id, qa_status, json.dumps(unresolved or [])),
+                    """INSERT INTO content_drafts(project_id,content_asset_id,version,title,meta_description,markdown,qa_status,unresolved_verify_json,provider)
+                       VALUES(?,?,1,'LED Stair Lights Guide',?,?,?,?, 'openai')""",
+                    (project_id, asset_id, meta_description, markdown, qa_status, json.dumps(unresolved or [])),
                 )
                 draft_id = int(cursor.lastrowid)
                 connection.execute("UPDATE content_assets SET current_draft_id=?,tags_json=? WHERE id=?", (draft_id, json.dumps(["LED Lighting", "Buying Guide"]), asset_id))
@@ -89,7 +98,7 @@ class PublishGateApiTests(unittest.TestCase):
         connection = initialize_database(self.database_path)
         try:
             with connection:
-                cursor = connection.execute("INSERT INTO content_drafts(project_id,content_asset_id,version,title,markdown,qa_status,unresolved_verify_json,provider) VALUES(?,?,2,'Revised LED Stair Lights Guide','# Revised','approved','[]','openai')", (project_id, asset_id))
+                cursor = connection.execute("INSERT INTO content_drafts(project_id,content_asset_id,version,title,meta_description,markdown,qa_status,unresolved_verify_json,provider) VALUES(?,?,2,'Revised LED Stair Lights Guide','A revised description that remains long enough for the publication metadata gate.','# Revised','approved','[]','openai')", (project_id, asset_id))
                 connection.execute("UPDATE content_assets SET current_draft_id=? WHERE id=?", (cursor.lastrowid, asset_id))
         finally:
             connection.close()
@@ -119,6 +128,38 @@ class PublishGateApiTests(unittest.TestCase):
         status, error = self.request("POST", f"/api/content-assets/{asset_id}/publish-wordpress", {"project_id": first_project, "status": "publish", "approval_id": approval_id})
         self.assertEqual(400, status)
         self.assertIn("approved WordPress publish request", error["error"])  # type: ignore[index]
+
+    def test_prepare_is_idempotent_and_exposes_the_gate_snapshot_without_secrets(self) -> None:
+        project_id, asset_id = self.asset("idempotent")
+        self.make_publishable(project_id, asset_id)
+        _, first = self.request("POST", f"/api/content-assets/{asset_id}/prepare-publish", {"project_id": project_id, "status": "draft", "allow_without_images": True})
+        _, second = self.request("POST", f"/api/content-assets/{asset_id}/prepare-publish", {"project_id": project_id, "status": "draft", "allow_without_images": True})
+        self.assertEqual(first["approval_id"], second["approval_id"])  # type: ignore[index]
+        self.assertEqual(first["job_id"], second["job_id"])  # type: ignore[index]
+        self.assertTrue(second["reused"])  # type: ignore[index]
+        status, detail = self.request("GET", f"/api/agent-jobs/{first['job_id']}?project_id={project_id}")  # type: ignore[index]
+        self.assertEqual(200, status)
+        approval = detail["approvals"][0]  # type: ignore[index]
+        self.assertEqual("publish", approval["approval_type"])
+        self.assertEqual("ready", approval["payload"]["report"]["status"])
+        serialized = json.dumps(detail).lower()
+        self.assertNotIn("application_password", serialized)
+        self.assertNotIn("not-used-by-gate", serialized)
+
+    def test_gate_blocks_missing_metadata_and_unsafe_markdown_links(self) -> None:
+        project_id, asset_id = self.asset("unsafe")
+        self.make_publishable(
+            project_id,
+            asset_id,
+            meta_description="",
+            markdown="## Unsafe link\n\n[Open this](javascript:alert(1))",
+        )
+        status, result = self.request("POST", f"/api/content-assets/{asset_id}/prepare-publish", {"project_id": project_id, "status": "publish", "allow_without_images": True})
+        self.assertEqual(200, status)
+        self.assertEqual("blocked", result["status"])  # type: ignore[index]
+        issue_codes = {item["code"] for item in result["report"]["issues"]}  # type: ignore[index]
+        self.assertTrue({"meta_description", "links"}.issubset(issue_codes))
+        self.assertNotIn("approval_id", result)  # type: ignore[operator]
 
 
 if __name__ == "__main__":

@@ -1171,6 +1171,281 @@ _MIGRATIONS: tuple[Migration, ...] = (
                 JOIN competitor_research_runs runs ON runs.id=items.research_run_id""",
         ),
     ),
+    (
+        36,
+        "durable bulk collection runs for competitor URL catalog",
+        (
+            """
+            CREATE TABLE IF NOT EXISTS competitor_catalog_collection_runs (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','completed','failed')),
+                candidate_ids_json TEXT NOT NULL DEFAULT '[]',
+                total_count INTEGER NOT NULL DEFAULT 0,
+                collected_count INTEGER NOT NULL DEFAULT 0,
+                already_collected_count INTEGER NOT NULL DEFAULT 0,
+                robots_blocked_count INTEGER NOT NULL DEFAULT 0,
+                failed_count INTEGER NOT NULL DEFAULT 0,
+                error_summary TEXT,
+                started_at TEXT,
+                completed_at TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_competitor_catalog_collection_runs_project ON competitor_catalog_collection_runs(project_id, created_at DESC)",
+        ),
+    ),
+    (
+        37,
+        "AI learning runs from collected competitor content library",
+        (
+            """
+            CREATE TABLE IF NOT EXISTS competitor_content_learning_runs (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN ('queued','running','completed','failed')),
+                candidate_memory_ids_json TEXT NOT NULL DEFAULT '[]',
+                source_count INTEGER NOT NULL DEFAULT 0,
+                processed_count INTEGER NOT NULL DEFAULT 0,
+                memories_created_count INTEGER NOT NULL DEFAULT 0,
+                provider TEXT NOT NULL DEFAULT 'deepseek',
+                model TEXT,
+                error_summary TEXT,
+                started_at TEXT,
+                completed_at TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_competitor_content_learning_runs_project ON competitor_content_learning_runs(project_id, created_at DESC)",
+        ),
+    ),
+    (
+        38,
+        "auditable agent tools and workflow checkpoints",
+        (
+            "ALTER TABLE agent_jobs ADD COLUMN checkpoint_json TEXT NOT NULL DEFAULT '{}'",
+            "ALTER TABLE agent_steps ADD COLUMN input_json TEXT NOT NULL DEFAULT '{}'",
+            "ALTER TABLE agent_steps ADD COLUMN prompt_version TEXT",
+            "ALTER TABLE agent_steps ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE agent_steps ADD COLUMN token_usage_json TEXT NOT NULL DEFAULT '{}'",
+            "ALTER TABLE agent_steps ADD COLUMN cost_micros INTEGER NOT NULL DEFAULT 0",
+            """
+            CREATE TABLE IF NOT EXISTS agent_tool_audits (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                job_id INTEGER,
+                tool_name TEXT NOT NULL,
+                status TEXT NOT NULL CHECK(status IN ('completed','failed')),
+                input_json TEXT NOT NULL DEFAULT '{}',
+                output_json TEXT NOT NULL DEFAULT '{}',
+                duration_ms INTEGER NOT NULL DEFAULT 0,
+                error_summary TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                completed_at TEXT,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY(job_id) REFERENCES agent_jobs(id) ON DELETE CASCADE
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_agent_tool_audits_job ON agent_tool_audits(project_id,job_id,id)",
+        ),
+    ),
+    (
+        39,
+        "unified collection plans, resumable URL items, and content versions",
+        (
+            """
+            CREATE TABLE IF NOT EXISTS collection_plans (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                source_type TEXT NOT NULL CHECK(source_type IN ('domain','keyword','first_party')),
+                source_value TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','paused')),
+                schedule TEXT NOT NULL DEFAULT 'manual',
+                settings_json TEXT NOT NULL DEFAULT '{}',
+                discovered_count INTEGER NOT NULL DEFAULT 0,
+                last_discovered_at TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                UNIQUE(project_id,source_type,source_value)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_collection_plans_project ON collection_plans(project_id,status,updated_at DESC)",
+            """
+            CREATE TABLE IF NOT EXISTS competitor_content_versions (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                memory_id INTEGER NOT NULL,
+                content_hash TEXT NOT NULL,
+                content TEXT NOT NULL,
+                structure_json TEXT NOT NULL DEFAULT '{}',
+                extractor TEXT NOT NULL DEFAULT '',
+                captured_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY(memory_id) REFERENCES competitor_content_memory(id) ON DELETE CASCADE,
+                UNIQUE(memory_id,content_hash)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_competitor_content_versions_memory ON competitor_content_versions(project_id,memory_id,captured_at DESC)",
+            """INSERT OR IGNORE INTO competitor_content_versions(
+                    project_id,memory_id,content_hash,content,structure_json,extractor,captured_at
+                ) SELECT project_id,id,content_hash,content,structure_json,'migration_39',last_captured_at
+                  FROM competitor_content_memory""",
+            "ALTER TABLE competitor_catalog_collection_runs ADD COLUMN unchanged_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE competitor_catalog_collection_runs ADD COLUMN recovered_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE competitor_catalog_collection_runs ADD COLUMN last_heartbeat_at TEXT",
+            """
+            CREATE TABLE IF NOT EXISTS collection_run_items (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                run_id INTEGER NOT NULL,
+                catalog_id INTEGER,
+                normalized_url TEXT NOT NULL,
+                source_url TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN (
+                    'queued','running','collected','unchanged','robots_blocked','excluded','failed'
+                )),
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL DEFAULT 3,
+                memory_id INTEGER,
+                version_id INTEGER,
+                extractor TEXT NOT NULL DEFAULT '',
+                error_summary TEXT NOT NULL DEFAULT '',
+                started_at TEXT,
+                completed_at TEXT,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY(run_id) REFERENCES competitor_catalog_collection_runs(id) ON DELETE CASCADE,
+                FOREIGN KEY(catalog_id) REFERENCES competitor_url_catalog(id) ON DELETE SET NULL,
+                FOREIGN KEY(memory_id) REFERENCES competitor_content_memory(id) ON DELETE SET NULL,
+                FOREIGN KEY(version_id) REFERENCES competitor_content_versions(id) ON DELETE SET NULL,
+                UNIQUE(run_id,normalized_url)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_collection_run_items_pending ON collection_run_items(project_id,run_id,status,id)",
+        ),
+    ),
+    (
+        40,
+        "typed learning cards with governed source evidence",
+        (
+            "ALTER TABLE content_learning_memories ADD COLUMN card_type TEXT NOT NULL DEFAULT 'general'",
+            "ALTER TABLE content_learning_memories ADD COLUMN confidence_score REAL NOT NULL DEFAULT 0.5",
+            "ALTER TABLE content_learning_memories ADD COLUMN freshness_status TEXT NOT NULL DEFAULT 'current'",
+            "ALTER TABLE content_learning_memories ADD COLUMN applicability_json TEXT NOT NULL DEFAULT '{}'",
+            "ALTER TABLE content_learning_memories ADD COLUMN evidence_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE content_learning_memories ADD COLUMN last_validated_at TEXT",
+            "ALTER TABLE content_learning_memories ADD COLUMN superseded_by_id INTEGER REFERENCES content_learning_memories(id) ON DELETE SET NULL",
+            "ALTER TABLE content_learning_memories ADD COLUMN inference_level TEXT NOT NULL DEFAULT 'observed'",
+            "ALTER TABLE competitor_content_learning_runs ADD COLUMN memories_updated_count INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE competitor_content_learning_runs ADD COLUMN memories_rejected_count INTEGER NOT NULL DEFAULT 0",
+            """
+            CREATE TABLE IF NOT EXISTS content_learning_memory_sources (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                memory_id INTEGER NOT NULL,
+                source_type TEXT NOT NULL CHECK(source_type IN (
+                    'competitor_content','first_party','gsc','editorial_diff','manual'
+                )),
+                source_id TEXT NOT NULL,
+                source_url TEXT NOT NULL DEFAULT '',
+                source_content_hash TEXT NOT NULL DEFAULT '',
+                source_version_id INTEGER,
+                evidence_excerpt TEXT NOT NULL DEFAULT '',
+                captured_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY(memory_id) REFERENCES content_learning_memories(id) ON DELETE CASCADE,
+                FOREIGN KEY(source_version_id) REFERENCES competitor_content_versions(id) ON DELETE SET NULL,
+                UNIQUE(project_id,memory_id,source_type,source_id,source_content_hash)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_content_learning_memory_sources_memory ON content_learning_memory_sources(project_id,memory_id,id)",
+            "CREATE INDEX IF NOT EXISTS idx_content_learning_memories_card_type ON content_learning_memories(project_id,status,card_type,freshness_status,quality_score DESC)",
+        ),
+    ),
+    (
+        41,
+        "classify legacy collected competitor memories as writing cards",
+        (
+            """UPDATE content_learning_memories
+               SET card_type='writing_style',
+                   confidence_score=quality_score,
+                   evidence_count=CASE WHEN trim(source_url)<>'' THEN 1 ELSE 0 END,
+                   inference_level='synthesized',
+                   last_validated_at=COALESCE(last_validated_at,updated_at)
+               WHERE source_content_hash LIKE 'collected-competitor:%' AND card_type='general'""",
+        ),
+    ),
+    (
+        42,
+        "content agent generation basis reports",
+        (
+            "ALTER TABLE content_briefs ADD COLUMN agent_job_id INTEGER REFERENCES agent_jobs(id) ON DELETE SET NULL",
+            "ALTER TABLE content_outlines ADD COLUMN agent_job_id INTEGER REFERENCES agent_jobs(id) ON DELETE SET NULL",
+            "CREATE INDEX IF NOT EXISTS idx_content_briefs_agent_job ON content_briefs(agent_job_id,id)",
+            "CREATE INDEX IF NOT EXISTS idx_content_outlines_agent_job ON content_outlines(agent_job_id,id)",
+            """
+            CREATE TABLE IF NOT EXISTS content_generation_basis_reports (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                agent_job_id INTEGER NOT NULL,
+                content_asset_id INTEGER NOT NULL,
+                draft_id INTEGER,
+                report_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                FOREIGN KEY(agent_job_id) REFERENCES agent_jobs(id) ON DELETE CASCADE,
+                FOREIGN KEY(content_asset_id) REFERENCES content_assets(id) ON DELETE CASCADE,
+                FOREIGN KEY(draft_id) REFERENCES content_drafts(id) ON DELETE SET NULL,
+                UNIQUE(agent_job_id)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_content_generation_basis_asset ON content_generation_basis_reports(project_id,content_asset_id,updated_at DESC)",
+        ),
+    ),
+    (
+        43,
+        "durable task queue and worker delivery audit",
+        (
+            """
+            CREATE TABLE IF NOT EXISTS durable_task_queue (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                task_type TEXT NOT NULL CHECK(task_type IN (
+                    'competitor_catalog_collection','collected_competitor_learning',
+                    'competitor_learning','agent_job'
+                )),
+                resource_id INTEGER NOT NULL,
+                payload_json TEXT NOT NULL DEFAULT '{}',
+                dedup_key TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued' CHECK(status IN (
+                    'queued','running','retry_wait','completed','failed','cancelled'
+                )),
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                max_attempts INTEGER NOT NULL DEFAULT 3,
+                available_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                lease_expires_at TEXT,
+                celery_task_id TEXT,
+                last_error TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                started_at TEXT,
+                completed_at TEXT,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_durable_task_queue_due ON durable_task_queue(status,available_at,id)",
+            "CREATE INDEX IF NOT EXISTS idx_durable_task_queue_project ON durable_task_queue(project_id,updated_at DESC,id DESC)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_durable_task_queue_active_dedup ON durable_task_queue(dedup_key) WHERE status IN ('queued','running','retry_wait')",
+        ),
+    ),
 )
 
 

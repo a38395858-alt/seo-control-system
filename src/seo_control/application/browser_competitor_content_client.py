@@ -449,6 +449,53 @@ class BrowserCompetitorContentClient:
                     result[url] = error
         return result
 
+    def preview_extract_many(self, urls: list[str], *, max_workers: int | None = None, respect_robots: bool = True) -> dict[str, dict[str, str] | Exception]:
+        """Quickly check whether public pages have usable static article text.
+
+        This deliberately does *not* launch Scrapy, Playwright, or Crawl4AI.
+        The content-production test button is an interactive diagnostic: it
+        must return a trustworthy answer promptly instead of making a user
+        wait for every optional rendering fallback across a large SERP.
+        Formal competitor learning continues to use :meth:`extract_many` and
+        its full, robots-compliant extraction chain.
+        """
+        unique = list(dict.fromkeys(urls))
+        if not unique:
+            return {}
+
+        def extract_static(url: str) -> dict[str, str]:
+            parsed = urlparse(url)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                raise CompetitorContentProtocolError("Competitor URL is not a public HTTP(S) page.")
+            if respect_robots and _robots_allows(url, timeout=self.timeout) is False:
+                raise CompetitorContentProtocolError("Competitor page is blocked by robots.txt.")
+            try:
+                html = self._fetch_static_html(url)
+            except CompetitorContentProtocolError:
+                raise
+            except Exception as error:
+                raise CompetitorContentProtocolError(f"Competitor HTTP fetch failed: {type(error).__name__}.") from error
+            title, content, extractor = self._extract_article(html, parsed.hostname)
+            if len(content) < 500:
+                raise CompetitorContentProtocolError("Competitor page has insufficient readable static article text.")
+            return {
+                "title": title or parsed.hostname,
+                "content": content,
+                "domain": parsed.hostname.removeprefix("www."),
+                "extractor": extractor,
+            }
+
+        result: dict[str, dict[str, str] | Exception] = {}
+        with ThreadPoolExecutor(max_workers=min(max_workers or self.max_workers, len(unique))) as executor:
+            futures = {executor.submit(extract_static, url): url for url in unique}
+            for future in as_completed(futures):
+                url = futures[future]
+                try:
+                    result[url] = future.result()
+                except Exception as error:
+                    result[url] = error
+        return result
+
     def _scrapy_fetch_many(self, urls: list[str]) -> dict[str, dict[str, str]] | None:
         """Run the optional Scrapy worker; ``None`` means use the fallback."""
         try:

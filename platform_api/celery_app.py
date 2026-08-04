@@ -16,5 +16,6 @@ celery_app.conf.update(
     accept_content=["json"],
     timezone="UTC",
     task_track_started=True,
+    task_routes={"platform.execute_workspace_queue_job": {"queue": "workspace"}},
     imports=("platform_api.tasks",),
 )

@@ -21,6 +21,7 @@ SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
+from seo_control.application.content_generator import PROMPT_VERSION  # noqa: E402
 from seo_control.web import create_server  # noqa: E402
 
 
@@ -32,6 +33,26 @@ class FakeContentGenerator:
 
     def generate(self, **request: object) -> str:
         stage = request.get("stage")
+        if stage == "industry_rules":
+            project_context = request.get("project_context") if isinstance(request.get("project_context"), dict) else {}
+            explicit_industry = str(project_context.get("industry") or "")
+            is_health = "health" in explicit_industry.lower() or "medical" in explicit_industry.lower()
+            return json.dumps(
+                {
+                    "industry": explicit_industry or "SEO software",
+                    "industry_confidence": 1.0 if explicit_industry else 0.86,
+                    "industry_basis": "explicit" if explicit_industry else "inferred",
+                    "audience_language": "Plain language for US small-business buyers",
+                    "tone_rules": ["Be practical and precise"],
+                    "structure_rules": ["Explain workflow fit before feature comparison"],
+                    "terminology_rules": ["Define specialist metrics on first use"],
+                    "evidence_policy": {"risk_level": "ymyl" if is_health else "standard", "preferred_sources": ["Clinical guidelines", "Government health sources"] if is_health else ["Official product documentation"], "high_risk_claims": ["Diagnosis and treatment outcomes"] if is_health else ["Current pricing"], "required_disclosures": ["Not a substitute for professional medical advice"] if is_health else []},
+                    "content_patterns": ["Decision checklist"],
+                    "prohibited_claims": ["Guaranteed rankings"],
+                    "conversion_rules": ["Use a restrained trial CTA"],
+                    "localization_rules": ["Use US English"],
+                }
+            )
         if stage == "semantic":
             return json.dumps(
                 {
@@ -136,9 +157,9 @@ class ContentGenerationWorkflowApiTests(unittest.TestCase):
         except HTTPError as error:
             return error.code, json.loads(error.read().decode("utf-8"))
 
-    def create_asset(self) -> tuple[int, int]:
+    def create_asset(self, *, industry: str = "") -> tuple[int, int]:
         status, project = self.request_json(
-            "POST", "/api/projects", {"name": "Content generation", "country_code": "US", "language_code": "en"}
+            "POST", "/api/projects", {"name": "Content generation", "industry": industry, "country_code": "US", "language_code": "en"}
         )
         self.assertEqual(201, status)
         project_id = project["id"]  # type: ignore[index]
@@ -181,6 +202,7 @@ class ContentGenerationWorkflowApiTests(unittest.TestCase):
         )
         self.assertEqual(201, status)
         self.assertEqual("US small business owners", brief["brief"]["target_audience"])  # type: ignore[index]
+        self.assertEqual("SEO software", brief["brief"]["brief"]["industry_rules"]["industry"])  # type: ignore[index]
 
         status, outline = self.request_json(
             "POST", f"/api/content-assets/{asset_id}/generate-outline", {"project_id": project_id, "provider": "gemini"}
@@ -197,16 +219,48 @@ class ContentGenerationWorkflowApiTests(unittest.TestCase):
 
         status, detail = self.request_json("GET", f"/api/content-assets/{asset_id}?project_id={project_id}")
         self.assertEqual(200, status)
-        self.assertEqual("in_review", detail["status"])  # type: ignore[index]
+        # A generated draft without an authoritative source stays available
+        # for review, but must not be represented as publish-ready.
+        self.assertEqual("needs_revision", detail["status"])  # type: ignore[index]
+        self.assertEqual("needs_sources", detail["content_status"])  # type: ignore[index]
         self.assertEqual(draft["draft"]["id"], detail["current_draft"]["id"])  # type: ignore[index]
         self.assertEqual(1, len(detail["drafts"]))  # type: ignore[index]
         runs = detail["generation_runs"]  # type: ignore[index]
-        self.assertEqual(["semantic", "title", "outline", "chapter_plan", "section", "chapter_plan", "section", "assembly"], [run["stage"] for run in runs])
+        self.assertEqual(["industry_rules", "semantic", "title", "outline", "chapter_plan", "section", "chapter_plan", "section", "assembly"], [run["stage"] for run in runs])
         self.assertTrue(all(run["status"] == "completed" for run in runs))
         self.assertTrue(all(run["provider"] == "gemini" for run in runs))
-        self.assertTrue(all(run["prompt_version"] == "content_competitor_learning_v11" for run in runs))
+        self.assertTrue(all(run["prompt_version"] == PROMPT_VERSION for run in runs))
+        policy_stages = {"semantic", "title", "outline", "chapter_plan", "section", "assembly"}
+        for run in runs:
+            if run["stage"] in policy_stages:
+                self.assertEqual("SEO software", run["input"]["writing_policy"]["industry_rules"]["industry"])
+                self.assertTrue(run["input"]["writing_policy"]["fixed_safety_rules"])
         self.assertEqual("not_run", detail["current_draft"]["qa_status"])  # type: ignore[index]
         self.assertNotIn("secret", json.dumps(detail).lower())
+
+    def test_explicit_ymyl_industry_is_authoritative_and_project_scoped(self) -> None:
+        health_project_id, health_asset_id = self.create_asset(industry="Healthcare")
+        status, health_brief = self.request_json(
+            "POST", f"/api/content-assets/{health_asset_id}/generate-brief",
+            {"project_id": health_project_id, "provider": "gemini", "target_audience": "US patients", "business_goal": "informational", "sources": []},
+        )
+        self.assertEqual(201, status)
+        health_rules = health_brief["brief"]["brief"]["industry_rules"]  # type: ignore[index]
+        self.assertEqual("Healthcare", health_rules["industry"])
+        self.assertEqual("explicit", health_rules["industry_basis"])
+        self.assertEqual(1.0, health_rules["industry_confidence"])
+        self.assertEqual("ymyl", health_rules["evidence_policy"]["risk_level"])
+
+        software_project_id, software_asset_id = self.create_asset(industry="SaaS")
+        status, software_brief = self.request_json(
+            "POST", f"/api/content-assets/{software_asset_id}/generate-brief",
+            {"project_id": software_project_id, "provider": "gemini", "target_audience": "US buyers", "business_goal": "commercial", "sources": []},
+        )
+        self.assertEqual(201, status)
+        software_rules = software_brief["brief"]["brief"]["industry_rules"]  # type: ignore[index]
+        self.assertEqual("SaaS", software_rules["industry"])
+        self.assertEqual("standard", software_rules["evidence_policy"]["risk_level"])
+        self.assertNotIn("Healthcare", json.dumps(software_brief))
 
     def test_generation_failure_is_logged_without_overwriting_the_existing_draft(self) -> None:
         project_id, asset_id = self.create_asset()

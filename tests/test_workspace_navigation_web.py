@@ -23,11 +23,11 @@ class WorkspaceNavigationWebTests(unittest.TestCase):
     def test_sidebar_uses_route_navigation_not_hash_anchors(self) -> None:
         self.assertIn("NavLink", self.app)
         for route in ("/research", "/keywords", "/titles", "/title-library", "/scoring"):
-            self.assertIn(f'to="{route}"', self.app)
+            self.assertIn(f'to={{`{route}${{projectQuery}}`}}', self.app)
         self.assertNotIn('href="#research"', self.app)
 
     def test_workspace_has_independent_keyword_title_and_scoring_routes(self) -> None:
-        self.assertIn("<Routes>", self.app)
+        self.assertIn("<Routes location={routeLocation}>", self.app)
         for route in ("/research", "/keywords", "/titles", "/title-library", "/scoring"):
             self.assertIn(f'path="{route}"', self.app)
 

@@ -90,6 +90,24 @@ python -m seo_control serve --host 127.0.0.1 --port 8000
 
 默认 SQLite 数据库保存在 `data/seo-control.sqlite3`。请勿提交其中包含真实网站资料、账号配置或业务数据的副本。
 
+长任务默认先写入 SQLite 持久队列，再由两个本地 Worker 执行；服务重启后会恢复未完成的采集、学习和 Agent 任务。生产环境可安装 `requirements-queue.txt` 并设置 `SEO_TASK_QUEUE_BACKEND=celery`、`REDIS_URL`、`SEO_WORKER_TOKEN` 和 `SEO_WORKSPACE_CALLBACK_URL`，把投递切换到 Redis/Celery，前端与业务 API 无需改动。PostgreSQL 业务数据按模块分批迁移，不与队列切换绑在一次高风险改写中。
+
+PostgreSQL 分批迁移默认只预览。先安装 `requirements-postgres.txt` 并通过环境变量提供 `DATABASE_URL`，然后按项目、关键词、采集目录、历史证据链的顺序执行；确认预览数量后才可增加 `--apply`，每批写入后必须执行对应的 `validate-*-postgres` 并得到零差异报告。
+
+当前 8000 工作台已完成 P6.8 运行时 PostgreSQL 切换。正式运行时 Schema 位于隔离数据库 `seo_agent_p68_runtime_20260803`，SQLite 原库继续保留用于应急回滚。日常重启使用根目录的 `start-workspace-postgres.ps1`；紧急切回 SQLite 使用 `rollback-workspace-sqlite.ps1`。完整验收和门禁说明见 `docs/开发卡-P6.8-运行时数据源影子校验与切换门禁.md`。
+
+```powershell
+python -m seo_control migrate-projects-postgres --database data/seo-control.sqlite3
+python -m seo_control migrate-keywords-postgres --database data/seo-control.sqlite3
+python -m seo_control migrate-collection-postgres --database data/seo-control.sqlite3
+python -m seo_control migrate-evidence-postgres --database data/seo-control.sqlite3
+python -m seo_control migrate-workflow-postgres --database data/seo-control.sqlite3
+python -m seo_control migrate-legacy-postgres --database data/seo-control.sqlite3
+python -m seo_control migrate-all-postgres --database data/seo-control.sqlite3
+```
+
+全库预览不需要 PostgreSQL 连接。真正写入时必须同时传入 `--apply --confirm-full-migration`，写入后再执行 `validate-all-postgres`。统一报告不输出 WordPress/GSC 凭据或业务字段具体值。
+
 ## 配置说明
 
 在“AI 与集成”页面分别保存 ChatGPT、DeepSeek、Gemini 与 Serper 配置。模型配置由服务端安全保存，前端只显示是否已配置；不要将 API Key、WordPress 密码或浏览器登录信息写进源码、文档或 Git。

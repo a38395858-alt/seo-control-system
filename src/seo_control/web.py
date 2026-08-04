@@ -7,6 +7,7 @@ from datetime import date, timedelta
 import base64
 import csv
 import html
+from html.parser import HTMLParser
 import io
 import json
 import mimetypes
@@ -14,6 +15,7 @@ import math
 import os
 import re
 import hashlib
+import hmac
 import time
 import subprocess
 import threading
@@ -25,7 +27,7 @@ from pathlib import Path
 import sqlite3
 from typing import Any, Iterator, Mapping
 from urllib.error import HTTPError
-from urllib.parse import parse_qs, quote, urlencode, urljoin, urlparse, urlsplit
+from urllib.parse import parse_qs, parse_qsl, quote, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 import requests
 from PIL import Image, ImageOps
@@ -37,18 +39,49 @@ except ImportError:  # pragma: no cover - Windows desktop runtime supplies this
 from seo_control.application.csv_keyword_import import parse_keyword_csv
 from seo_control.application.ai_keyword_reviewer import OpenAICompatibleKeywordReviewer, RuleBasedKeywordReviewer
 from seo_control.application.ai_title_generator import OpenAICompatibleTitleGenerator, RuleBasedTitleGenerator, TitleGenerationProtocolError
-from seo_control.application.content_generator import ContentGenerationProtocolError, OpenAICompatibleContentGenerator, PROMPT_VERSION
+from seo_control.application.content_generator import (
+    ContentGenerationProtocolError,
+    FIXED_CONTENT_SAFETY_RULES,
+    OpenAICompatibleContentGenerator,
+    PROMPT_VERSION,
+    SYSTEM_PROMPT,
+    _stage_instruction,
+)
 from seo_control.application.browser_serp_title_client import BrowserSerpTitleClient, GoogleSerpProtocolError, GoogleSerpVerificationRequired
 from seo_control.application.browser_competitor_content_client import BrowserCompetitorContentClient, CompetitorContentProtocolError
 from seo_control.application.serper_search_client import SerperSearchClient, SerperSearchProtocolError
 from seo_control.application.google_suggest_client import GoogleSuggestClient, GoogleSuggestProtocolError
 from seo_control.application.gsc_browser_capture_client import GscBrowserCaptureClient, GscBrowserCaptureError
+from seo_control.application.gsc_feedback import GscFeedbackService
 from seo_control.application.keyword_expansion_service import KeywordExpansionService
 from seo_control.application.keyword_import_service import KeywordImportService
-from seo_control.application.agent_workflows import AgentWorkflowInputError, run_content_workflow_skeleton
+from seo_control.application.agent_tools import AgentToolService
+from seo_control.application.agent_workflows import AgentWorkflowInputError, run_content_workflow, run_content_workflow_skeleton
+from seo_control.application.competitor_intelligence import CollectionService, normalize_collection_url
+from seo_control.application.memory_learning import MemoryLearningService
 from seo_control.domain.keywords import normalize_keyword
 from seo_control.domain.keyword_scoring import KeywordScoringInput, calculate_keyword_score
 from seo_control.infrastructure.database import initialize_database
+from seo_control.infrastructure.credential_vault import CredentialVault
+from seo_control.infrastructure.runtime_database import RuntimeDatabaseController, RuntimeDatabaseMode
+from seo_control.infrastructure.runtime_postgres import (
+    PostgresRuntimeCollectionRepository,
+    PostgresRuntimeConnectionFactory,
+    PostgresRuntimeKeywordRepository,
+    PostgresRuntimeProjectRepository,
+)
+from seo_control.infrastructure.repositories import (
+    CollectionRepository,
+    KeywordRepository,
+    ProjectRepository,
+    ShadowCollectionRepository,
+    ShadowKeywordRepository,
+    ShadowProjectRepository,
+    SQLiteCollectionRepository,
+    SQLiteKeywordRepository,
+    SQLiteProjectRepository,
+)
+from seo_control.infrastructure.task_queue import DurableTaskQueue
 from platform_api.site_crawler import crawl_site
 
 
@@ -77,6 +110,14 @@ COMPETITOR_NON_ARTICLE_DOMAINS = (
 )
 COMPETITOR_MARKETPLACE_DOMAINS = ("amazon.com", "ebay.com", "aliexpress.com", "temu.com", "walmart.com", "etsy.com", "wayfair.com")
 COMPETITOR_PRODUCT_PATH_MARKERS = ("/product/", "/products/", "/collections/", "/category/", "/categories/", "/shop/", "/store/", "/dp/", "/best-sellers/")
+COMPETITOR_TRACKING_QUERY_PARAMETERS = frozenset({
+    "dclid", "fbclid", "gclid", "gbraid", "mc_cid", "mc_eid", "msclkid", "rsltid", "srsltid", "ttclid", "twclid", "wbraid",
+})
+
+
+def normalize_competitor_url(value: str) -> str:
+    """Return a stable competitor-page key without search/ad tracking noise."""
+    return normalize_collection_url(value)
 
 
 def _looks_like_image_bytes(payload: bytes) -> bool:
@@ -130,6 +171,10 @@ def competitor_search_queries(title: str, keyword: str) -> list[str]:
         marker in title_intent
         for marker in (" idea", "inspiration", "inspiring", "tips", "examples", "designs", "styles")
     )
+    benefit_or_design_intent = any(
+        marker in title_intent
+        for marker in (" benefit", "benefits", "advantage", "advantages", " design", "planning", "layout")
+    )
     if inspiration_intent:
         # A literal headline such as "10 Inspiring Ideas ..." frequently
         # returns Pinterest and video cards. Keep its subject keyword but use
@@ -140,6 +185,14 @@ def competitor_search_queries(title: str, keyword: str) -> list[str]:
             compact = f"{compact} ideas"
         if "guide" not in compact.casefold():
             compact = f"{compact} guide"
+    elif benefit_or_design_intent:
+        # Benefits and design headlines are informational, yet their raw
+        # product keyword often produces shopping SERPs.  The second query
+        # must explicitly ask Google for a guide/article-shaped result set.
+        compact = core_keyword or compact
+        suffix = "design guide" if any(marker in title_intent for marker in (" design", "planning", "layout")) else "benefits guide"
+        if suffix not in compact.casefold():
+            compact = f"{compact} {suffix}"
     elif any(marker in title_intent for marker in ("waterproof", "water resistant", "weatherproof")):
         compact = f"{compact} IP rating"
     elif any(marker in title_intent for marker in ("how ", "what to", "guide", "look for", "best ", "compare", "vs.")):
@@ -154,7 +207,7 @@ def competitor_search_queries(title: str, keyword: str) -> list[str]:
             " vs ", " vs. ", " versus ", "compare", "comparison",
             "how ", "what to", "look for", "guide", "review",
             " idea", "inspiration", "inspiring", "tips", "examples",
-            "designs", "styles", "ways to",
+            "design", "designs", "styles", "ways to", "benefit", "advantages",
         )
     )
     primary = original if intent_first else (core_keyword or original)
@@ -209,12 +262,59 @@ class KeywordDiscoveryServer(ThreadingHTTPServer):
     gsc_browser_client: GscBrowserCaptureClient
     periodic_learning_stop: threading.Event
     periodic_learning_wake: threading.Event
+    collection_service: CollectionService
+    recovered_collection_runs: list[tuple[int, int]]
+    recovered_content_agent_jobs: list[tuple[int, int]]
+    recovered_gsc_feedback_jobs: list[tuple[int, int]]
+    task_queue: DurableTaskQueue
+    worker_token: str
+    periodic_learning_thread: threading.Thread | None
+    project_repository: ProjectRepository
+    keyword_repository: KeywordRepository
+    collection_repository: CollectionRepository
+    runtime_database: RuntimeDatabaseController
+    runtime_postgres_factory: PostgresRuntimeConnectionFactory | None
+    credential_vault: CredentialVault
+
+    def serve_forever(self, poll_interval: float = 0.5) -> None:
+        self.task_queue.start()
+        if self.periodic_learning_thread is None:
+            self.periodic_learning_thread = threading.Thread(
+                target=_periodic_competitor_learning_loop,
+                args=(self,),
+                daemon=True,
+                name="periodic-competitor-learning",
+            )
+            self.periodic_learning_thread.start()
+        recovered = list(getattr(self, "recovered_collection_runs", []))
+        self.recovered_collection_runs = []
+        for project_id, run_id in recovered:
+            self.enqueue_background_task("competitor_catalog_collection", project_id, run_id)
+        for project_id, job_id in list(getattr(self, "recovered_content_agent_jobs", [])):
+            self.enqueue_background_task("agent_job", project_id, job_id)
+        self.recovered_content_agent_jobs = []
+        for project_id, job_id in list(getattr(self, "recovered_gsc_feedback_jobs", [])):
+            self.enqueue_background_task("agent_job", project_id, job_id)
+        self.recovered_gsc_feedback_jobs = []
+        super().serve_forever(poll_interval=poll_interval)
+
+    def enqueue_background_task(self, task_type: str, project_id: int, resource_id: int) -> dict[str, Any]:
+        return self.task_queue.enqueue(
+            project_id=project_id,
+            task_type=task_type,
+            resource_id=resource_id,
+            payload={"project_id": project_id},
+        )
 
     def shutdown(self) -> None:
         if hasattr(self, "periodic_learning_stop"):
             self.periodic_learning_stop.set()
         if hasattr(self, "periodic_learning_wake"):
             self.periodic_learning_wake.set()
+        if self.periodic_learning_thread is not None and self.periodic_learning_thread is not threading.current_thread():
+            self.periodic_learning_thread.join(timeout=2)
+        if hasattr(self, "task_queue"):
+            self.task_queue.stop()
         super().shutdown()
 
 
@@ -226,6 +326,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
 
     def do_GET(self) -> None:
         path = urlsplit(self.path).path
+        collection_run_items = re.fullmatch(r"/api/competitor-url-catalog/collection-runs/(\d+)/items", path)
         agent_job = re.fullmatch(r"/api/agent-jobs/(\d+)", path)
         learning_memory = re.fullmatch(r"/api/content-learning-memories/(\d+)", path)
         competitor_learning = re.fullmatch(r"/api/projects/(\d+)/competitor-learning(?:/(runs))?", path)
@@ -261,6 +362,8 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             self._list_project_knowledge(int(knowledge_project.group(1)))
         elif path == "/api/projects/summary":
             self._list_project_summaries()
+        elif path == "/api/runtime-database/status":
+            self._runtime_database_status()
         elif path == "/api/system-tasks":
             self._list_system_tasks()
         elif path == "/api/agent-jobs":
@@ -289,8 +392,16 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             self._list_content_library()
         elif path == "/api/content-memory":
             self._list_content_memory()
+        elif path == "/api/competitor-content-learning/runs":
+            self._list_competitor_content_learning_runs()
         elif path == "/api/competitor-url-archive":
             self._list_competitor_url_archive()
+        elif collection_run_items:
+            self._list_competitor_catalog_collection_run_items(int(collection_run_items.group(1)))
+        elif path == "/api/competitor-url-catalog/collection-runs":
+            self._list_competitor_catalog_collection_runs()
+        elif path == "/api/collection-plans":
+            self._list_collection_plans()
         elif path == "/api/competitor-url-catalog":
             self._list_competitor_url_catalog()
         elif path == "/api/authority-sources":
@@ -299,31 +410,53 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             self._get_content_asset(self._content_asset_path(path) or 0)
         elif self._keyword_title_candidates_path(path) is not None:
             self._list_title_candidates(self._keyword_title_candidates_path(path) or 0)
-        elif path in {"", "/", "/agent-platform", "/projects", "/system-tasks", "/integrations", "/research", "/keywords", "/titles", "/title-library", "/content", "/content-library", "/content-memory", "/competitor-learning", "/learning-memories", "/knowledge", "/website-crawl", "/gsc", "/content-publish", "/authority-sources", "/scoring", "/settings"} or re.fullmatch(r"/content-library/\d+", path) or re.fullmatch(r"/(agent-platform/site|projects)(/\d+)?(?:/.*)?", path):
+        elif path in {"", "/", "/agent-platform", "/projects", "/system-tasks", "/integrations", "/research", "/keywords", "/titles", "/title-library", "/content", "/content-history", "/content-library", "/content-memory", "/collected-content-library", "/competitor-learning", "/learning-memories", "/knowledge", "/website-crawl", "/gsc", "/content-publish", "/authority-sources", "/scoring", "/settings"} or re.fullmatch(r"/content-library/\d+", path) or re.fullmatch(r"/(agent-platform/site|projects)(/\d+)?(?:/.*)?", path):
             self._serve_index()
         else:
             super().do_GET()
 
     def do_POST(self) -> None:
         path = urlsplit(self.path).path
-        agent_job_action = re.fullmatch(r"/api/agent-jobs/(\d+)/(retry|cancel)", path)
+        internal_queue_execute = re.fullmatch(r"/api/internal/task-queue/(\d+)/execute", path)
+        agent_job_action = re.fullmatch(r"/api/agent-jobs/(\d+)/(retry|cancel|pause|resume|execute)", path)
         agent_approval = re.fullmatch(r"/api/agent-approvals/(\d+)", path)
         learning_memory_action = re.fullmatch(r"/api/content-learning-memories/(\d+)/(disable|enable|pin|unpin|feedback)", path)
         competitor_learning = re.fullmatch(r"/api/projects/(\d+)/competitor-learning(?:/(run|runs/(\d+)/execute))?", path)
         candidate_id = self._title_candidate_action_path(path, "select")
         content_action = self._content_asset_action_path(path)
+        content_prompt_preview = re.fullmatch(r"/api/content-assets/(\d+)/prompt-preview", path)
         wordpress_project = re.fullmatch(r"/api/projects/(\d+)/wordpress(?:/(test))?", path)
         gsc_project = re.fullmatch(r"/api/projects/(\d+)/gsc/(property|sync|learn-content)", path)
         gsc_browser_capture = re.fullmatch(r"/api/projects/(\d+)/gsc/browser/(capture|capture-ranked-pages)", path)
         knowledge_project = re.fullmatch(r"/api/projects/(\d+)/knowledge(?:/(crawl))?", path)
         image_generate = re.fullmatch(r"/api/content-images/(\d+)/generate", path)
-        if path not in {"/api/projects", "/api/keyword-imports", "/api/suggest-expansions", "/api/keyword-opportunity-scores", "/api/expanded-keywords", "/api/ai-keyword-reviews", "/api/serp-title-research", "/api/browser-serp-title-research", "/api/title-generation-jobs", "/api/multi-provider-title-generation-jobs", "/api/title-candidates", "/api/content-assets", "/api/authority-sources", "/api/authority-sources/research", "/api/settings/ai", "/api/settings/ai/test", "/api/settings/serper", "/api/settings/serper/test", "/api/settings/images", "/api/settings/images/test", "/api/settings/gsc", "/api/agent-jobs", "/api/content-learning-memories"} and candidate_id is None and content_action is None and wordpress_project is None and gsc_project is None and gsc_browser_capture is None and knowledge_project is None and image_generate is None and agent_job_action is None and agent_approval is None and learning_memory_action is None and competitor_learning is None:
+        catalog_collection_execute = re.fullmatch(r"/api/competitor-url-catalog/collection-runs/(\d+)/execute", path)
+        collection_plan_discover = re.fullmatch(r"/api/collection-plans/(\d+)/discover", path)
+        collected_content_learning_execute = re.fullmatch(r"/api/competitor-content-learning/runs/(\d+)/execute", path)
+        runtime_database_action = re.fullmatch(r"/api/runtime-database/(shadow/enable|cutover/check|cutover|rollback)", path)
+        if path not in {"/api/projects", "/api/keyword-imports", "/api/suggest-expansions", "/api/keyword-opportunity-scores", "/api/expanded-keywords", "/api/ai-keyword-reviews", "/api/serp-title-research", "/api/browser-serp-title-research", "/api/title-generation-jobs", "/api/multi-provider-title-generation-jobs", "/api/title-candidates", "/api/content-assets", "/api/authority-sources", "/api/authority-sources/research", "/api/settings/ai", "/api/settings/ai/test", "/api/settings/serper", "/api/settings/serper/test", "/api/settings/images", "/api/settings/images/test", "/api/settings/gsc", "/api/agent-jobs", "/api/content-learning-memories", "/api/collection-plans", "/api/competitor-url-catalog/collect", "/api/competitor-content-learning/learn"} and internal_queue_execute is None and candidate_id is None and content_action is None and content_prompt_preview is None and wordpress_project is None and gsc_project is None and gsc_browser_capture is None and knowledge_project is None and image_generate is None and agent_job_action is None and agent_approval is None and learning_memory_action is None and competitor_learning is None and catalog_collection_execute is None and collection_plan_discover is None and collected_content_learning_execute is None and runtime_database_action is None:
             self._json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
             return
         payload = self._read_json()
         if payload is None:
             return
-        if competitor_learning:
+        if internal_queue_execute:
+            self._execute_durable_queue_job(int(internal_queue_execute.group(1)))
+        elif runtime_database_action:
+            self._runtime_database_action(runtime_database_action.group(1), payload)
+        elif collection_plan_discover:
+            self._discover_collection_plan(int(collection_plan_discover.group(1)), payload)
+        elif path == "/api/collection-plans":
+            self._save_collection_plan(payload)
+        elif path == "/api/competitor-url-catalog/collect":
+            self._queue_competitor_catalog_collection(payload)
+        elif catalog_collection_execute:
+            self._execute_competitor_catalog_collection(int(catalog_collection_execute.group(1)), payload)
+        elif path == "/api/competitor-content-learning/learn":
+            self._queue_collected_competitor_content_learning(payload)
+        elif collected_content_learning_execute:
+            self._execute_collected_competitor_content_learning(int(collected_content_learning_execute.group(1)), payload)
+        elif competitor_learning:
             project_id, action, run_id = int(competitor_learning.group(1)), competitor_learning.group(2), competitor_learning.group(3)
             if action == "run":
                 self._queue_competitor_learning_run(project_id, payload, trigger_type="manual")
@@ -342,8 +475,12 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         elif path == "/api/content-learning-memories":
             self._create_content_learning_memory(payload)
         elif agent_job_action:
-            if agent_job_action.group(2) == "retry": self._retry_agent_job(int(agent_job_action.group(1)), payload)
-            else: self._cancel_agent_job(int(agent_job_action.group(1)), payload)
+            action = agent_job_action.group(2)
+            if action == "retry": self._retry_agent_job(int(agent_job_action.group(1)), payload)
+            elif action == "cancel": self._cancel_agent_job(int(agent_job_action.group(1)), payload)
+            elif action == "pause": self._pause_agent_job(int(agent_job_action.group(1)), payload)
+            elif action == "resume": self._resume_agent_job(int(agent_job_action.group(1)), payload)
+            else: self._execute_agent_job(int(agent_job_action.group(1)), payload)
         elif agent_approval:
             self._decide_agent_approval(int(agent_approval.group(1)), payload)
         elif path == "/api/agent-jobs":
@@ -389,10 +526,16 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             self._create_authority_source(payload)
         elif path == "/api/authority-sources/research":
             self._research_authority_sources(payload)
+        elif content_prompt_preview:
+            self._preview_content_prompt(int(content_prompt_preview.group(1)), payload)
         elif content_action is not None:
             asset_id, action = content_action
             if action == "briefs": self._create_content_brief(asset_id, payload)
             elif action == "outlines": self._create_content_outline(asset_id, payload)
+            elif action == "preview-competitors": self._preview_competitor_research_api(asset_id, payload)
+            elif action == "preview-outline": self._preview_competitor_outline_api(asset_id, payload)
+            elif action == "preview-content": self._preview_content_api(asset_id, payload)
+            elif action == "restart": self._restart_content_asset(asset_id, payload)
             elif action == "research-competitors": self._research_competitors_api(asset_id, payload)
             elif action == "image-prompts": self._create_section_image_prompts(asset_id, payload)
             elif action == "generate-images": self._generate_all_section_images(asset_id, payload)
@@ -532,6 +675,70 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             payload = self._content_asset_detail(connection, int(values[0]), asset_id)
         self._json(HTTPStatus.OK, payload)
 
+    def _preview_content_prompt(self, asset_id: int, payload: Mapping[str, Any]) -> None:
+        """Expose the effective static prompt and scoped source roles before a billable run.
+
+        This endpoint deliberately does not call a model and never returns raw
+        company documents, GSC metrics, credentials, or competitor bodies. It
+        gives the operator the exact server-side prompt instructions plus an
+        auditable count of the project-local inputs that the next run may use.
+        """
+        project_id = self._integer(payload, "project_id")
+        if project_id is None:
+            return
+        requested_action = self._optional_text(payload, "preview_action") or "generate"
+        if requested_action not in {"generate", "generate-brief", "generate-outline", "generate-draft", "full_content_agent"}:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "preview_action is not supported."})
+            return
+        try:
+            with self._database() as connection:
+                asset = self._content_asset(connection, project_id, asset_id)
+                manual_sources = self._content_sources(payload.get("sources", []))
+                authority_sources = self._authority_sources_for_asset(connection, asset)
+                gsc_sources = self._gsc_performance_sources_for_asset(connection, asset)
+                competitor_sources, _analysis = self._research_sources(connection, asset["id"])
+                learning_memories = self._select_content_learning_memories(connection, asset)
+        except (sqlite3.Error, ValueError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+
+        source_groups = [
+            ("网站产品与公司资料", "company_knowledge", [source for source in manual_sources if source.get("source_type") == "company_knowledge"], "只支持已提供的一方产品、品牌和公开业务事实。"),
+            ("GSC 搜索信号", "gsc", [*gsc_sources, *[source for source in manual_sources if source.get("source_type") == "gsc_anchor"]], "只用于搜索措辞、内容缺口、页面重叠和内链机会；不会写入指标。"),
+            ("竞品学习与调研", "competitor", competitor_sources, "只用于结构、术语、读者问题和选题缺口；不能复制或作为事实。"),
+            ("权威资料", "authority", authority_sources, "用于技术、安全、认证、规格和法规等可验证事实。"),
+            ("人工补充资料", "manual", [source for source in manual_sources if source.get("source_type") not in {"company_knowledge", "gsc_anchor"}], "仅按原始资料可支持的范围使用。"),
+            ("项目学习记忆", "memory", learning_memories, "只提供已治理的写法、结构、选题或表现策略，不作为事实来源。"),
+        ]
+        source_summary = [
+            {
+                "key": key,
+                "label": label,
+                "count": len(items),
+                "rule": rule,
+                "examples": [str(item.get("title") or item.get("topic") or "项目资料")[:160] for item in items[:3] if isinstance(item, Mapping)],
+            }
+            for label, key, items, rule in source_groups
+        ]
+        stages = ["industry_rules", "semantic", "title", "outline", "chapter_plan", "section", "assembly", "qa"]
+        if requested_action == "generate-brief": stages = ["industry_rules", "semantic"]
+        elif requested_action == "generate-outline": stages = ["title", "outline"]
+        elif requested_action == "generate-draft": stages = ["chapter_plan", "section", "assembly"]
+        self._json(HTTPStatus.OK, {
+            "prompt_version": PROMPT_VERSION,
+            "requested_action": requested_action,
+            "article": {
+                "title": str(asset["title_snapshot"] or ""),
+                "primary_keyword": str(asset["keyword"] or ""),
+                "locale": str(asset["locale"] or ""),
+                "target_audience": self._optional_text(payload, "target_audience") or "US searchers evaluating this topic",
+                "business_goal": self._optional_text(payload, "business_goal") or "informational",
+            },
+            "source_summary": source_summary,
+            "system_prompt": SYSTEM_PROMPT,
+            "stages": [{"stage": stage, "instruction": _stage_instruction(stage)} for stage in stages],
+        })
+
     def _create_content_brief(self, asset_id: int, payload: Mapping[str, Any]) -> None:
         project_id = self._integer(payload, "project_id")
         audience, goal = self._text(payload, "target_audience"), self._text(payload, "business_goal")
@@ -543,7 +750,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 self._content_asset(connection, project_id, asset_id)
                 with connection:
                     connection.execute("UPDATE content_briefs SET status='superseded' WHERE content_asset_id=? AND status='current'", (asset_id,))
-                    cursor = connection.execute("INSERT INTO content_briefs(content_asset_id,target_audience,business_goal,target_length,sources_json,brief_json) VALUES(?,?,?,?,?,?)", (asset_id, audience, goal, target, json.dumps(sources, ensure_ascii=False), json.dumps({"source_policy": "unavailable sources must be marked [VERIFY]"})))
+                    cursor = connection.execute("INSERT INTO content_briefs(content_asset_id,target_audience,business_goal,target_length,sources_json,brief_json) VALUES(?,?,?,?,?,?)", (asset_id, audience, goal, target, json.dumps(sources, ensure_ascii=False), json.dumps({"source_policy": "unsupported facts are omitted or replaced with general, non-factual guidance"})))
                     connection.execute("UPDATE content_assets SET status='briefing',current_brief_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (cursor.lastrowid, asset_id))
                     row = connection.execute("SELECT * FROM content_briefs WHERE id=?", (cursor.lastrowid,)).fetchone()
         except (sqlite3.Error, ValueError) as error: self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)}); return
@@ -557,12 +764,13 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 asset = self._content_asset(connection, project_id, asset_id)
                 brief_id = asset["current_brief_id"]
                 if brief_id is None: raise ValueError("a content brief is required before creating an outline")
+                self._require_content_competitor_learning(connection, asset)
                 with connection:
                     cursor = connection.execute("INSERT INTO content_outlines(content_asset_id,brief_id) VALUES(?,?)", (asset_id, brief_id))
                     for position, section in enumerate(sections, 1):
                         if not isinstance(section, Mapping) or not all(isinstance(section.get(key), str) and section[key].strip() for key in ("heading", "purpose")): raise ValueError("each outline section needs heading and purpose")
                         section_data = self._normalise_outline_section(section, position)
-                        connection.execute("INSERT INTO content_outline_sections(outline_id,position,heading,purpose,word_budget,section_json) VALUES(?,?,?,?,?,?)", (cursor.lastrowid, position, section_data["heading"], section_data["purpose"], 0, json.dumps(section_data, ensure_ascii=False)))
+                        connection.execute("INSERT INTO content_outline_sections(outline_id,position,heading,purpose,word_budget,section_json) VALUES(?,?,?,?,?,?)", (cursor.lastrowid, position, section_data["heading"], section_data["purpose"], max(0, int(section_data.get("target_words") or 0)), json.dumps(section_data, ensure_ascii=False)))
                     connection.execute("UPDATE content_assets SET status='outlining',current_outline_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (cursor.lastrowid, asset_id))
                     row = connection.execute("SELECT * FROM content_outlines WHERE id=?", (cursor.lastrowid,)).fetchone()
                     result = self._content_outline_payload(connection, row)
@@ -588,25 +796,258 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)}); return
         self._json(HTTPStatus.CREATED, research)
 
+    def _preview_competitor_research_api(self, asset_id: int, payload: Mapping[str, Any]) -> None:
+        """Test top Google results without persisting content, memory, or AI output."""
+        project_id = self._integer(payload, "project_id")
+        if project_id is None:
+            return
+        try:
+            with self._database() as connection:
+                asset = self._content_asset(connection, project_id, asset_id)
+                query = " ".join(str(asset["title_snapshot"] or "").split())
+                if not query:
+                    raise ValueError("a selected title is required for competitor preview")
+                key = _serper_api_key(self.server.ai_settings_path)
+                if key is None:
+                    raise ValueError("Serper.dev · Google Search API is not configured.")
+                client = SerperSearchClient(key)
+                results: list[dict[str, Any]] = []
+                seen: set[str] = set()
+                for page in range(1, 6):
+                    if len(results) >= 50:
+                        break
+                    found = client.search(query=query, locale=asset["locale"], max_results=min(10, 50 - len(results)), page=page)
+                    added = 0
+                    for item in found:
+                        normalized = normalize_competitor_url(str(item.get("url") or ""))
+                        if not normalized or normalized in seen:
+                            continue
+                        seen.add(normalized); added += 1
+                        value = dict(item); value["rank"] = len(results) + 1
+                        results.append(value)
+                        if len(results) >= 50:
+                            break
+                    if not added:
+                        break
+                own_domain = self._project_domain(connection, project_id)
+            eligible = [item for item in results if not competitor_candidate_exclusion_reason(item, own_domain)]
+            # The preview is intentionally a fast, no-write diagnostic.  It
+            # lists the complete first 50 Google results, then checks the top
+            # 20 editorial candidates for static readable text.  Crawling all
+            # 50 with JS/Crawl4AI fallbacks could hold the button for several
+            # minutes and looked like an unresponsive UI.
+            preview_candidates = eligible[:20]
+            preview_urls = [str(item["url"]) for item in preview_candidates]
+            preview_extract = getattr(self.server.competitor_content_client, "preview_extract_many", None)
+            if callable(preview_extract):
+                batch = preview_extract(preview_urls, max_workers=5, respect_robots=True)
+            else:
+                # Keep injected clients and older integrations compatible.
+                batch = self.server.competitor_content_client.extract_many(preview_urls, max_workers=5, respect_robots=True)
+            items: list[dict[str, Any]] = []
+            for item in results:
+                reason = competitor_candidate_exclusion_reason(item, own_domain)
+                value = {"rank": item["rank"], "title": item["title"], "url": item["url"], "domain": item["domain"]}
+                if reason:
+                    value.update({"status": "skipped", "reason": reason, "content_chars": 0})
+                elif str(item["url"]) not in batch:
+                    value.update({"status": "skipped", "reason": "未纳入本次快速测试（只检测前 20 条可学习候选）；正式采集会按完整策略继续筛选。", "content_chars": 0})
+                else:
+                    extracted = batch.get(str(item["url"]))
+                    if isinstance(extracted, Mapping):
+                        value.update({"status": "available", "reason": "正文可读取；正式采集后才会入库和参与学习。", "content_chars": len(str(extracted.get("content") or ""))})
+                    else:
+                        value.update({"status": "failed", "reason": str(extracted or "正文提取失败。"), "content_chars": 0})
+                items.append(value)
+            # Preview bodies are intentionally process-local and short-lived:
+            # they are never written to SQLite/PostgreSQL or a learning table.
+            # Reusing them for the immediately following outline test prevents
+            # the UI from downloading the same five pages a second time.
+            cache = getattr(self.server, "competitor_preview_cache", {})
+            cache[(project_id, asset_id)] = {
+                "created_at": time.monotonic(),
+                "pages": {
+                    url: {
+                        "title": str(page.get("title") or ""),
+                        "content": str(page.get("content") or ""),
+                        "domain": str(page.get("domain") or ""),
+                    }
+                    for url, page in batch.items()
+                    if isinstance(page, Mapping) and str(page.get("content") or "").strip()
+                },
+            }
+            self.server.competitor_preview_cache = cache
+        except (sqlite3.Error, ValueError, SerperSearchProtocolError, CompetitorContentProtocolError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)}); return
+        available = sum(1 for item in items if item["status"] == "available")
+        self._json(HTTPStatus.OK, {"query": query, "discovered_count": len(items), "available_count": available, "recommended_learning_count": min(5, available), "items": items})
+
+    def _preview_competitor_outline_api(self, asset_id: int, payload: Mapping[str, Any]) -> None:
+        """Generate a disposable outline from user-tested sources only."""
+        project_id = self._integer(payload, "project_id")
+        raw_sources = payload.get("sources")
+        if project_id is None or not isinstance(raw_sources, list):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "project_id and tested sources are required."}); return
+        sources = [item for item in raw_sources[:5] if isinstance(item, Mapping) and isinstance(item.get("url"), str) and str(item.get("url")).startswith(("http://", "https://"))]
+        if not sources:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "请先完成测试采集，并至少选择一篇可读取文章。"}); return
+        try:
+            with self._database() as connection:
+                asset = self._content_asset(connection, project_id, asset_id)
+            urls = [str(item["url"]) for item in sources]
+            cached_preview = getattr(self.server, "competitor_preview_cache", {}).get((project_id, asset_id), {})
+            cached_pages = cached_preview.get("pages", {}) if isinstance(cached_preview, Mapping) and time.monotonic() - float(cached_preview.get("created_at") or 0) <= 600 else {}
+            missing_urls = [url for url in urls if not isinstance(cached_pages.get(url), Mapping)]
+            preview_extract = getattr(self.server.competitor_content_client, "preview_extract_many", None)
+            if missing_urls:
+                batch = preview_extract(missing_urls, max_workers=5, respect_robots=True) if callable(preview_extract) else self.server.competitor_content_client.extract_many(missing_urls, max_workers=5, respect_robots=True)
+            else:
+                batch = {}
+            pages = []
+            for item in sources:
+                url = str(item["url"])
+                page = cached_pages.get(url) if isinstance(cached_pages.get(url), Mapping) else batch.get(url)
+                if not isinstance(page, Mapping):
+                    continue
+                pages.append({"url": item["url"], "search_query": asset["title_snapshot"], "search_title": item.get("title", ""), "page_title": page.get("title", ""), "domain": page.get("domain", item.get("domain", "")), "content_excerpt": str(page.get("content", ""))[:5000]})
+            if not pages:
+                raise CompetitorContentProtocolError("测试来源无法再次读取正文，无法生成测试大纲。")
+            generator, _provider, _model = self._content_generator({"provider": "deepseek"})
+            if generator is None:
+                raise ValueError("Selected content provider is not configured.")
+            data = {"target_keyword": asset["keyword"], "selected_title": asset["title_snapshot"], "locale": asset["locale"], "pages": pages}
+            raw = generator.run_stage(stage="competitor_analysis", data=data) if callable(getattr(generator, "run_stage", None)) else generator.generate(stage="competitor_analysis", **data)
+            analysis = json.loads(raw) if isinstance(raw, str) else raw
+            if not isinstance(analysis, Mapping) or not isinstance(analysis.get("dynamic_outline"), list):
+                raise ContentGenerationProtocolError("AI returned no usable test outline.")
+        except (sqlite3.Error, ValueError, CompetitorContentProtocolError, ContentGenerationProtocolError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)}); return
+        self._json(HTTPStatus.OK, {"source_count": len(pages), "analysis": analysis, "persisted": False})
+
+    def _preview_content_api(self, asset_id: int, payload: Mapping[str, Any]) -> None:
+        """Generate one disposable H2 sample from already learned competitor sources."""
+        project_id = self._integer(payload, "project_id")
+        if project_id is None:
+            return
+        try:
+            with self._database() as connection:
+                asset = self._content_asset(connection, project_id, asset_id)
+                sources, analysis = self._research_sources(connection, asset_id)
+                if not sources or not isinstance(analysis, Mapping):
+                    raise CompetitorContentProtocolError("请先完成同行采集与学习，再测试内容。")
+                raw_outline = analysis.get("dynamic_outline")
+                if not isinstance(raw_outline, list):
+                    raise ContentGenerationProtocolError("同行学习没有返回可用于测试的文章大纲。")
+                first_section = next((item for item in raw_outline if isinstance(item, Mapping) and str(item.get("heading") or "").strip()), None)
+                if first_section is None:
+                    raise ContentGenerationProtocolError("同行学习没有返回可用于测试的文章章节。")
+                generator, provider, model = self._content_generator(payload)
+                if generator is None:
+                    raise ValueError("Selected content provider is not configured.")
+                section = dict(first_section)
+                section["id"] = "test-section-1"
+                section["position"] = 1
+                section["source_ids"] = [str(source["source_id"]) for source in sources[:5]]
+                section["internal_link_plan"] = {"use": False}
+                compact_sources = [{**source, "content": str(source.get("content") or "")[:6_000]} for source in sources[:5]]
+                chapter_plan = {
+                    "chapter_goal": str(section.get("purpose") or section.get("reader_question") or "Give the reader a practical, evidence-bounded answer."),
+                    "subtopics": [{"heading": str(section.get("heading")), "reader_question": str(section.get("reader_question") or "What does the reader need to know?"), "key_points": section.get("key_points") or []}],
+                    "internal_link_plan": {"use": False},
+                    "product_recommendation": {"use": False},
+                }
+                data = {
+                    "topic": asset["title_snapshot"],
+                    "title": asset["title_snapshot"],
+                    "audience": self._optional_text(payload, "target_audience") or "US searchers evaluating this topic",
+                    "intent": {},
+                    "project_context": {},
+                    "writing_policy": {},
+                    "angle": "",
+                    "section": section,
+                    "chapter_plan": chapter_plan,
+                    "competitor_learning": analysis,
+                    "learning_memories": self._select_content_learning_memories(connection, asset),
+                    "sources": compact_sources,
+                    "voice": self._optional_text(payload, "voice") or "clear, helpful American English",
+                    "language": asset["locale"],
+                    "reader_markdown_policy": "Output portable Markdown only. This is an unsaved H2 preview. Do not output internal source IDs, research labels, citations, or Markdown links.",
+                }
+                raw = generator.run_stage(stage="section", data=data) if callable(getattr(generator, "run_stage", None)) else generator.generate(stage="section", **data)
+                result = json.loads(raw) if isinstance(raw, str) else raw
+                if not isinstance(result, Mapping) or not isinstance(result.get("markdown"), str) or not result["markdown"].strip():
+                    raise ContentGenerationProtocolError("AI returned no usable test content.")
+        except (sqlite3.Error, ValueError, CompetitorContentProtocolError, ContentGenerationProtocolError, json.JSONDecodeError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        self._json(HTTPStatus.OK, {
+            "heading": str(section.get("heading") or "测试章节"),
+            "markdown": self._sanitize_reader_markdown(str(result["markdown"])),
+            "source_count": len(compact_sources),
+            "provider": provider,
+            "model": model,
+            "persisted": False,
+        })
+
+    def _restart_content_asset(self, asset_id: int, payload: Mapping[str, Any]) -> None:
+        """Clear only the current title's production pointers before a fresh Agent run.
+
+        Old versions, source snapshots and job/step audit rows stay in the database;
+        the reset merely removes them from the active production path.
+        """
+        project_id = self._integer(payload, "project_id")
+        if project_id is None:
+            return
+        if payload.get("confirm_reset") is not True:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "confirm_reset=true is required before restarting content production."})
+            return
+        try:
+            with self._database() as connection:
+                self._content_asset(connection, project_id, asset_id)
+                with connection:
+                    connection.execute(
+                        "UPDATE agent_steps SET status='cancelled',completed_at=CURRENT_TIMESTAMP,error_summary=COALESCE(error_summary,'Cancelled because this title was restarted.') WHERE job_id IN (SELECT id FROM agent_jobs WHERE project_id=? AND content_asset_id=? AND status IN ('queued','planning','running','retrying','waiting_approval','waiting_input')) AND status IN ('queued','running')",
+                        (project_id, asset_id),
+                    )
+                    connection.execute(
+                        "UPDATE agent_jobs SET status='cancelled',current_node='cancelled',error_summary=COALESCE(error_summary,'Cancelled because this title was restarted.'),completed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE project_id=? AND content_asset_id=? AND status IN ('queued','planning','running','retrying','waiting_approval','waiting_input')",
+                        (project_id, asset_id),
+                    )
+                    connection.execute(
+                        "UPDATE content_generation_jobs SET status='failed',failed_stage='restarted',error_summary=COALESCE(error_summary,'Superseded by a fresh content Agent run.'),completed_at=CURRENT_TIMESTAMP WHERE project_id=? AND content_asset_id=? AND status='running'",
+                        (project_id, asset_id),
+                    )
+                    connection.execute("UPDATE content_briefs SET status='superseded' WHERE content_asset_id=? AND status IN ('current','pending_approval')", (asset_id,))
+                    connection.execute("UPDATE content_outlines SET status='superseded' WHERE content_asset_id=? AND status IN ('current','pending_approval','approved')", (asset_id,))
+                    connection.execute("UPDATE content_drafts SET status='superseded' WHERE project_id=? AND content_asset_id=? AND status IN ('draft','current','approved')", (project_id, asset_id))
+                    connection.execute("UPDATE competitor_research_runs SET status=CASE WHEN status='running' THEN 'failed' ELSE 'insufficient' END,error_summary=COALESCE(error_summary,'Superseded by a fresh content Agent run.'),completed_at=COALESCE(completed_at,CURRENT_TIMESTAMP) WHERE project_id=? AND content_asset_id=? AND status IN ('running','completed','insufficient')", (project_id, asset_id))
+                    connection.execute("UPDATE content_assets SET status='planned',current_brief_id=NULL,current_outline_id=NULL,current_draft_id=NULL,current_generation_run_id=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=? AND project_id=?", (asset_id, project_id))
+                result = self._content_asset_detail(connection, project_id, asset_id)
+        except (sqlite3.Error, ValueError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        self._json(HTTPStatus.OK, result)
+
     def _run_competitor_research(self, connection: sqlite3.Connection, asset: sqlite3.Row, generator: Any, provider: str, model: str | None) -> dict[str, Any]:
         """Capture one to five accessible competitors and persist website/project memory."""
-        queries = competitor_search_queries(str(asset["title_snapshot"]), str(asset["keyword"] or ""))
-        if not queries:
+        google_query = " ".join(str(asset["title_snapshot"] or "").split())
+        if not google_query:
             raise ValueError("a selected title is required for competitor research")
-        google_query = queries[0]
+        # Google research intentionally follows the exact approved title.
+        # If the title produces a product-heavy SERP, the UI offers a title
+        # recovery flow instead of silently broadening or changing the query.
+        queries = [google_query]
         with connection:
             cursor = connection.execute(
                 "INSERT INTO competitor_research_runs(project_id,content_asset_id,query,locale,provider,model) VALUES(?,?,?,?,?,?)",
                 (asset["project_id"], asset["id"], f"Serper.dev · Google API: {' → '.join(queries)}", asset["locale"], provider, model),
             )
             run_id = int(cursor.lastrowid)
-            connection.execute("UPDATE competitor_research_runs SET query=? WHERE id=?", (f"Serper.dev Google API: {google_query}", run_id))
+            connection.execute("UPDATE competitor_research_runs SET query=? WHERE id=?", (f"Serper.dev · Google API: {' → '.join(queries)}", run_id))
         try:
-            # Query one preserves the user-approved full title. Query two is a
-            # compact, informational form derived only from title/keyword terms
-            # (for example, "... waterproof IP rating"). Combining two first
-            # result pages avoids shopping-heavy SERPs without accepting retail
-            # pages as article evidence.
+            # The user-approved title is the only Google query.  A shopping-
+            # heavy SERP is reported to the user rather than being silently
+            # broadened with keyword or intent variants.
             results: list[dict[str, Any]] = []
             seen_urls: set[str] = set()
             search_errors: list[str] = []
@@ -616,23 +1057,55 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 if serper_key is None:
                     raise CompetitorContentProtocolError("Serper.dev · Google Search API is not configured. Save the Serper API key in AI & integrations before competitor research.")
                 search_client = SerperSearchClient(serper_key)
-            try:
-                found = search_client.search(query=google_query, locale=asset["locale"], max_results=30)
-            except SerperSearchProtocolError as error:
-                search_errors.append(f"{google_query}: {error}")
-                found = []
-            for item in found:
-                url = str(item.get("url") or "")
-                normalized = url.split("#", 1)[0].rstrip("/").casefold()
-                if not normalized or normalized in seen_urls:
-                    continue
-                seen_urls.add(normalized)
-                result = dict(item)
-                result["rank"] = len(results) + 1
-                result["search_query"] = google_query
-                results.append(result)
-                if len(results) >= 30:
-                    break
+            # One approved title equals one Google query.  Search intent is
+            # therefore auditable and never silently broadened by the system.
+            for query in queries:
+                # Serper returns a page of organic results.  Keep the query
+                # identical and continue past a social-heavy first page.
+                # Only the best enterprise editorial candidates are fetched.
+                for page_number in range(1, 6):
+                    if len(results) >= 50:
+                        break
+                    try:
+                        try:
+                            found = search_client.search(
+                                query=query,
+                                locale=asset["locale"],
+                                max_results=min(10, 50 - len(results)),
+                                page=page_number,
+                            )
+                        except TypeError:
+                            # Existing injected test/legacy adapters can still
+                            # serve the first page; production Serper supports
+                            # the explicit page parameter above.
+                            if page_number != 1:
+                                break
+                            found = search_client.search(
+                                query=query,
+                                locale=asset["locale"],
+                                max_results=min(10, 50 - len(results)),
+                            )
+                    except SerperSearchProtocolError as error:
+                        search_errors.append(f"{query} (page {page_number}): {error}")
+                        break
+                    if not found:
+                        break
+                    added_on_page = 0
+                    for item in found:
+                        url = str(item.get("url") or "")
+                        normalized = normalize_competitor_url(url)
+                        if not normalized or normalized in seen_urls:
+                            continue
+                        seen_urls.add(normalized)
+                        result = dict(item)
+                        result["rank"] = len(results) + 1
+                        result["search_query"] = query
+                        results.append(result)
+                        added_on_page += 1
+                        if len(results) >= 50:
+                            break
+                    if added_on_page == 0:
+                        break
             if not results:
                 message = "Serper.dev · Google Search API returned no readable organic results for the selected title. " + " | ".join(search_errors)
                 with connection:
@@ -656,10 +1129,11 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                     collection_status="excluded" if reason else "queued",
                     reason=reason or "",
                 )
-            # Search covers Google's first two pages.  We probe all returned
-            # organic candidates, but retain only the first five usable
-            # articles.  Limiting the probe to page one caused legitimate
-            # tasks to stop at two sources even when page two had articles.
+            # Serper returns the first 20 Google organic results for the
+            # selected title.  Every eligible result is fetched and stored;
+            # the final AI outline receives a bounded evidence pack so the
+            # model has enough room to analyse the articles rather than
+            # truncating all of their bodies.
             def editorial_candidates(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 candidates: list[dict[str, Any]] = []
                 for item in items:
@@ -682,14 +1156,45 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             # from the project-local catalog.  This makes the catalog the
             # single source of truth for later collection/retry work rather
             # than relying on transient search-response objects.
-            editorial_candidates(results)
-            candidates = self._queued_competitor_catalog_candidates(
-                connection,
-                asset["project_id"],
-                google_query,
-            )
-            batch = self.server.competitor_content_client.extract_many([str(item["url"]) for item in candidates], max_workers=5, respect_robots=True) if callable(getattr(self.server.competitor_content_client, "extract_many", None)) else {}
+            enterprise_path_markers = ("/blog", "/learn", "/resource", "/guide", "/insight", "/news", "/knowledge")
+            eligible_results = sorted(
+                editorial_candidates(results),
+                key=lambda item: (0 if any(marker in urlsplit(str(item.get("url") or "")).path.casefold() for marker in enterprise_path_markers) else 1, int(item.get("rank") or 0)),
+            )[:15]
+            # A research retry must reuse a previously collected article when
+            # it appears in the same title's SERP.  Previously this method
+            # fetched only catalog rows still marked ``queued``; a successful
+            # prior collection was therefore omitted from the new learning
+            # pack and could incorrectly make a retry look like zero sources.
+            candidates: list[dict[str, Any]] = []
             extracted_pages: list[tuple[Mapping[str, Any], Mapping[str, Any], int]] = []
+            reused_memory_ids: set[int] = set()
+            for result in eligible_results:
+                normalized = normalize_competitor_url(str(result.get("url") or ""))
+                existing = connection.execute(
+                    """SELECT catalog.collection_status,memory.id,memory.url,memory.domain,memory.page_title,memory.content
+                       FROM competitor_url_catalog catalog
+                       JOIN competitor_content_memory memory ON memory.id=catalog.memory_id
+                       WHERE catalog.project_id=? AND catalog.normalized_url=?
+                         AND catalog.collection_status='collected'""",
+                    (asset["project_id"], normalized),
+                ).fetchone() if normalized else None
+                if existing is not None and str(existing["content"] or "").strip():
+                    memory_id = int(existing["id"])
+                    if memory_id not in reused_memory_ids:
+                        reused_memory_ids.add(memory_id)
+                        extracted_pages.append((
+                            result,
+                            {
+                                "title": str(existing["page_title"] or result["title"]),
+                                "content": str(existing["content"]),
+                                "domain": str(existing["domain"] or result["domain"]),
+                            },
+                            memory_id,
+                        ))
+                    continue
+                candidates.append(result)
+            batch = self.server.competitor_content_client.extract_many([str(item["url"]) for item in candidates], max_workers=5, respect_robots=True) if callable(getattr(self.server.competitor_content_client, "extract_many", None)) else {}
             for result in candidates:
                 try:
                     fetched = batch.get(str(result["url"])) if batch else None
@@ -752,13 +1257,18 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                                     "INSERT INTO competitor_research_items(research_run_id,rank,search_title,url,domain,status,error_summary) VALUES(?,?,?,?,?, 'failed',?)",
                                     (run_id, result["rank"], result["title"], result["url"], result["domain"], str(error)),
                                 )
+            # Screen a broader bounded pool so a result page with several
+            # good articles is not reduced to one source merely because one
+            # of the first five candidates is unavailable or off-topic.  The
+            # final learning pack remains capped at five sources.
+            screened_pages = extracted_pages[:10]
             relevance_data = {
                 "target_keyword": asset["keyword"],
                 "selected_title": asset["title_snapshot"],
                 "locale": asset["locale"],
                 "pages": [
-                    {"url": result["url"], "search_query": result.get("search_query", ""), "search_title": result["title"], "page_title": page.get("title", ""), "domain": page.get("domain", result["domain"]), "content_excerpt": str(page.get("content", ""))[:6000]}
-                    for result, page, _memory_id in extracted_pages[:5]
+                    {"url": result["url"], "search_query": result.get("search_query", ""), "search_title": result["title"], "page_title": page.get("title", ""), "domain": page.get("domain", result["domain"]), "content_excerpt": str(page.get("content", ""))[:3000]}
+                    for result, page, _memory_id in screened_pages
                 ],
             }
             if not relevance_data["pages"]:
@@ -778,7 +1288,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 if isinstance(item, Mapping) and item.get("decision") in {"accept", "reject"} and isinstance(item.get("url"), str)
             }
             product_like_rejections = 0
-            for result, page, memory_id in extracted_pages[:5]:
+            for result, page, memory_id in screened_pages:
                 decision = decisions.get(str(result["url"]))
                 accepted = bool(decision and decision.get("decision") == "accept")
                 reason = str(decision.get("reason") or "Did not match the selected title and search intent.") if decision else "No relevance decision returned for this page."
@@ -806,6 +1316,13 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                         connection.execute(
                             "INSERT INTO competitor_research_items(research_run_id,rank,search_title,url,domain,status,error_summary) VALUES(?,?,?,?,?, 'skipped',?)",
                             (run_id, result["rank"], result["title"], result["url"], result["domain"], reason),
+                        )
+                    continue
+                if len(selected) >= 5:
+                    with connection:
+                        connection.execute(
+                            "INSERT INTO competitor_research_items(research_run_id,rank,search_title,url,domain,status,error_summary) VALUES(?,?,?,?,?, 'skipped',?)",
+                            (run_id, result["rank"], result["title"], result["url"], result["domain"], "Five complementary competitor articles have already been selected for this learning run."),
                         )
                     continue
                 with connection:
@@ -901,22 +1418,15 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         return has_power_tradeoff and has_fixture_context and has_editorial_shape
 
     def _upsert_competitor_memory(self, connection: sqlite3.Connection, project_id: int, result: Mapping[str, Any], page: Mapping[str, str]) -> int:
-        url = str(result["url"]); normalized = url.split("#", 1)[0].rstrip("/").casefold(); content = str(page["content"])
-        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-        headings = [line for line in content.splitlines() if len(line) < 160][:24]
         with connection:
-            connection.execute(
-                """INSERT INTO competitor_content_memory(project_id,normalized_url,url,domain,page_title,content,content_hash,structure_json)
-                   VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(project_id,normalized_url) DO UPDATE SET
-                   url=excluded.url,domain=excluded.domain,page_title=excluded.page_title,content=excluded.content,content_hash=excluded.content_hash,structure_json=excluded.structure_json,last_captured_at=CURRENT_TIMESTAMP""",
-                (project_id, normalized, url, page["domain"], page["title"], content, digest, json.dumps({"sample_lines": headings}, ensure_ascii=False)),
+            write = self.server.collection_service.persist_content(
+                connection,
+                project_id=project_id,
+                result=result,
+                page=page,
+                chunks=self._content_chunks,
             )
-            row = connection.execute("SELECT id FROM competitor_content_memory WHERE project_id=? AND normalized_url=?", (project_id, normalized)).fetchone()
-            memory_id = int(row[0])
-            connection.execute("DELETE FROM competitor_content_chunks WHERE memory_id=?", (memory_id,))
-            for position, chunk in enumerate(self._content_chunks(content), 1):
-                connection.execute("INSERT INTO competitor_content_chunks(project_id,memory_id,position,content) VALUES(?,?,?,?)", (project_id, memory_id, position, chunk))
-        return memory_id
+        return write.memory_id
 
     @staticmethod
     def _upsert_competitor_url_catalog(
@@ -929,27 +1439,14 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         memory_id: int | None = None,
     ) -> None:
         """Persist every discovered URL; bodies are linked only when allowed."""
-        url = str(result.get("url") or "").strip()
-        normalized = url.split("#", 1)[0].rstrip("/").casefold()
-        if not normalized:
-            return
         with connection:
-            connection.execute(
-                """INSERT INTO competitor_url_catalog(
-                       project_id,normalized_url,url,domain,search_title,collection_status,exclusion_reason,last_rank,last_query,memory_id,last_collected_at
-                   ) VALUES(?,?,?,?,?,?,?,?,?,?,CASE WHEN ?='collected' THEN CURRENT_TIMESTAMP ELSE NULL END)
-                   ON CONFLICT(project_id,normalized_url) DO UPDATE SET
-                       url=excluded.url,domain=excluded.domain,search_title=excluded.search_title,
-                       collection_status=excluded.collection_status,exclusion_reason=excluded.exclusion_reason,
-                       last_rank=excluded.last_rank,last_query=excluded.last_query,
-                       memory_id=COALESCE(excluded.memory_id,competitor_url_catalog.memory_id),
-                       discovered_count=competitor_url_catalog.discovered_count+1,last_seen_at=CURRENT_TIMESTAMP,
-                       last_collected_at=CASE WHEN excluded.collection_status='collected' THEN CURRENT_TIMESTAMP ELSE competitor_url_catalog.last_collected_at END""",
-                (
-                    project_id, normalized, url, str(result.get("domain") or ""), str(result.get("title") or ""),
-                    collection_status, reason[:1200], int(result.get("rank") or 0) or None,
-                    str(result.get("search_query") or ""), memory_id, collection_status,
-                ),
+            CollectionService().register_catalog_result(
+                connection,
+                project_id=project_id,
+                result=result,
+                collection_status=collection_status,
+                reason=reason,
+                memory_id=memory_id,
             )
 
     @staticmethod
@@ -983,7 +1480,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         if "robot" not in message.casefold():
             return
         url = str(result.get("url") or "").strip()
-        normalized = url.split("#", 1)[0].rstrip("/").casefold()
+        normalized = normalize_competitor_url(url)
         if not normalized:
             return
         with connection:
@@ -1006,6 +1503,55 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
 
     def _latest_competitor_research(self, connection: sqlite3.Connection, asset_id: int) -> sqlite3.Row | None:
         return connection.execute("SELECT * FROM competitor_research_runs WHERE content_asset_id=? ORDER BY id DESC LIMIT 1", (asset_id,)).fetchone()
+
+    def _content_competitor_learning_gate(self, connection: sqlite3.Connection, asset: sqlite3.Row) -> dict[str, Any]:
+        """Return the durable prerequisite state for an article's writing stages.
+
+        A research run is considered learned only after it has persisted at least
+        one readable competitor page *and* the model's structural analysis.  The
+        check is deliberately tied to the content asset, rather than to all
+        project memories, so a previous article can never unlock a new title.
+        """
+        research = self._latest_competitor_research(connection, int(asset["id"]))
+        if research is None:
+            return {
+                "collected_count": 0, "analysis_ready": False, "learning_ready": False,
+                "can_generate_outline": False,
+                "blocked_reason": "请先采集并学习同行文章；完成后才能生成文章大纲。",
+            }
+        selected_count = int(connection.execute(
+            "SELECT COUNT(*) AS count FROM competitor_research_items WHERE research_run_id=? AND status='selected'",
+            (research["id"],),
+        ).fetchone()["count"])
+        try:
+            analysis = json.loads(research["analysis_json"] or "{}")
+        except json.JSONDecodeError:
+            analysis = {}
+        analysis_ready = isinstance(analysis, Mapping) and bool(analysis)
+        learning_ready = research["status"] == "completed" and selected_count > 0 and analysis_ready
+        if learning_ready:
+            reason = ""
+        elif research["status"] in {"running"}:
+            reason = "同行文章正在采集和学习，请完成后再生成文章大纲。"
+        elif research["status"] == "insufficient":
+            reason = "本次未采集到可用同行文章；请调整标题或稍后重新采集后再生成大纲。"
+        else:
+            reason = "同行文章尚未完成学习；请先完成采集与分析后再生成文章大纲。"
+        return {
+            "research_run_id": int(research["id"]),
+            "research_status": str(research["status"]),
+            "collected_count": selected_count,
+            "usable_count": int(research["usable_count"] or 0),
+            "analysis_ready": analysis_ready,
+            "learning_ready": learning_ready,
+            "can_generate_outline": learning_ready,
+            "blocked_reason": reason,
+        }
+
+    def _require_content_competitor_learning(self, connection: sqlite3.Connection, asset: sqlite3.Row) -> None:
+        gate = self._content_competitor_learning_gate(connection, asset)
+        if not gate["can_generate_outline"]:
+            raise ValueError(str(gate["blocked_reason"]))
 
     def _competitor_research_payload(self, connection: sqlite3.Connection, run_id: int) -> dict[str, Any]:
         row = connection.execute("SELECT * FROM competitor_research_runs WHERE id=?", (run_id,)).fetchone()
@@ -1059,19 +1605,475 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         if project_id is None:
             return
         try:
+            rows = self.server.collection_repository.list_catalog(project_id)
+        except (sqlite3.Error, ValueError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        self._json(HTTPStatus.OK, rows)
+
+    def _list_collection_plans(self) -> None:
+        project_id = self._query_project_id()
+        if project_id is None:
+            return
+        try:
+            rows = self.server.collection_repository.list_collection_plans(project_id)
+        except (sqlite3.Error, ValueError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        self._json(HTTPStatus.OK, rows)
+
+    def _save_collection_plan(self, payload: Mapping[str, Any]) -> None:
+        project_id = self._integer(payload, "project_id")
+        if project_id is None:
+            return
+        source_type = self._optional_text(payload, "source_type") or "keyword"
+        source_value = self._optional_text(payload, "source_value")
+        if not source_value:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "source_value is required."})
+            return
+        settings = payload.get("settings")
+        if settings is not None and not isinstance(settings, Mapping):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "settings must be an object."})
+            return
+        try:
+            with self._database() as connection, connection:
+                value = self.server.collection_service.save_plan(
+                    connection,
+                    project_id=project_id,
+                    source_type=source_type,
+                    source_value=source_value,
+                    enabled=payload.get("enabled") is not False,
+                    schedule=str(payload.get("schedule") or "manual"),
+                    settings=settings,
+                )
+        except (sqlite3.Error, ValueError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        self._json(HTTPStatus.OK, value)
+
+    def _discover_collection_plan(self, plan_id: int, payload: Mapping[str, Any]) -> None:
+        """Execute a domain or keyword plan into the unified URL catalog."""
+        project_id = self._integer(payload, "project_id")
+        if project_id is None:
+            return
+        try:
+            max_results = min(self._limit(payload, "max_results", 30), 100)
+            locale = self._optional_text(payload, "locale") or "en-US"
+            with self._database() as connection:
+                plan = self.server.collection_service.get_plan(
+                    connection, project_id=project_id, plan_id=plan_id
+                )
+                if plan["status"] != "active":
+                    raise ValueError("collection plan is paused")
+                if plan["source_type"] == "first_party":
+                    raise ValueError("first_party plans use the project website-crawl collector, not competitor discovery")
+                source_value = str(plan["source_value"])
+                if plan["source_type"] == "domain":
+                    parsed = urlparse(source_value if "://" in source_value else f"https://{source_value}")
+                    domain = (parsed.hostname or "").removeprefix("www.")
+                    if not domain:
+                        raise ValueError("domain collection plan has an invalid source_value")
+                    query = f"site:{domain}"
+                else:
+                    query = source_value
+
+            search_client = getattr(self.server, "competitor_search_client", None)
+            if search_client is None:
+                serper_key = _serper_api_key(self.server.ai_settings_path)
+                search_client = SerperSearchClient(serper_key) if serper_key else self.server.competitor_content_client
+            results = search_client.search(query=query, locale=locale, max_results=max_results)
+            queued = excluded = 0
+            with self._database() as connection, connection:
+                # Recheck plan ownership after network I/O before writing.
+                self.server.collection_service.get_plan(connection, project_id=project_id, plan_id=plan_id)
+                own_domain = self._project_domain(connection, project_id)
+                for rank, item in enumerate(results, 1):
+                    result = dict(item)
+                    result["rank"] = int(result.get("rank") or rank)
+                    result["search_query"] = query
+                    reason = competitor_candidate_exclusion_reason(result, own_domain)
+                    self.server.collection_service.register_catalog_result(
+                        connection,
+                        project_id=project_id,
+                        result=result,
+                        collection_status="excluded" if reason else "queued",
+                        reason=reason or "",
+                    )
+                    if reason:
+                        excluded += 1
+                    else:
+                        queued += 1
+                connection.execute(
+                    """UPDATE collection_plans SET discovered_count=discovered_count+?,
+                           last_discovered_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
+                       WHERE id=? AND project_id=?""",
+                    (len(results), plan_id, project_id),
+                )
+        except (sqlite3.Error, ValueError, CompetitorContentProtocolError, SerperSearchProtocolError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        self._json(HTTPStatus.OK, {
+            "plan_id": plan_id,
+            "project_id": project_id,
+            "query": query,
+            "discovered_count": len(results),
+            "queued_count": queued,
+            "excluded_count": excluded,
+        })
+
+    def _list_competitor_catalog_collection_run_items(self, run_id: int) -> None:
+        project_id = self._query_project_id()
+        if project_id is None:
+            return
+        try:
+            with self._database() as connection:
+                rows = self.server.collection_service.list_run_items(
+                    connection, project_id=project_id, run_id=run_id
+                )
+        except (sqlite3.Error, ValueError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        self._json(HTTPStatus.OK, rows)
+
+    def _list_competitor_catalog_collection_runs(self) -> None:
+        project_id = self._query_project_id()
+        if project_id is None:
+            return
+        try:
             with self._database() as connection:
                 self._project_exists(connection, project_id)
                 rows = connection.execute(
-                    """SELECT id,url,domain,search_title,collection_status,exclusion_reason,last_rank,last_query,
-                              memory_id,discovered_count,first_seen_at,last_seen_at,last_collected_at
-                       FROM competitor_url_catalog WHERE project_id=?
-                       ORDER BY last_seen_at DESC,id DESC""",
+                    """SELECT id,project_id,status,total_count,collected_count,unchanged_count,already_collected_count,
+                              robots_blocked_count,failed_count,recovered_count,last_heartbeat_at,
+                              error_summary,started_at,completed_at,created_at,updated_at
+                       FROM competitor_catalog_collection_runs WHERE project_id=?
+                       ORDER BY id DESC LIMIT 20""",
                     (project_id,),
                 ).fetchall()
         except (sqlite3.Error, ValueError) as error:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
             return
         self._json(HTTPStatus.OK, [dict(row) for row in rows])
+
+    def _queue_competitor_catalog_collection(self, payload: Mapping[str, Any]) -> None:
+        """Queue one compliant, URL-checkpointed pass over uncollected pages."""
+        project_id = self._integer(payload, "project_id")
+        if project_id is None:
+            return
+        try:
+            with self._database() as connection, connection:
+                row, candidate_ids = self.server.collection_service.create_catalog_run(
+                    connection, project_id=project_id
+                )
+                run_id = int(row["id"])
+        except (sqlite3.Error, ValueError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        if candidate_ids:
+            self.server.enqueue_background_task("competitor_catalog_collection", project_id, run_id)
+            self._json(HTTPStatus.ACCEPTED, row)
+            return
+        self._json(HTTPStatus.OK, row)
+
+    @staticmethod
+    def _mark_competitor_catalog_entries(
+        connection: sqlite3.Connection,
+        project_id: int,
+        canonical_url: str,
+        *,
+        status: str,
+        memory_id: int | None = None,
+        reason: str = "",
+    ) -> None:
+        """Compatibility wrapper for the unified collection persistence service."""
+        CollectionService.mark_catalog(
+            connection,
+            project_id=project_id,
+            normalized_url=canonical_url,
+            status=status,
+            memory_id=memory_id,
+            reason=reason,
+        )
+
+    def _execute_competitor_catalog_collection(self, run_id: int, payload: Mapping[str, Any]) -> None:
+        project_id = self._integer(payload, "project_id")
+        if project_id is None:
+            return
+        try:
+            with self._database() as connection, connection:
+                claimed = self.server.collection_service.claim_run_items(
+                    connection, project_id=project_id, run_id=run_id
+                )
+                if not claimed:
+                    row = self.server.collection_service.recalculate_run(
+                        connection, project_id=project_id, run_id=run_id, complete_if_idle=True
+                    )
+                    self._json(HTTPStatus.OK, row)
+                    return
+        except (sqlite3.Error, ValueError) as error:
+            self._finish_competitor_catalog_collection_failure(run_id, project_id, error)
+            return
+
+        candidates = [{
+            "item_id": int(row["id"]),
+            "url": str(row["source_url"]),
+            "domain": str(row.get("domain") or ""),
+            "title": str(row.get("search_title") or ""),
+            "rank": int(row.get("last_rank") or 0),
+            "search_query": str(row.get("last_query") or ""),
+        } for row in claimed]
+        try:
+            batch = (
+                self.server.competitor_content_client.extract_many(
+                    [item["url"] for item in candidates], max_workers=5, respect_robots=True
+                )
+                if callable(getattr(self.server.competitor_content_client, "extract_many", None))
+                else {}
+            )
+        except Exception:
+            # A batch-adapter failure falls back to isolated URL requests so
+            # one process-level error cannot erase every item's checkpoint.
+            batch = {}
+        try:
+            for item in candidates:
+                canonical = normalize_competitor_url(item["url"])
+                try:
+                    fetched = batch.get(item["url"]) if batch else None
+                    if isinstance(fetched, Exception):
+                        raise fetched
+                    page = fetched if isinstance(fetched, Mapping) else self._extract_competitor_content(url=item["url"])
+                    if not isinstance(page, Mapping):
+                        raise CompetitorContentProtocolError("Competitor extraction returned no article content.")
+                    with self._database() as connection, connection:
+                        write = self.server.collection_service.persist_content(
+                            connection,
+                            project_id=project_id,
+                            result=item,
+                            page=page,
+                            chunks=self._content_chunks,
+                            extractor=str(page.get("extractor") or "competitor_content_client"),
+                        )
+                        self._mark_competitor_catalog_entries(
+                            connection, project_id, canonical, status="collected", memory_id=write.memory_id
+                        )
+                        self.server.collection_service.finish_item(
+                            connection,
+                            project_id=project_id,
+                            run_id=run_id,
+                            item_id=int(item["item_id"]),
+                            status=write.outcome,
+                            memory_id=write.memory_id,
+                            version_id=write.version_id,
+                            extractor=str(page.get("extractor") or "competitor_content_client"),
+                        )
+                except Exception as error:
+                    blocked = "robot" in str(error).casefold()
+                    with self._database() as connection, connection:
+                        if blocked:
+                            self._archive_robots_blocked_url(connection, project_id, item, error)
+                        self._mark_competitor_catalog_entries(
+                            connection, project_id, canonical,
+                            status="robots_blocked" if blocked else "failed", reason=str(error),
+                        )
+                        self.server.collection_service.finish_item(
+                            connection,
+                            project_id=project_id,
+                            run_id=run_id,
+                            item_id=int(item["item_id"]),
+                            status="robots_blocked" if blocked else "failed",
+                            error_summary=str(error),
+                        )
+            with self._database() as connection, connection:
+                row = self.server.collection_service.recalculate_run(
+                    connection, project_id=project_id, run_id=run_id, complete_if_idle=True
+                )
+        except Exception as error:
+            self._finish_competitor_catalog_collection_failure(run_id, project_id, error)
+            return
+        self._json(HTTPStatus.OK, row)
+
+    def _finish_competitor_catalog_collection_failure(self, run_id: int, project_id: int, error: Exception) -> None:
+        with self._database() as connection, connection:
+            connection.execute(
+                """UPDATE competitor_catalog_collection_runs
+                   SET status='failed',error_summary=?,completed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
+                   WHERE id=? AND project_id=?""",
+                (str(error)[:1200], run_id, project_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM competitor_catalog_collection_runs WHERE id=? AND project_id=?",
+                (run_id, project_id),
+            ).fetchone()
+        self._json(HTTPStatus.OK, dict(row) if row else {"id": run_id, "status": "failed"})
+
+    def _list_competitor_content_learning_runs(self) -> None:
+        project_id = self._query_project_id()
+        if project_id is None:
+            return
+        try:
+            with self._database() as connection:
+                self._project_exists(connection, project_id)
+                rows = connection.execute(
+                    """SELECT id,project_id,status,source_count,processed_count,memories_created_count,
+                              memories_updated_count,memories_rejected_count,
+                              provider,model,error_summary,started_at,completed_at,created_at,updated_at
+                       FROM competitor_content_learning_runs WHERE project_id=? ORDER BY id DESC LIMIT 20""",
+                    (project_id,),
+                ).fetchall()
+        except (sqlite3.Error, ValueError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        self._json(HTTPStatus.OK, [dict(row) for row in rows])
+
+    def _queue_collected_competitor_content_learning(self, payload: Mapping[str, Any]) -> None:
+        """Queue AI strategy extraction from every readable page in this project's collection library."""
+        project_id = self._integer(payload, "project_id")
+        if project_id is None:
+            return
+        provider = self._optional_text(payload, "provider") or "deepseek"
+        model = self._optional_text(payload, "model")
+        if provider not in AI_PROVIDERS:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "provider must be openai, gemini, or deepseek"})
+            return
+        if model is not None and not re.fullmatch(r"[A-Za-z0-9._:/-]{1,128}", model):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "model contains unsupported characters"})
+            return
+        try:
+            with self._database() as connection, connection:
+                self._project_exists(connection, project_id)
+                active = connection.execute(
+                    "SELECT 1 FROM competitor_content_learning_runs WHERE project_id=? AND status IN ('queued','running')",
+                    (project_id,),
+                ).fetchone()
+                if active is not None:
+                    raise ValueError("a collected-content learning run is already queued or running for this project")
+                rows = connection.execute(
+                    "SELECT id,url,content_hash FROM competitor_content_memory WHERE project_id=? AND trim(content)<>'' ORDER BY id ASC",
+                    (project_id,),
+                ).fetchall()
+                candidate_ids: list[int] = []
+                seen: set[str] = set()
+                for row in rows:
+                    canonical = normalize_competitor_url(str(row["url"]))
+                    content_hash = str(row["content_hash"] or "")
+                    key = canonical or content_hash
+                    if not key or key in seen:
+                        continue
+                    seen.add(key)
+                    candidate_ids.append(int(row["id"]))
+                status = "queued" if candidate_ids else "completed"
+                cursor = connection.execute(
+                    """INSERT INTO competitor_content_learning_runs(
+                           project_id,status,candidate_memory_ids_json,source_count,provider,model,completed_at
+                       ) VALUES(?,?,?,?,?,?,CASE WHEN ?='completed' THEN CURRENT_TIMESTAMP ELSE NULL END)""",
+                    (project_id, status, json.dumps(candidate_ids), len(candidate_ids), provider, model, status),
+                )
+                run_id = int(cursor.lastrowid)
+                row = connection.execute("SELECT * FROM competitor_content_learning_runs WHERE id=?", (run_id,)).fetchone()
+        except (sqlite3.Error, ValueError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        if candidate_ids:
+            self.server.enqueue_background_task("collected_competitor_learning", project_id, run_id)
+            self._json(HTTPStatus.ACCEPTED, dict(row))
+            return
+        self._json(HTTPStatus.OK, dict(row))
+
+    def _execute_collected_competitor_content_learning(self, run_id: int, payload: Mapping[str, Any]) -> None:
+        project_id = self._integer(payload, "project_id")
+        if project_id is None:
+            return
+        try:
+            with self._database() as connection, connection:
+                self._project_exists(connection, project_id)
+                run = connection.execute(
+                    "SELECT * FROM competitor_content_learning_runs WHERE id=? AND project_id=?", (run_id, project_id)
+                ).fetchone()
+                if run is None:
+                    raise ValueError("collected-content learning run does not exist in this project")
+                if run["status"] != "queued":
+                    self._json(HTTPStatus.OK, dict(run))
+                    return
+                candidate_ids = json.loads(run["candidate_memory_ids_json"] or "[]")
+                if not isinstance(candidate_ids, list) or not all(isinstance(item, int) for item in candidate_ids):
+                    raise ValueError("collected-content learning run has invalid candidates")
+                connection.execute(
+                    "UPDATE competitor_content_learning_runs SET status='running',started_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                    (run_id,),
+                )
+                placeholders = ",".join("?" for _ in candidate_ids)
+                rows = connection.execute(
+                    f"SELECT id,url,domain,page_title,content,content_hash FROM competitor_content_memory WHERE project_id=? AND id IN ({placeholders}) ORDER BY id ASC",
+                    (project_id, *candidate_ids),
+                ).fetchall() if candidate_ids else []
+        except (sqlite3.Error, ValueError, json.JSONDecodeError) as error:
+            self._finish_collected_competitor_content_learning_failure(run_id, project_id, error)
+            return
+
+        try:
+            generator, provider, model = self._content_generator({"provider": str(run["provider"]), "model": run["model"]})
+            if generator is None:
+                raise ValueError(f"{self._content_provider_label(str(run['provider']))} must be configured before AI learning can run")
+            processed = created = updated = rejected = 0
+            for start in range(0, len(rows), 6):
+                batch = rows[start:start + 6]
+                sources = [
+                    {
+                        "source_id": f"competitor-memory-{item['id']}", "title": str(item["page_title"]),
+                        "url": str(item["url"]), "domain": str(item["domain"]),
+                        "content_excerpt": re.sub(r"\s+", " ", str(item["content"]))[:3600],
+                    }
+                    for item in batch
+                ]
+                if callable(getattr(generator, "run_stage", None)):
+                    raw_cards = generator.run_stage(stage="competitor_memory_synthesis", data={"source_documents": sources, "policy": "learn_structure_and_method_only_no_competitor_prose"})
+                elif callable(getattr(generator, "generate", None)):
+                    raw_cards = generator.generate(stage="competitor_memory_synthesis", source_documents=sources, policy="learn_structure_and_method_only_no_competitor_prose")
+                else:
+                    raise ContentGenerationProtocolError("configured content generator has no supported stage method")
+                result = json.loads(raw_cards) if isinstance(raw_cards, str) else raw_cards
+                cards = result.get("memory_cards", []) if isinstance(result, Mapping) else []
+                if not isinstance(cards, list):
+                    raise ContentGenerationProtocolError("AI content competitor_memory_synthesis returned invalid memory cards")
+                with self._database() as connection, connection:
+                    valid_cards = [card for card in cards if isinstance(card, Mapping)]
+                    learned = MemoryLearningService(connection, project_id=project_id).save_competitor_cards(
+                        valid_cards,
+                        source_documents=sources,
+                        learning_run_id=run_id,
+                    )
+                    created += learned.created_count
+                    updated += learned.updated_count
+                    rejected += learned.rejected_count + (len(cards) - len(valid_cards))
+                    processed += len(batch)
+                    connection.execute(
+                        """UPDATE competitor_content_learning_runs
+                           SET processed_count=?,memories_created_count=?,memories_updated_count=?,
+                               memories_rejected_count=?,provider=?,model=?,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                        (processed, created, updated, rejected, provider, model, run_id),
+                    )
+            with self._database() as connection, connection:
+                connection.execute(
+                    """UPDATE competitor_content_learning_runs
+                       SET status='completed',processed_count=?,memories_created_count=?,memories_updated_count=?,
+                           memories_rejected_count=?,provider=?,model=?,completed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                    (processed, created, updated, rejected, provider, model, run_id),
+                )
+                row = connection.execute("SELECT * FROM competitor_content_learning_runs WHERE id=?", (run_id,)).fetchone()
+        except Exception as error:
+            self._finish_collected_competitor_content_learning_failure(run_id, project_id, error)
+            return
+        self._json(HTTPStatus.OK, dict(row))
+
+    def _finish_collected_competitor_content_learning_failure(self, run_id: int, project_id: int, error: Exception) -> None:
+        with self._database() as connection, connection:
+            connection.execute(
+                """UPDATE competitor_content_learning_runs SET status='failed',error_summary=?,completed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
+                   WHERE id=? AND project_id=?""",
+                (str(error)[:1200], run_id, project_id),
+            )
+            row = connection.execute("SELECT * FROM competitor_content_learning_runs WHERE id=?", (run_id,)).fetchone()
+        self._json(HTTPStatus.OK, dict(row) if row else {"id": run_id, "status": "failed"})
 
     def _get_competitor_learning(self, project_id: int, *, include_runs: bool) -> None:
         try:
@@ -1121,7 +2123,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                        VALUES(?,?,?,?,?,?,CASE WHEN ? THEN CURRENT_TIMESTAMP ELSE NULL END)
                        ON CONFLICT(project_id) DO UPDATE SET topics_json=excluded.topics_json,interval_days=excluded.interval_days,
                          enabled=excluded.enabled,provider=excluded.provider,model=excluded.model,
-                         next_run_at=CASE WHEN excluded.enabled=0 THEN NULL WHEN competitor_learning_schedules.enabled=0 THEN CURRENT_TIMESTAMP ELSE competitor_learning_schedules.next_run_at END,
+                         next_run_at=CASE WHEN excluded.enabled=0 THEN NULL WHEN competitor_learning_schedules.enabled=0 THEN CAST(CURRENT_TIMESTAMP AS TEXT) ELSE competitor_learning_schedules.next_run_at END,
                          updated_at=CURRENT_TIMESTAMP""",
                     (project_id, json.dumps(topics, ensure_ascii=False), interval, int(enabled), provider, model, int(enabled)),
                 )
@@ -1153,7 +2155,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 row = connection.execute("SELECT * FROM competitor_learning_runs WHERE id=?", (run_id,)).fetchone()
         except (sqlite3.Error, ValueError, json.JSONDecodeError) as error:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)}); return
-        threading.Thread(target=_dispatch_competitor_learning_run, args=(self.server, project_id, run_id), daemon=True, name=f"competitor-learning-{run_id}").start()
+        self.server.enqueue_background_task("competitor_learning", project_id, run_id)
         self._json(HTTPStatus.ACCEPTED, dict(row))
 
     def _execute_competitor_learning_run(self, project_id: int, run_id: int) -> None:
@@ -1262,7 +2264,11 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         project_id = self._integer(payload, "project_id")
         if project_id is None: return
         with self._database() as connection:
-            cursor = connection.execute("DELETE FROM authority_source_library WHERE id=? AND project_id=?", (source_id, project_id))
+            # The PostgreSQL runtime commits only inside the connection context.
+            # Without this block DELETE returned 200 but was rolled back when the
+            # request connection closed, so the source reappeared after refresh.
+            with connection:
+                cursor = connection.execute("DELETE FROM authority_source_library WHERE id=? AND project_id=?", (source_id, project_id))
         if cursor.rowcount != 1:
             self._json(HTTPStatus.NOT_FOUND, {"error": "authority source does not exist in this website."}); return
         self._json(HTTPStatus.OK, {"deleted": 1})
@@ -2003,8 +3009,8 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
 
     def _get_gsc_settings(self) -> None:
         settings = _gsc_settings(self.server.ai_settings_path)
-        with self._database() as connection:
-            connection = connection.execute("SELECT account_email FROM gsc_oauth_connection WHERE id=1").fetchone()
+        with self._credential_database() as connection:
+            connection = connection.execute("SELECT account_email FROM gsc_oauth_credentials WHERE id=1").fetchone()
         self._json(HTTPStatus.OK, {"configured": bool(settings["client_id"] and settings["client_secret"]), "client_id": settings["client_id"], "client_secret_configured": bool(settings["client_secret"]), "connected": connection is not None, "account_email": str(connection["account_email"]) if connection else "", "redirect_uri": self._gsc_redirect_uri()})
 
     def _save_gsc_settings(self, payload: Mapping[str, Any]) -> None:
@@ -2049,8 +3055,8 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             email = ""
             profile = requests.get("https://www.googleapis.com/oauth2/v2/userinfo", headers={"Authorization": f"Bearer {token.get('access_token', '')}"}, timeout=20)
             if profile.ok: email = str(profile.json().get("email") or "")
-            with self._database() as connection, connection:
-                connection.execute("INSERT INTO gsc_oauth_connection(id,account_email,refresh_token,scopes) VALUES(1,?,?,?) ON CONFLICT(id) DO UPDATE SET account_email=excluded.account_email,refresh_token=excluded.refresh_token,scopes=excluded.scopes,updated_at=CURRENT_TIMESTAMP", (email, self._protect_gsc_token(refresh_token), "webmasters.readonly userinfo.email"))
+            with self._credential_database() as connection, connection:
+                connection.execute("INSERT INTO gsc_oauth_credentials(id,account_email,refresh_token,scopes) VALUES(1,?,?,?) ON CONFLICT(id) DO UPDATE SET account_email=excluded.account_email,refresh_token=excluded.refresh_token,scopes=excluded.scopes,updated_at=CURRENT_TIMESTAMP", (email, self._protect_gsc_token(refresh_token), "webmasters.readonly userinfo.email"))
         except Exception as exception:
             self._serve_gsc_callback_page(project_id, f"Google token exchange failed: {str(exception)[:180]}"); return
         self._serve_gsc_callback_page(project_id, "Google Search Console connected. You can now select a property and sync rankings.", success=True)
@@ -2063,7 +3069,9 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
 
     def _get_gsc_project(self, project_id: int) -> None:
         with self._database() as connection:
-            project = connection.execute("SELECT id,name,site_url FROM projects WHERE id=?", (project_id,)).fetchone(); selected = connection.execute("SELECT property_url FROM project_gsc_properties WHERE project_id=?", (project_id,)).fetchone(); account = connection.execute("SELECT account_email FROM gsc_oauth_connection WHERE id=1").fetchone()
+            project = connection.execute("SELECT id,name,site_url FROM projects WHERE id=?", (project_id,)).fetchone(); selected = connection.execute("SELECT property_url FROM project_gsc_properties WHERE project_id=?", (project_id,)).fetchone()
+        with self._credential_database() as credential_connection:
+            account = credential_connection.execute("SELECT account_email FROM gsc_oauth_credentials WHERE id=1").fetchone()
         if project is None: self._json(HTTPStatus.NOT_FOUND, {"error": "project does not exist"}); return
         properties: list[str] = []; warning = ""
         if account:
@@ -2100,129 +3108,9 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             rows = connection.execute("SELECT query,page_url,clicks,impressions,ctr,position,collected_at FROM project_gsc_query_rows WHERE project_id=? ORDER BY clicks DESC,impressions DESC,position ASC LIMIT 80", (project_id,)).fetchall()
         self._json(HTTPStatus.OK, {"anchors": [dict(row) for row in rows], "days": days, "synced": synced, "capture": dict(capture) if capture else None})
 
-    @staticmethod
-    def _normalise_gsc_page_url(value: str) -> str:
-        """Compare published and GSC page URLs without treating tracking params as pages."""
-        parsed = urlsplit(value.strip())
-        if not parsed.scheme or not parsed.netloc:
-            return value.strip().rstrip("/")
-        path = parsed.path.rstrip("/") or "/"
-        return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}{path}"
-
     def _learn_from_published_gsc_content(self, project_id: int, payload: Mapping[str, Any]) -> None:
-        """Turn repeated, real published-page GSC observations into guarded memories.
-
-        A single export is an observation, never an editorial rule.  A
-        performance memory becomes active only after another observation at
-        least seven days later and enough query/impression evidence exists.
-        This avoids pretending that short-term GSC movement proves causality.
-        """
-        window_days = max(7, min(365, self._integer(payload, "days") or 7))
-        try:
-            with self._database() as connection, connection:
-                self._project_exists(connection, project_id)
-                publications = connection.execute(
-                    """SELECT publications.*,assets.title_snapshot,keywords.keyword,assets.current_draft_id
-                       FROM content_wordpress_publications publications
-                       JOIN content_assets assets ON assets.id=publications.content_asset_id
-                       JOIN keywords ON keywords.id=assets.keyword_id
-                       WHERE publications.project_id=? AND publications.status='publish'
-                         AND publications.wordpress_url IS NOT NULL AND assets.deleted_at IS NULL
-                       ORDER BY publications.id DESC""",
-                    (project_id,),
-                ).fetchall()
-                latest_by_asset: dict[int, sqlite3.Row] = {}
-                for publication in publications:
-                    latest_by_asset.setdefault(int(publication["content_asset_id"]), publication)
-                gsc_rows = connection.execute(
-                    "SELECT query,page_url,clicks,impressions,ctr,position FROM project_gsc_query_rows WHERE project_id=?",
-                    (project_id,),
-                ).fetchall()
-                rows_by_url: dict[str, list[sqlite3.Row]] = {}
-                for row in gsc_rows:
-                    rows_by_url.setdefault(self._normalise_gsc_page_url(str(row["page_url"])), []).append(row)
-                snapshots: list[dict[str, Any]] = []
-                memories_created = 0
-                for asset_id, publication in latest_by_asset.items():
-                    published_url = str(publication["wordpress_url"])
-                    page_rows = rows_by_url.get(self._normalise_gsc_page_url(published_url), [])
-                    clicks = sum(float(row["clicks"] or 0) for row in page_rows)
-                    impressions = sum(float(row["impressions"] or 0) for row in page_rows)
-                    ctr = clicks / impressions if impressions else 0.0
-                    weighted_position = sum(float(row["position"] or 0) * float(row["impressions"] or 0) for row in page_rows) / impressions if impressions else 0.0
-                    previous = connection.execute(
-                        """SELECT * FROM content_gsc_performance_snapshots
-                           WHERE project_id=? AND content_asset_id=? ORDER BY collected_at DESC,id DESC LIMIT 1""",
-                        (project_id, asset_id),
-                    ).fetchone()
-                    days_since_previous = None
-                    if previous is not None:
-                        days_since_previous = connection.execute("SELECT CAST(julianday('now') - julianday(?) AS INTEGER)", (previous["collected_at"],)).fetchone()[0]
-                    qualified = previous is not None and (days_since_previous or 0) >= 7 and impressions >= 100 and len(page_rows) >= 3
-                    learning_status = "qualified" if qualified else ("observing" if previous is None else "insufficient")
-                    summary = self._gsc_snapshot_summary(
-                        title=str(publication["title_snapshot"]), query_count=len(page_rows), clicks=clicks, impressions=impressions,
-                        ctr=ctr, position=weighted_position, previous=previous,
-                    )
-                    cursor = connection.execute(
-                        """INSERT INTO content_gsc_performance_snapshots(
-                               project_id,content_asset_id,draft_id,published_url,window_days,clicks,impressions,ctr,average_position,query_count,learning_status,summary
-                           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (project_id, asset_id, publication["current_draft_id"], published_url, window_days, clicks, impressions, ctr, weighted_position, len(page_rows), learning_status, summary),
-                    )
-                    snapshot_id = int(cursor.lastrowid)
-                    for row in page_rows:
-                        connection.execute(
-                            """INSERT INTO content_gsc_performance_rows(snapshot_id,query,page_url,clicks,impressions,ctr,position)
-                               VALUES(?,?,?,?,?,?,?)""",
-                            (snapshot_id, row["query"], row["page_url"], row["clicks"], row["impressions"], row["ctr"], row["position"]),
-                        )
-                    memory_id = None
-                    if qualified:
-                        memory_id = self._upsert_content_performance_memory(
-                            connection, project_id, asset_id, publication, snapshot_id, summary,
-                            clicks=clicks, impressions=impressions, ctr=ctr, position=weighted_position, query_count=len(page_rows), window_days=window_days,
-                        )
-                        memories_created += 1
-                    snapshots.append({"content_asset_id": asset_id, "snapshot_id": snapshot_id, "title": publication["title_snapshot"], "published_url": published_url, "query_count": len(page_rows), "impressions": round(impressions, 2), "learning_status": learning_status, "memory_id": memory_id, "summary": summary})
-        except (sqlite3.Error, ValueError) as error:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": f"GSC content learning failed: {str(error)[:300]}"}); return
-        self._json(HTTPStatus.OK, {"snapshots": snapshots, "memories_created": memories_created, "message": "已保存发布内容的 GSC 快照。首个快照仅观察；至少 7 天后的第二次有效快照才会形成可用于写作的效果记忆。"})
-
-    @staticmethod
-    def _gsc_snapshot_summary(*, title: str, query_count: int, clicks: float, impressions: float, ctr: float, position: float, previous: sqlite3.Row | None) -> str:
-        base = f"“{title}”的已发布页面本次匹配到 {query_count} 个 GSC 查询，获得 {clicks:.0f} 次点击、{impressions:.0f} 次展现、CTR {ctr * 100:.1f}%、平均排名 {position:.1f}。"
-        if previous is None:
-            return base + "这是首个观察快照，不作为写作因果结论。"
-        movement = impressions - float(previous["impressions"] or 0)
-        return base + f"与上一次快照相比，展现变化 {movement:+.0f}。该数据描述搜索表现，不证明某一种写法单独造成变化。"
-
-    def _upsert_content_performance_memory(
-        self, connection: sqlite3.Connection, project_id: int, asset_id: int, publication: sqlite3.Row, snapshot_id: int, summary: str, *,
-        clicks: float, impressions: float, ctr: float, position: float, query_count: int, window_days: int,
-    ) -> int:
-        source_hash = f"gsc-performance:{project_id}:{asset_id}:{self._normalise_gsc_page_url(str(publication['wordpress_url']))}"
-        evidence = {"source": "Google Search Console", "snapshot_id": snapshot_id, "content_asset_id": asset_id, "published_url": publication["wordpress_url"], "window_days": window_days, "clicks": clicks, "impressions": impressions, "ctr": ctr, "average_position": position, "query_count": query_count, "causality": "descriptive_only"}
-        quality_score = 0.7 if impressions >= 500 else 0.55
-        existing = connection.execute("SELECT id FROM content_learning_memories WHERE project_id=? AND source_content_hash=?", (project_id, source_hash)).fetchone()
-        topic = str(publication["keyword"] or publication["title_snapshot"])
-        if existing is None:
-            cursor = connection.execute(
-                """INSERT INTO content_learning_memories(project_id,memory_type,topic,summary,evidence_json,source_url,source_content_hash,quality_score,status)
-                   VALUES(?,?,?,?,?,?,?,?, 'active')""",
-                (project_id, "performance", topic[:300], summary[:12000], json.dumps(evidence, ensure_ascii=False), str(publication["wordpress_url"]), source_hash, quality_score),
-            )
-            memory_id = int(cursor.lastrowid)
-        else:
-            memory_id = int(existing["id"])
-            connection.execute("UPDATE content_learning_memories SET topic=?,summary=?,evidence_json=?,source_url=?,quality_score=?,status='active',updated_at=CURRENT_TIMESTAMP WHERE id=?", (topic[:300], summary[:12000], json.dumps(evidence, ensure_ascii=False), str(publication["wordpress_url"]), quality_score, memory_id))
-        connection.execute(
-            """INSERT INTO content_memory_links(content_asset_id,memory_id,role,relevance_score,selected_by_model)
-               VALUES(?,?, 'performance', 0.8, 1)
-               ON CONFLICT(content_asset_id,memory_id,role) DO UPDATE SET relevance_score=excluded.relevance_score,selected_by_model=1""",
-            (asset_id, memory_id),
-        )
-        return memory_id
+        """Queue the durable, evidence-gated GSC feedback workflow."""
+        self._queue_gsc_feedback_learning(project_id, payload)
 
     def _list_content_gsc_performance(self, project_id: int) -> None:
         try:
@@ -2336,7 +3224,8 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             with self._database() as connection:
                 self._project_exists(connection, project_id)
                 published = connection.execute(
-                    """SELECT publications.content_asset_id,publications.wordpress_url,publications.draft_id AS published_draft_id,assets.title_snapshot
+                    """SELECT publications.content_asset_id,publications.wordpress_url,publications.draft_id AS published_draft_id,
+                              publications.created_at AS published_at,assets.title_snapshot
                        FROM content_wordpress_publications publications
                        JOIN content_assets assets ON assets.id=publications.content_asset_id
                        WHERE publications.project_id=? AND publications.status='publish' AND assets.deleted_at IS NULL
@@ -2370,6 +3259,38 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                         performance_score, performance_breakdown = self._content_performance_score(latest, previous)
                         combined_score = round(quality_score * 0.6 + performance_score / 45 * 40)
                         correlation_pairs.append((float(quality_score), float(performance_score)))
+                    used_rows = connection.execute(
+                        """SELECT links.memory_id,links.role,links.relevance_score,links.selected_by_model,
+                                  links.selected_by_user,links.created_at AS selected_at,
+                                  memories.memory_type,memories.card_type,memories.topic,memories.source_url
+                           FROM content_memory_links links
+                           JOIN content_learning_memories memories ON memories.id=links.memory_id
+                           WHERE links.content_asset_id=? AND memories.project_id=?
+                             AND (links.selected_by_model=1 OR links.selected_by_user=1)
+                             AND datetime(links.created_at) <= datetime(?)
+                           ORDER BY links.relevance_score DESC,links.id""",
+                        (asset_id, project_id, publication["published_at"]),
+                    ).fetchall()
+                    used_memories: list[dict[str, Any]] = []
+                    for used in used_rows:
+                        source_rows = connection.execute(
+                            """SELECT source_type,source_id,source_url,source_content_hash,captured_at
+                               FROM content_learning_memory_sources
+                               WHERE project_id=? AND memory_id=? ORDER BY captured_at DESC,id DESC LIMIT 8""",
+                            (project_id, used["memory_id"]),
+                        ).fetchall()
+                        selected_by = "model" if used["selected_by_model"] else "user"
+                        used_memories.append({
+                            "memory_id": int(used["memory_id"]),
+                            "memory_type": used["memory_type"],
+                            "card_type": used["card_type"],
+                            "topic": used["topic"],
+                            "source_url": used["source_url"],
+                            "sources": [dict(source) for source in source_rows],
+                            "relevance_score": float(used["relevance_score"]),
+                            "selection_reason": f"{selected_by} selected this {used['role']} memory for the article before publication.",
+                            "selected_at": used["selected_at"],
+                        })
                     articles.append({
                         "content_asset_id": asset_id,
                         "draft_id": int(draft["id"]),
@@ -2382,6 +3303,9 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                         "performance_breakdown": performance_breakdown,
                         "combined_score": combined_score,
                         "latest_snapshot": dict(latest) if latest is not None else None,
+                        "memory_assisted": bool(used_memories),
+                        "evaluation_group": "memory_assisted" if used_memories else "no_memory_baseline",
+                        "used_memories": used_memories,
                     })
                 correlation = self._spearman_correlation(correlation_pairs)
                 if correlation is None:
@@ -2397,6 +3321,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             "summary": {
                 "published_articles": len(articles),
                 "qualified_articles": len(correlation_pairs),
+                "memory_assisted_articles": sum(1 for article in articles if article["memory_assisted"]),
                 "correlation_state": correlation_state,
                 "spearman_correlation": correlation,
                 "note": correlation_note,
@@ -2427,7 +3352,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         return [str(item.get("siteUrl")) for item in payload.get("siteEntry", []) if item.get("siteUrl")]
 
     def _gsc_request(self, method: str, url: str, body: Mapping[str, Any] | None = None) -> Mapping[str, Any]:
-        with self._database() as connection: connection = connection.execute("SELECT refresh_token FROM gsc_oauth_connection WHERE id=1").fetchone()
+        with self._credential_database() as connection: connection = connection.execute("SELECT refresh_token FROM gsc_oauth_credentials WHERE id=1").fetchone()
         if connection is None: raise ValueError("connect a Google account first")
         settings = _gsc_settings(self.server.ai_settings_path); refresh_token = self._unprotect_gsc_token(str(connection["refresh_token"]))
         token_response = requests.post("https://oauth2.googleapis.com/token", data={"client_id": settings["client_id"], "client_secret": settings["client_secret"], "refresh_token": refresh_token, "grant_type": "refresh_token"}, timeout=20); token_response.raise_for_status(); access_token = str(token_response.json().get("access_token") or "")
@@ -2444,8 +3369,8 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         return win32crypt.CryptUnprotectData(base64.b64decode(value.removeprefix("dpapi:")), None, None, None, 0)[1].decode("utf-8")
 
     def _get_wordpress_config(self, project_id: int) -> None:
-        with self._database() as connection:
-            row = connection.execute("SELECT project_id,site_url,username,updated_at,last_tested_at FROM project_wordpress_configs WHERE project_id=?", (project_id,)).fetchone()
+        with self._credential_database() as connection:
+            row = connection.execute("SELECT project_id,site_url,username,updated_at,last_tested_at FROM wordpress_credentials WHERE project_id=?", (project_id,)).fetchone()
         self._json(HTTPStatus.OK, dict(row) | {"configured": True} if row else {"configured": False})
 
     def _save_wordpress_config(self, project_id: int, payload: Mapping[str, Any]) -> None:
@@ -2455,9 +3380,10 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         if not site_url.startswith(("https://", "http://")):
             self._json(HTTPStatus.BAD_REQUEST, {"error": "site_url must start with https:// or http://."}); return
         try:
-            with self._database() as connection, connection:
+            with self._database() as connection:
                 if connection.execute("SELECT 1 FROM projects WHERE id=?", (project_id,)).fetchone() is None: raise ValueError("project does not exist")
-                connection.execute("INSERT INTO project_wordpress_configs(project_id,site_url,username,application_password) VALUES(?,?,?,?) ON CONFLICT(project_id) DO UPDATE SET site_url=excluded.site_url,username=excluded.username,application_password=excluded.application_password,last_tested_at=NULL,updated_at=CURRENT_TIMESTAMP", (project_id, site_url.rstrip("/"), username, self._protect_wordpress_password(password)))
+            with self._credential_database() as connection, connection:
+                connection.execute("INSERT INTO wordpress_credentials(project_id,site_url,username,application_password) VALUES(?,?,?,?) ON CONFLICT(project_id) DO UPDATE SET site_url=excluded.site_url,username=excluded.username,application_password=excluded.application_password,last_tested_at=NULL,updated_at=CURRENT_TIMESTAMP", (project_id, site_url.rstrip("/"), username, self._protect_wordpress_password(password)))
         except (sqlite3.Error, ValueError) as error:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)}); return
         self._get_wordpress_config(project_id)
@@ -2466,8 +3392,8 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         try:
             configuration = self._wordpress_configuration(project_id, payload)
             session, _page = self._wordpress_admin_session(configuration)
-            with self._database() as connection, connection:
-                connection.execute("UPDATE project_wordpress_configs SET last_tested_at=CURRENT_TIMESTAMP WHERE project_id=?", (project_id,))
+            with self._credential_database() as connection, connection:
+                connection.execute("UPDATE wordpress_credentials SET last_tested_at=CURRENT_TIMESTAMP WHERE project_id=?", (project_id,))
         except Exception as error:
             self._json(HTTPStatus.BAD_GATEWAY, {"error": f"WordPress backend login failed: {type(error).__name__}. Check site URL, username and password."}); return
         self._json(HTTPStatus.OK, {"status": "connected", "username": configuration["username"], "method": "python_form_session"})
@@ -2502,6 +3428,40 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 report_id = int(cursor.lastrowid)
                 response: dict[str, Any] = {"gate_report_id": report_id, "report": report, "status": report["status"]}
                 if report["status"] == "ready":
+                    pending = connection.execute(
+                        """SELECT approvals.id,approvals.job_id,approvals.payload_json
+                           FROM agent_approval_requests approvals
+                           JOIN agent_jobs jobs ON jobs.id=approvals.job_id
+                           WHERE approvals.project_id=? AND approvals.approval_type='publish'
+                             AND approvals.status='pending' AND jobs.content_asset_id=?
+                             AND jobs.status='waiting_approval'
+                           ORDER BY approvals.id DESC""",
+                        (project_id, asset_id),
+                    ).fetchall()
+                    for approval in pending:
+                        try:
+                            approval_payload = json.loads(approval["payload_json"] or "{}")
+                        except (TypeError, json.JSONDecodeError):
+                            continue
+                        if (
+                            isinstance(approval_payload, Mapping)
+                            and approval_payload.get("draft_id") == report["draft_id"]
+                            and approval_payload.get("requested_status") == requested_status
+                        ):
+                            approval_payload = dict(approval_payload)
+                            approval_payload["gate_report_id"] = report_id
+                            approval_payload["report"] = report
+                            connection.execute(
+                                "UPDATE agent_approval_requests SET payload_json=? WHERE id=?",
+                                (json.dumps(approval_payload, ensure_ascii=False), approval["id"]),
+                            )
+                            response |= {
+                                "job_id": int(approval["job_id"]),
+                                "approval_id": int(approval["id"]),
+                                "reused": True,
+                            }
+                            self._json(HTTPStatus.OK, response)
+                            return
                     workflow = run_content_workflow_skeleton(project_id=project_id, content_asset_id=asset_id, requested_action="prepare_publish")
                     job_cursor = connection.execute(
                         """INSERT INTO agent_jobs(project_id,content_asset_id,requested_action,status,current_node,input_json)
@@ -2518,7 +3478,13 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                                VALUES(?,?, 'completed', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)""",
                             (job_id, event["node"], event["message"], json.dumps({"message": event["message"]}, ensure_ascii=False)),
                         )
-                    approval_payload = {"content_asset_id": asset_id, "draft_id": report["draft_id"], "requested_status": requested_status, "gate_report_id": report_id}
+                    approval_payload = {
+                        "content_asset_id": asset_id,
+                        "draft_id": report["draft_id"],
+                        "requested_status": requested_status,
+                        "gate_report_id": report_id,
+                        "report": report,
+                    }
                     approval_cursor = connection.execute(
                         "INSERT INTO agent_approval_requests(project_id,job_id,approval_type,payload_json) VALUES(?,?, 'publish', ?)",
                         (project_id, job_id, json.dumps(approval_payload, ensure_ascii=False)),
@@ -2551,12 +3517,21 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         except (TypeError, json.JSONDecodeError):
             unresolved = ["invalid verification state"]
         check("verification", not unresolved, "正文仍有待验证事项；请修订或确认后重新进行质量审核。")
+        title = str(draft["title"] or "").strip()
+        meta_description = str(draft["meta_description"] or "").strip()
+        check("title", bool(title), "正文标题为空，无法创建 WordPress 文章。")
+        check(
+            "meta_description",
+            50 <= len(meta_description) <= 180,
+            "Meta Description 必须为 50–180 个字符，避免搜索摘要缺失或被截断。",
+        )
         try:
             tags = json.loads(asset["tags_json"] or "[]")
         except (TypeError, json.JSONDecodeError):
             tags = []
         check("tags", isinstance(tags, list) and 2 <= len(tags) <= 3 and all(isinstance(tag, str) and tag.strip() for tag in tags), "内容必须保留 2–3 个有效英文标签。")
-        configuration = connection.execute("SELECT last_tested_at FROM project_wordpress_configs WHERE project_id=?", (project_id,)).fetchone()
+        with self._credential_database() as credential_connection:
+            configuration = credential_connection.execute("SELECT last_tested_at FROM wordpress_credentials WHERE project_id=?", (project_id,)).fetchone()
         check("wordpress_connection", configuration is not None and configuration["last_tested_at"] is not None, "请先在“内容发布”中保存并测试当前网站的 WordPress 后台连接。")
         images = connection.execute("SELECT seo_filename,status FROM content_section_images WHERE project_id=? AND content_asset_id=? AND draft_id=? ORDER BY position", (project_id, asset["id"], draft["id"])).fetchall()
         if not images:
@@ -2570,6 +3545,26 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                     image_failures.append(filename or "未命名配图")
             check("images", not image_failures, f"以下 H2 配图尚未成功生成或本地文件不可读：{', '.join(image_failures[:3])}。" if image_failures else "H2 配图均已生成且本地文件可读。")
         markdown = str(draft["markdown"] or "")
+        markdown_links = re.findall(r"!?\[[^\]]*\]\(([^)\s]+)(?:\s+['\"][^'\"]*['\"])?\)", markdown)
+        unsafe_links = [
+            target for target in markdown_links
+            if not target.startswith(("https://", "http://", "/", "#"))
+        ]
+        check(
+            "links",
+            not unsafe_links,
+            f"正文包含不安全或不受支持的链接：{', '.join(unsafe_links[:3])}。" if unsafe_links else "正文链接协议检查通过。",
+        )
+        duplicate = connection.execute(
+            """SELECT publications.content_asset_id
+               FROM content_wordpress_publications publications
+               JOIN content_drafts published_drafts ON published_drafts.id=publications.draft_id
+               WHERE publications.project_id=? AND publications.status='publish'
+                 AND publications.content_asset_id<>? AND TRIM(published_drafts.markdown)=TRIM(?)
+               LIMIT 1""",
+            (project_id, asset["id"], markdown),
+        ).fetchone()
+        check("duplicate", duplicate is None, "当前正文与本项目另一篇已公开文章完全重复，请先处理重复内容风险。")
         markdown_has_table = bool(re.search(r"^\s*\|.+\|\s*$", markdown, flags=re.MULTILINE))
         rendered_html = self._markdown_to_wordpress_html(markdown)
         check("tables", not markdown_has_table or "<table" in rendered_html, "正文中的 Markdown 表格无法转换为 WordPress HTML 表格。")
@@ -2610,7 +3605,15 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         if cursor.rowcount != 1:
             raise ValueError("publish approval has already been consumed")
 
-    def _record_publish_job_outcome(self, project_id: int, approval_id: int, *, succeeded: bool, message: str) -> None:
+    def _record_publish_job_outcome(
+        self,
+        project_id: int,
+        approval_id: int,
+        *,
+        succeeded: bool,
+        message: str,
+        result: Mapping[str, Any] | None = None,
+    ) -> None:
         """Keep the durable approval job truthful without storing WordPress secrets."""
         with self._database() as connection, connection:
             approval = connection.execute("SELECT job_id FROM agent_approval_requests WHERE id=? AND project_id=?", (approval_id, project_id)).fetchone()
@@ -2619,8 +3622,15 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             job_status = "completed" if succeeded else "failed"
             node = "wordpress_publish_completed" if succeeded else "wordpress_publish_failed"
             connection.execute(
-                "UPDATE agent_jobs SET status=?,current_node=?,error_summary=?,completed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?",
-                (job_status, node, None if succeeded else message[:500], approval["job_id"]),
+                """UPDATE agent_jobs SET status=?,current_node=?,error_summary=?,result_json=?,
+                       completed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (
+                    job_status,
+                    node,
+                    None if succeeded else message[:500],
+                    json.dumps(dict(result or {}), ensure_ascii=False),
+                    approval["job_id"],
+                ),
             )
             connection.execute(
                 """INSERT INTO agent_steps(job_id,node_name,status,input_summary,output_json,started_at,completed_at)
@@ -2661,7 +3671,13 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                     with connection:
                         cursor = connection.execute("INSERT INTO content_wordpress_publications(project_id,content_asset_id,draft_id,wordpress_post_id,wordpress_url,status) VALUES(?,?,?,?,?,?)", (project_id, asset_id, draft["id"], post_id, link, status))
                         row = connection.execute("SELECT * FROM content_wordpress_publications WHERE id=?", (cursor.lastrowid,)).fetchone()
-                    self._record_publish_job_outcome(project_id, approval_id, succeeded=True, message="WordPress publication completed.")
+                    self._record_publish_job_outcome(
+                        project_id,
+                        approval_id,
+                        succeeded=True,
+                        message="WordPress publication completed.",
+                        result=dict(row),
+                    )
                     self._json(HTTPStatus.CREATED, dict(row)); return
                 nonce = self._wordpress_post_nonce(editor)
                 if not nonce: raise ValueError("WordPress post form did not contain _wpnonce")
@@ -2738,7 +3754,13 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             message = f"WordPress publishing failed: {type(error).__name__}: {str(error)[:300]}"
             self._record_publish_job_outcome(project_id, approval_id, succeeded=False, message=message)
             self._json(HTTPStatus.BAD_GATEWAY, {"error": message}); return
-        self._record_publish_job_outcome(project_id, approval_id, succeeded=True, message="WordPress publication completed.")
+        self._record_publish_job_outcome(
+            project_id,
+            approval_id,
+            succeeded=True,
+            message="WordPress publication completed.",
+            result=dict(row),
+        )
         self._json(HTTPStatus.CREATED, dict(row))
 
     def _publish_wordpress_gutenberg(self, connection: sqlite3.Connection, project_id: int, asset_id: int, draft: sqlite3.Row, session: requests.Session, configuration: Mapping[str, str], status: str, editor_html: str, set_stage: Any) -> tuple[int, str]:
@@ -2936,8 +3958,8 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         return media_url
 
     def _wordpress_configuration(self, project_id: int, payload: Mapping[str, Any]) -> dict[str, str]:
-        with self._database() as connection:
-            row = connection.execute("SELECT * FROM project_wordpress_configs WHERE project_id=?", (project_id,)).fetchone()
+        with self._credential_database() as connection:
+            row = connection.execute("SELECT * FROM wordpress_credentials WHERE project_id=?", (project_id,)).fetchone()
         if row is None: raise ValueError("save this website's WordPress URL, username and backend password first")
         return {"site_url": row["site_url"], "username": row["username"], "password": self._unprotect_wordpress_password(row["application_password"])}
 
@@ -3027,6 +4049,10 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         content.  Escaping every line turns all of those into visible syntax in
         WordPress, so parse that compact subset rather than relying on a theme.
         """
+        # The verification record belongs to the internal quality gate.  Even
+        # legacy drafts that contained an old marker must never expose it on a
+        # public WordPress page.
+        markdown = KeywordDiscoveryRequestHandler._sanitize_reader_markdown(markdown)
         lines = markdown.replace("\r\n", "\n").replace("\r", "\n").split("\n")
         output: list[str] = []
 
@@ -3043,11 +4069,91 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
 
         def cells(value: str) -> list[str]:
             trimmed = value.strip().strip("|")
-            return [item.strip() for item in trimmed.split("|")]
+            return [item.replace(r"\|", "|").strip() for item in re.split(r"(?<!\\)\|", trimmed)]
 
         def table_rule(value: str) -> bool:
             parts = cells(value)
             return len(parts) >= 2 and all(re.fullmatch(r":?-{3,}:?", part.replace(" ", "")) is not None for part in parts)
+
+        class SafeTableParser(HTMLParser):
+            """Extract only semantic table structure and plain cell text."""
+
+            def __init__(self) -> None:
+                super().__init__(convert_charrefs=True)
+                self.table_depth = 0
+                self.section = "body"
+                self.row: list[tuple[str, str, str]] | None = None
+                self.cell_tag = ""
+                self.cell_scope = ""
+                self.cell_text: list[str] = []
+                self.rows: list[tuple[str, list[tuple[str, str, str]]]] = []
+                self.ignored_depth = 0
+
+            def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+                name = tag.casefold()
+                if name == "table": self.table_depth += 1; return
+                if self.table_depth != 1: return
+                if name in {"script", "style", "template", "iframe", "object", "embed", "svg", "math"}:
+                    self.ignored_depth += 1; return
+                if self.ignored_depth: return
+                if name in {"thead", "tbody", "tfoot"}: self.section = "head" if name == "thead" else "body"; return
+                if name == "tr": self.row = []; return
+                if name in {"th", "td"} and self.row is not None:
+                    self.cell_tag = name
+                    scope = dict(attrs).get("scope") or ""
+                    self.cell_scope = scope if name == "th" and scope in {"col", "row"} else ""
+                    self.cell_text = []
+                elif name == "br" and self.cell_tag:
+                    self.cell_text.append(" ")
+
+            def handle_data(self, data: str) -> None:
+                if self.table_depth == 1 and not self.ignored_depth and self.cell_tag: self.cell_text.append(data)
+
+            def handle_endtag(self, tag: str) -> None:
+                name = tag.casefold()
+                if self.table_depth == 1 and self.ignored_depth:
+                    if name in {"script", "style", "template", "iframe", "object", "embed", "svg", "math"}: self.ignored_depth -= 1
+                    return
+                if self.table_depth == 1 and name in {"th", "td"} and self.cell_tag == name and self.row is not None:
+                    text_value = " ".join("".join(self.cell_text).split())
+                    self.row.append((self.cell_tag, self.cell_scope, text_value))
+                    self.cell_tag = ""; self.cell_scope = ""; self.cell_text = []
+                elif self.table_depth == 1 and name == "tr" and self.row is not None:
+                    if self.row: self.rows.append((self.section, self.row))
+                    self.row = None
+                elif name == "table" and self.table_depth:
+                    self.table_depth -= 1
+
+        def html_table(block: str) -> str | None:
+            parser = SafeTableParser()
+            try:
+                parser.feed(block); parser.close()
+            except (ValueError, AssertionError):
+                return None
+            if not parser.rows: return None
+            head_rows = [row for section, row in parser.rows if section == "head"]
+            body_rows = [row for section, row in parser.rows if section != "head"]
+
+            def render_rows(rows: list[list[tuple[str, str, str]]]) -> str:
+                rendered: list[str] = []
+                for row in rows:
+                    rendered_cells = []
+                    for tag, scope, text_value in row:
+                        scope_attr = f' scope="{scope}"' if scope else ""
+                        rendered_cells.append(f"<{tag}{scope_attr}>{inline(text_value)}</{tag}>")
+                    rendered.append("<tr>" + "".join(rendered_cells) + "</tr>")
+                return "".join(rendered)
+
+            head_html = f"<thead>{render_rows(head_rows)}</thead>" if head_rows else ""
+            body_html = f"<tbody>{render_rows(body_rows)}</tbody>"
+            return f'<figure class="wp-block-table seo-control-table-wrap" style="display:block;width:100%;max-width:100%;overflow-x:auto;-webkit-overflow-scrolling:touch;"><table class="seo-control-table" style="width:100%;min-width:640px;border-collapse:collapse;">{head_html}{body_html}</table></figure>'
+
+        def list_item(value: str) -> str:
+            task = re.match(r"^\[([ xX])\]\s+(.+)$", value)
+            if task is None: return f"<li>{inline(value)}</li>"
+            checked = " checked" if task.group(1).casefold() == "x" else ""
+            state = "Completed" if checked else "Pending"
+            return f'<li class="task-list-item"><input type="checkbox" disabled{checked} aria-label="{state} checklist item"><span>{inline(task.group(2))}</span></li>'
 
         index = 0
         while index < len(lines):
@@ -3058,6 +4164,16 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             heading = re.match(r"^(#{1,3})\s+(.+)$", value)
             if heading:
                 level = len(heading.group(1)); output.append(f"<h{level}>{inline(heading.group(2).strip())}</h{level}>"); index += 1; continue
+            if re.match(r"^<table(?:\s|>)", value, flags=re.IGNORECASE):
+                block: list[str] = []
+                while index < len(lines):
+                    block.append(lines[index])
+                    closed = re.search(r"</table\s*>", lines[index], flags=re.IGNORECASE) is not None
+                    index += 1
+                    if closed: break
+                rendered_table = html_table("\n".join(block))
+                output.append(rendered_table if rendered_table is not None else f"<p>{inline(' '.join(block))}</p>")
+                continue
             if "|" in value and index + 1 < len(lines) and table_rule(lines[index + 1]):
                 header = cells(value); index += 2; body: list[list[str]] = []
                 while index < len(lines) and lines[index].strip() and "|" in lines[index]:
@@ -3073,16 +4189,28 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             if unordered or ordered:
                 tag = "ul" if unordered else "ol"; items: list[str] = []
                 pattern = r"^(?:[-*])\s+(.+)$" if unordered else r"^\d+[.)]\s+(.+)$"
+                first_number = int(re.match(r"^(\d+)", value).group(1)) if ordered else 1
                 while index < len(lines):
                     item = re.match(pattern, lines[index].strip())
                     if item is None: break
-                    items.append(f"<li>{inline(item.group(1))}</li>"); index += 1
-                output.append(f"<{tag}>" + "".join(items) + f"</{tag}>")
+                    item_parts = [item.group(1)]; index += 1
+                    while index < len(lines):
+                        continuation = lines[index].strip()
+                        if not continuation or re.match(r"^(#{1,3})\s+", continuation) or re.match(r"^(?:[-*])\s+", continuation) or re.match(r"^\d+[.)]\s+", continuation) or re.match(r"^<table(?:\s|>)", continuation, flags=re.IGNORECASE) or ("|" in continuation and index + 1 < len(lines) and table_rule(lines[index + 1])): break
+                        item_parts.append(continuation); index += 1
+                    items.append(list_item(" ".join(item_parts)))
+                    next_index = index
+                    while next_index < len(lines) and not lines[next_index].strip(): next_index += 1
+                    if next_index < len(lines) and re.match(pattern, lines[next_index].strip()): index = next_index; continue
+                    index = next_index; break
+                list_class = ' class="task-list"' if tag == "ul" and any('class="task-list-item"' in item for item in items) else ""
+                start = f' start="{first_number}"' if tag == "ol" and first_number != 1 else ""
+                output.append(f"<{tag}{list_class}{start}>" + "".join(items) + f"</{tag}>")
                 continue
             paragraph = [value]; index += 1
             while index < len(lines):
                 next_value = lines[index].strip()
-                if not next_value or re.match(r"^(#{1,3})\s+", next_value) or re.match(r"^(?:[-*])\s+", next_value) or re.match(r"^\d+[.)]\s+", next_value) or ("|" in next_value and index + 1 < len(lines) and table_rule(lines[index + 1])):
+                if not next_value or re.match(r"^(#{1,3})\s+", next_value) or re.match(r"^(?:[-*])\s+", next_value) or re.match(r"^\d+[.)]\s+", next_value) or re.match(r"^<table(?:\s|>)", next_value, flags=re.IGNORECASE) or ("|" in next_value and index + 1 < len(lines) and table_rule(lines[index + 1])):
                     break
                 paragraph.append(next_value); index += 1
             output.append(f"<p>{inline(' '.join(paragraph))}</p>")
@@ -3125,6 +4253,8 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         try:
             with self._database() as connection:
                 asset = self._content_asset(connection, project_id, asset_id)
+                if action in {"generate", "generate-outline", "generate-draft"}:
+                    self._require_content_competitor_learning(connection, asset)
                 generator, provider, model, research_generator, research_provider, research_model, reviewer_provider, reviewer_model, routing_mode, routing_summary = self._content_execution_route(payload)
                 job_id = self._start_content_generation_job(
                     connection, asset, action, provider, model,
@@ -3141,14 +4271,6 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                     self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": f"{self._content_provider_label(provider)} configuration 未配置，未切换到其他模型。", "generation_job": job})
                     return
                 result: dict[str, Any] = {}
-                if action == "generate" and payload.get("competitor_research") is True:
-                    result["competitor_research"] = self._run_competitor_research(
-                        connection, asset,
-                        research_generator or generator,
-                        research_provider or provider,
-                        research_model if research_generator is not None else model,
-                    )
-                    asset = self._content_asset(connection, project_id, asset_id)
                 # The project console sends the current website's first-party
                 # knowledge on every generation request.  Refresh only that
                 # source family inside an existing Brief, so an old Brief can
@@ -3217,7 +4339,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
 
     @staticmethod
     def _content_failed_stage(error: str) -> str:
-        matched = re.search(r"AI content (semantic|title|outline|chapter_plan|section|assembly|qa)", error)
+        matched = re.search(r"AI content (industry_rules|semantic|title|outline|chapter_plan|section|assembly|qa)", error)
         return matched.group(1) if matched else "generation"
 
     @staticmethod
@@ -3401,23 +4523,121 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         if draft is None:
             raise ValueError("current draft does not exist")
         brief = self._current_content_brief(connection, asset)
-        brief_payload = self._content_brief_payload(brief)
+        brief_payload = self._ensure_brief_industry_policy(
+            connection, asset, brief, self._content_brief_payload(brief), generator, provider, model, generation_job_id
+        )
         outline = connection.execute("SELECT * FROM content_outlines WHERE id=?", (asset["current_outline_id"],)).fetchone() if asset["current_outline_id"] else None
         review_data = {
             "canonical_title": asset["title_snapshot"], "primary_keyword": asset["keyword"],
+            "project_context": brief_payload["brief"].get("project_context", {}),
+            "writing_policy": self._writing_policy(brief_payload["brief"]),
             "article": {"title": draft["title"], "markdown": self._sanitize_reader_markdown(str(draft["markdown"])), "meta_description": draft["meta_description"]},
             "outline": self._content_outline_payload(connection, outline)["sections"] if outline else [],
             "sources": brief_payload["sources"], "learning_memories": brief_payload["brief"].get("learning_memories", []),
             "rules": {"max_targeted_rewrites": 2, "h2_guidance": "natural, normally around 5-7 but never forced", "no_unrelated_references": True, "tables_must_be_real_html_on_publish": True, "image_requirement": "800x600 WebP when images are selected"},
         }
         review, _run = self._run_content_stage(connection, asset, "qa", review_data, generator, provider, model, generation_job_id)
+        review = dict(review)
+        markdown = str(draft["markdown"] or "")
+        keyword = str(asset["keyword"] or "").strip()
+        word_count = self._english_word_count(markdown)
+        bold_keyword_count = self._bold_primary_keyword_count(markdown, keyword)
+        target_words = sum(
+            max(0, int(section.get("target_words") or section.get("word_budget") or 0))
+            for section in review_data["outline"]
+            if isinstance(section, Mapping)
+        )
+        approved_max_words = 0
+        if not target_words:
+            outline_run = connection.execute(
+                """SELECT output_json FROM content_generation_runs
+                   WHERE content_asset_id=? AND stage='outline' AND status='completed'
+                     AND output_json LIKE ?
+                   ORDER BY id DESC LIMIT 1""",
+                (asset["id"], '%"recommended_word_range"%'),
+            ).fetchone()
+            if outline_run is not None:
+                raw_outline_output = outline_run["output_json"]
+                if isinstance(raw_outline_output, Mapping):
+                    outline_output = dict(raw_outline_output)
+                else:
+                    try:
+                        outline_output = json.loads(str(raw_outline_output or "{}"))
+                    except (TypeError, json.JSONDecodeError):
+                        outline_output = {}
+                if isinstance(outline_output, Mapping):
+                    generated_sections = outline_output.get("sections")
+                    if isinstance(generated_sections, list):
+                        target_words = sum(
+                            max(0, int(section.get("target_words") or 0))
+                            for section in generated_sections
+                            if isinstance(section, Mapping)
+                        )
+                    recommended_range = outline_output.get("recommended_word_range")
+                    if isinstance(recommended_range, Mapping):
+                        approved_max_words = max(0, int(recommended_range.get("max") or 0))
+        allowed_words = approved_max_words or (int(round(target_words * 1.2)) if target_words else 0)
+        blockers = [str(item) for item in review.get("critical_blockers", []) if isinstance(item, str) and item.strip()]
+        raw_rewrites = review.get("targeted_rewrite")
+        rewrites = [dict(item) for item in raw_rewrites if isinstance(item, Mapping)][:2] if isinstance(raw_rewrites, list) else []
+        deterministic_rewrites: list[dict[str, str]] = []
+        checks = [dict(item) for item in review.get("checks", []) if isinstance(item, Mapping)] if isinstance(review.get("checks"), list) else []
+        if bold_keyword_count != 1:
+            blockers.append(f"The exact primary keyword is bolded {bold_keyword_count} times; exactly one body occurrence is required.")
+            checks.append({"name": "Deterministic primary-keyword emphasis", "status": "fail", "note": f"Found {bold_keyword_count} bold occurrences; required exactly 1."})
+            deterministic_rewrites.append({
+                "target": "Whole article formatting",
+                "issue": f"The exact primary keyword is bolded {bold_keyword_count} times.",
+                "instruction": "Keep exactly one bold exact-match primary keyword in the opening body paragraph and remove bold emphasis from every later exact-match occurrence; do not alter headings or evidence markers.",
+            })
+        else:
+            checks.append({"name": "Deterministic primary-keyword emphasis", "status": "pass", "note": "Exactly one bold body occurrence was found."})
+        if allowed_words and word_count > allowed_words:
+            blockers.append(f"The article has {word_count} words, above the approved proportional ceiling of {allowed_words} words.")
+            checks.append({"name": "Deterministic article length", "status": "fail", "note": f"Found {word_count} words; proportional ceiling is {allowed_words}."})
+            deterministic_rewrites.append({
+                "target": "Whole article",
+                "issue": f"The draft is {word_count} words, above the {allowed_words}-word proportional ceiling.",
+                "instruction": f"Shorten the complete article to no more than {allowed_words} words by removing repetition and overly granular checklist prose while preserving all six H2 roles, supported facts, and useful decision boundaries. Do not introduce reader-facing verification labels.",
+            })
+        elif allowed_words:
+            checks.append({"name": "Deterministic article length", "status": "pass", "note": f"Found {word_count} words; proportional ceiling is {allowed_words}."})
+        review["checks"] = checks
+        review["critical_blockers"] = list(dict.fromkeys(blockers))
+        review["targeted_rewrite"] = [*deterministic_rewrites, *rewrites][:2]
         qa_status = str(review.get("status") or "needs_verification")
         if qa_status not in {"approved", "needs_revision", "needs_verification"}:
             qa_status = "needs_verification"
-        raw_rewrites = review.get("targeted_rewrite")
-        review["targeted_rewrite"] = [dict(item) for item in raw_rewrites if isinstance(item, Mapping)][:2] if isinstance(raw_rewrites, list) else []
         review["reviewer"] = {"provider": provider, "model": model}
-        unresolved = review.get("unresolved_verify") if isinstance(review.get("unresolved_verify"), list) else []
+        unresolved = [str(item) for item in review.get("unresolved_verify", []) if isinstance(item, str) and item.strip()] if isinstance(review.get("unresolved_verify"), list) else []
+        try:
+            draft_unresolved = json.loads(str(draft["unresolved_verify_json"] or "[]"))
+        except (TypeError, json.JSONDecodeError):
+            draft_unresolved = []
+        if not unresolved and isinstance(draft_unresolved, list):
+            unresolved.extend(str(item) for item in draft_unresolved if isinstance(item, str) and item.strip())
+        unresolved = list(dict.fromkeys(unresolved))
+        review["unresolved_verify"] = unresolved
+        if unresolved and review["targeted_rewrite"]:
+            editable_rewrites: list[dict[str, Any]] = []
+            for item in review["targeted_rewrite"]:
+                rewrite_text = f"{item.get('issue', '')} {item.get('instruction', '')}".casefold()
+                explicit_evidence_request = any(term in rewrite_text for term in ("supply", "provide", "add a source"))
+                verification_dependency = "verify" in rewrite_text and any(
+                    term in rewrite_text for term in ("manufacturer", "datasheet", "manual", "documentation", "specification", "specific controller", "source")
+                )
+                if not (explicit_evidence_request or verification_dependency):
+                    editable_rewrites.append(item)
+            review["targeted_rewrite"] = editable_rewrites
+        if review["targeted_rewrite"]:
+            qa_status = "needs_revision"
+        elif unresolved:
+            qa_status = "needs_verification"
+        score = review.get("overall_score")
+        if not isinstance(score, (int, float)):
+            score = 0
+        review["overall_score"] = max(0, min(int(score), 79 if (review["critical_blockers"] or unresolved) else 100))
+        review["status"] = qa_status
         with connection:
             connection.execute("UPDATE content_drafts SET qa_json=?,qa_status=?,unresolved_verify_json=? WHERE id=?", (json.dumps(review, ensure_ascii=False), qa_status, json.dumps(unresolved, ensure_ascii=False), draft["id"]))
             authority_count = int(connection.execute("SELECT COUNT(*) FROM content_authority_source_links WHERE project_id=? AND content_asset_id=?", (asset["project_id"], asset["id"])).fetchone()[0])
@@ -3445,13 +4665,22 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         instructions = [dict(item) for item in raw_instructions if isinstance(item, Mapping)][:2] if isinstance(raw_instructions, list) else []
         if not instructions:
             raise ValueError("quality review has no targeted rewrite instructions")
-        rewrite_count = int(connection.execute("SELECT COUNT(*) FROM content_drafts WHERE content_asset_id=? AND qa_json LIKE '%rewrite_from_draft_id%'", (asset["id"],)).fetchone()[0])
+        rewrite_count = int(connection.execute(
+            """SELECT COUNT(*) FROM content_drafts
+               WHERE content_asset_id=? AND generation_job_id=?
+                 AND qa_json LIKE ?""",
+            (asset["id"], generation_job_id, "%rewrite_from_draft_id%"),
+        ).fetchone()[0])
         if rewrite_count >= 2:
             raise ValueError("targeted rewrite limit reached; review the remaining issues manually")
         brief = self._current_content_brief(connection, asset)
-        brief_payload = self._content_brief_payload(brief)
+        brief_payload = self._ensure_brief_industry_policy(
+            connection, asset, brief, self._content_brief_payload(brief), generator, provider, model, generation_job_id
+        )
         rewrite_data = {
             "canonical_title": asset["title_snapshot"], "primary_keyword": asset["keyword"],
+            "project_context": brief_payload["brief"].get("project_context", {}),
+            "writing_policy": self._writing_policy(brief_payload["brief"]),
             "article": {"title": draft["title"], "markdown": self._sanitize_reader_markdown(str(draft["markdown"])), "meta_description": draft["meta_description"]},
             "instructions": instructions, "sources": brief_payload["sources"],
             "learning_memories": brief_payload["brief"].get("learning_memories", []),
@@ -3464,43 +4693,208 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         rewrite_qa = {"status": "not_run", "rewrite_from_draft_id": draft["id"], "applied_targets": rewritten.get("applied_targets", []), "checks": [], "unresolved_verify": verification}
         with connection:
             version = int(connection.execute("SELECT COALESCE(MAX(version),0)+1 FROM content_drafts WHERE content_asset_id=?", (asset["id"],)).fetchone()[0])
+            sanitized_markdown = self._normalise_primary_keyword_emphasis(self._sanitize_reader_markdown(markdown), str(asset["keyword"] or ""))
             cursor = connection.execute("""INSERT INTO content_drafts(
                    project_id,content_asset_id,outline_id,generation_run_id,generation_job_id,parent_draft_id,
                    version,title,meta_description,markdown,sources_used_json,unresolved_verify_json,qa_json,
                    qa_status,provider,model
-               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (asset["project_id"], asset["id"], asset["current_outline_id"], run["id"], generation_job_id, draft["id"], version, draft["title"], str(rewritten.get("meta_description") or draft["meta_description"] or ""), self._sanitize_reader_markdown(markdown), draft["sources_used_json"], json.dumps(verification, ensure_ascii=False), json.dumps(rewrite_qa, ensure_ascii=False), "not_run", provider, model))
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (asset["project_id"], asset["id"], asset["current_outline_id"], run["id"], generation_job_id, draft["id"], version, draft["title"], str(rewritten.get("meta_description") or draft["meta_description"] or ""), sanitized_markdown, draft["sources_used_json"], json.dumps(verification, ensure_ascii=False), json.dumps(rewrite_qa, ensure_ascii=False), "not_run", provider, model))
             connection.execute("UPDATE content_assets SET status='needs_revision',current_draft_id=?,current_generation_run_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (cursor.lastrowid, run["id"], asset["id"]))
             updated = connection.execute("SELECT * FROM content_drafts WHERE id=?", (cursor.lastrowid,)).fetchone()
         return self._content_draft_payload(updated)
 
-    def _generate_ai_brief(self, connection: sqlite3.Connection, asset: sqlite3.Row, payload: Mapping[str, Any], generator: Any, provider: str, model: str | None, generation_job_id: int) -> dict[str, Any]:
+    @staticmethod
+    def _normalise_industry_rules(value: Mapping[str, Any], explicit_industry: str) -> dict[str, Any]:
+        """Keep the model policy bounded and make an explicit project industry authoritative."""
+        list_fields = (
+            "tone_rules", "structure_rules", "terminology_rules", "content_patterns",
+            "prohibited_claims", "conversion_rules", "localization_rules",
+        )
+        rules: dict[str, Any] = {
+            "industry": str(value.get("industry") or "").strip(),
+            "industry_basis": str(value.get("industry_basis") or "unknown").strip().lower(),
+            "audience_language": str(value.get("audience_language") or "").strip(),
+        }
+        try:
+            confidence = float(value.get("industry_confidence") or 0.0)
+        except (TypeError, ValueError):
+            confidence = 0.0
+        rules["industry_confidence"] = max(0.0, min(confidence, 1.0))
+        for field in list_fields:
+            raw = value.get(field)
+            rules[field] = list(dict.fromkeys(
+                str(item).strip() for item in raw
+                if isinstance(item, str) and item.strip()
+            ))[:20] if isinstance(raw, list) else []
+        raw_evidence = value.get("evidence_policy")
+        evidence = dict(raw_evidence) if isinstance(raw_evidence, Mapping) else {}
+        risk_level = str(evidence.get("risk_level") or "standard").strip().lower()
+        if risk_level not in {"standard", "elevated", "ymyl"}:
+            risk_level = "elevated"
+        rules["evidence_policy"] = {
+            "risk_level": risk_level,
+            **{
+                field: list(dict.fromkeys(
+                    str(item).strip() for item in evidence.get(field, [])
+                    if isinstance(item, str) and item.strip()
+                ))[:20]
+                for field in ("preferred_sources", "high_risk_claims", "required_disclosures")
+            },
+        }
+        if explicit_industry:
+            rules["industry"] = explicit_industry
+            rules["industry_basis"] = "explicit"
+            rules["industry_confidence"] = 1.0
+        elif rules["industry_basis"] not in {"inferred", "unknown"}:
+            rules["industry_basis"] = "inferred" if rules["industry"] else "unknown"
+        return rules
+
+    @staticmethod
+    def _writing_policy(brief: Mapping[str, Any]) -> dict[str, Any]:
+        industry_rules = brief.get("industry_rules")
+        return {
+            "fixed_safety_rules": list(FIXED_CONTENT_SAFETY_RULES),
+            "industry_rules": dict(industry_rules) if isinstance(industry_rules, Mapping) else {},
+            "priority": "Fixed safety and evidence rules override dynamic industry preferences.",
+        }
+
+    def _project_writing_context(self, connection: sqlite3.Connection, asset: sqlite3.Row) -> tuple[dict[str, Any], list[dict[str, str]]]:
+        project = connection.execute(
+            "SELECT id,name,site_url,industry,default_country,default_language FROM projects WHERE id=?",
+            (asset["project_id"],),
+        ).fetchone()
+        if project is None:
+            raise ValueError("project does not exist")
+        project_context = {
+            "project_id": int(project["id"]),
+            "name": str(project["name"] or ""),
+            "site_url": str(project["site_url"] or ""),
+            "industry": str(project["industry"] or "").strip(),
+            "country": str(project["default_country"] or ""),
+            "language": str(project["default_language"] or ""),
+        }
+        rows = connection.execute(
+            """SELECT title,source_type,url,knowledge_type,summary,content
+               FROM project_knowledge_documents
+               WHERE project_id=? AND status='ready'
+               ORDER BY CASE WHEN summary<>'' THEN 0 ELSE 1 END,updated_at DESC,id DESC
+               LIMIT 12""",
+            (asset["project_id"],),
+        ).fetchall()
+        signals: list[dict[str, str]] = []
+        for row in rows:
+            summary = str(row["summary"] or "").strip()
+            content = re.sub(r"\s+", " ", str(row["content"] or "")).strip()
+            signals.append({
+                "title": str(row["title"] or "")[:300],
+                "source_type": str(row["source_type"] or ""),
+                "knowledge_type": str(row["knowledge_type"] or ""),
+                "url": str(row["url"] or "")[:1000],
+                "summary_or_excerpt": (summary or content)[:700],
+            })
+        return project_context, signals
+
+    def _generate_project_industry_rules(
+        self,
+        connection: sqlite3.Connection,
+        asset: sqlite3.Row,
+        generator: Any,
+        provider: str,
+        model: str | None,
+        generation_job_id: int,
+        *,
+        audience: str,
+        business_goal: str,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        project_context, knowledge_signals = self._project_writing_context(connection, asset)
+        industry_input = {
+            "project_context": project_context,
+            "article_context": {
+                "canonical_title": asset["title_snapshot"],
+                "primary_keyword": asset["keyword"],
+                "locale": asset["locale"],
+                "target_audience": audience,
+                "business_goal": business_goal,
+            },
+            "knowledge_signals": knowledge_signals,
+            "fixed_safety_rules": list(FIXED_CONTENT_SAFETY_RULES),
+            "instruction": "Generate rules only for this project and article. Do not reuse an industry policy from another project.",
+        }
+        raw_rules, _run = self._run_content_stage(
+            connection, asset, "industry_rules", industry_input, generator, provider, model, generation_job_id
+        )
+        return project_context, self._normalise_industry_rules(raw_rules, project_context["industry"])
+
+    def _ensure_brief_industry_policy(
+        self,
+        connection: sqlite3.Connection,
+        asset: sqlite3.Row,
+        brief: sqlite3.Row,
+        brief_payload: dict[str, Any],
+        generator: Any,
+        provider: str,
+        model: str | None,
+        generation_job_id: int,
+    ) -> dict[str, Any]:
+        if isinstance(brief_payload["brief"].get("industry_rules"), Mapping):
+            return brief_payload
+        project_context, industry_rules = self._generate_project_industry_rules(
+            connection, asset, generator, provider, model, generation_job_id,
+            audience=str(brief["target_audience"] or ""),
+            business_goal=str(brief["business_goal"] or ""),
+        )
+        updated = dict(brief_payload["brief"])
+        updated["project_context"] = project_context
+        updated["industry_rules"] = industry_rules
+        updated["fixed_safety_rules"] = list(FIXED_CONTENT_SAFETY_RULES)
+        with connection:
+            connection.execute("UPDATE content_briefs SET brief_json=? WHERE id=?", (json.dumps(updated, ensure_ascii=False), brief["id"]))
+        brief_payload["brief"] = updated
+        return brief_payload
+
+    def _generate_ai_brief(self, connection: sqlite3.Connection, asset: sqlite3.Row, payload: Mapping[str, Any], generator: Any, provider: str, model: str | None, generation_job_id: int, *, agent_job_id: int | None = None) -> dict[str, Any]:
         audience = self._optional_text(payload, "target_audience") or "US searchers evaluating this topic"
         goal = self._optional_text(payload, "business_goal") or "informational"
         manual_sources = self._content_sources(payload.get("sources", []))
         competitor_sources, analysis = self._research_sources(connection, asset["id"])
         authority_sources = self._authority_sources_for_asset(connection, asset)
+        gsc_performance_sources = self._gsc_performance_sources_for_asset(connection, asset)
         self._link_authority_sources_for_asset(connection, asset, authority_sources)
-        sources = authority_sources + competitor_sources + manual_sources
+        # Search Console data is deliberately a separate source family.  It
+        # guides terminology, intent and internal-link choices, but is never
+        # evidence for reader-facing product, safety, performance or ranking
+        # claims.  Keeping the type explicit makes that boundary enforceable
+        # in every model stage and auditable after generation.
+        sources = authority_sources + gsc_performance_sources + competitor_sources + manual_sources
+        project_context, industry_rules = self._generate_project_industry_rules(
+            connection, asset, generator, provider, model, generation_job_id,
+            audience=audience, business_goal=goal,
+        )
+        writing_policy = {
+            "fixed_safety_rules": list(FIXED_CONTENT_SAFETY_RULES),
+            "industry_rules": industry_rules,
+            "priority": "Fixed safety and evidence rules override dynamic industry preferences.",
+        }
         if analysis is None:
-            data = {"topic": asset["title_snapshot"], "primary_keyword": asset["keyword"], "language_market": asset["locale"], "audience": audience, "business_goal": goal, "brand": self._optional_text(payload, "brand") or "", "sources": sources, "learning_memories": payload.get("learning_memories", []), "constraints": payload.get("constraints", [])}
+            data = {"topic": asset["title_snapshot"], "primary_keyword": asset["keyword"], "language_market": asset["locale"], "audience": audience, "business_goal": goal, "brand": self._optional_text(payload, "brand") or "", "project_context": project_context, "writing_policy": writing_policy, "sources": sources, "learning_memories": payload.get("learning_memories", []), "constraints": payload.get("constraints", [])}
             semantic, _run = self._run_content_stage(connection, asset, "semantic", data, generator, provider, model, generation_job_id)
         else:
             semantic = {"intent": {"dominant": analysis.get("search_intent", ""), "secondary": [], "reader_job": ""}, "entities": analysis.get("entities", []), "gaps_or_conflicts": [{"item": item, "action": "cover"} for item in analysis.get("missing_gaps", []) if isinstance(item, str)], "angle": "Competitor-informed original synthesis.", "must_cover": analysis.get("missing_gaps", [])}
-        brief_json = {"semantic": semantic, "competitor_analysis": analysis or {}, "learning_memories": payload.get("learning_memories", []), "source_policy": "Material facts without a usable source must be marked [VERIFY]."}
+        brief_json = {"project_context": project_context, "industry_rules": industry_rules, "fixed_safety_rules": list(FIXED_CONTENT_SAFETY_RULES), "semantic": semantic, "competitor_analysis": analysis or {}, "learning_memories": payload.get("learning_memories", []), "source_policy": "Material facts without a usable source must be recorded in unresolved_verify and omitted from reader-facing text, unless a genuinely general non-factual explanation is useful."}
         with connection:
             connection.execute("UPDATE content_briefs SET status='superseded' WHERE content_asset_id=? AND status='current'", (asset["id"],))
-            cursor = connection.execute("INSERT INTO content_briefs(content_asset_id,target_audience,business_goal,target_length,sources_json,brief_json) VALUES(?,?,?,?,?,?)", (asset["id"], audience, goal, 0, json.dumps(sources, ensure_ascii=False), json.dumps(brief_json, ensure_ascii=False)))
+            cursor = connection.execute("INSERT INTO content_briefs(content_asset_id,target_audience,business_goal,target_length,sources_json,brief_json,agent_job_id) VALUES(?,?,?,?,?,?,?)", (asset["id"], audience, goal, 0, json.dumps(sources, ensure_ascii=False), json.dumps(brief_json, ensure_ascii=False), agent_job_id))
             connection.execute("UPDATE content_assets SET status='briefing',current_brief_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (cursor.lastrowid, asset["id"]))
             row = connection.execute("SELECT * FROM content_briefs WHERE id=?", (cursor.lastrowid,)).fetchone()
         return self._content_brief_payload(row)
 
     def _refresh_current_brief_company_knowledge(self, connection: sqlite3.Connection, asset: sqlite3.Row, payload: Mapping[str, Any]) -> None:
-        """Replace only current-site knowledge sources in an existing Brief.
+        """Refresh first-party knowledge and project-local GSC intelligence.
 
         A Brief is intentionally durable for manual research, but the website
-        knowledge base changes as product pages are crawled or edited.  The
+        knowledge base and Search Console rows change independently.  The
         current generation payload is the scoped bridge from that website to
-        this SQLite content project, so keep its company knowledge fresh while
+        this content project, so refresh those two source families while
         preserving manual, authority, and competitor sources already saved.
         """
         raw_sources = payload.get("sources")
@@ -3508,19 +4902,86 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             return
         incoming = self._content_sources(raw_sources)
         company_sources = [source for source in incoming if source.get("source_type") == "company_knowledge"]
-        if not company_sources:
-            return
         brief = self._current_content_brief(connection, asset)
         existing = self._content_brief_payload(brief)["sources"]
         preserved = [
             source for source in existing
-            if not (isinstance(source, Mapping) and source.get("source_type") == "company_knowledge")
+            if not (isinstance(source, Mapping) and source.get("source_type") == "gsc_performance")
         ]
+        if company_sources:
+            preserved = [
+                source for source in preserved
+                if not (isinstance(source, Mapping) and source.get("source_type") == "company_knowledge")
+            ]
+        refreshed_sources = preserved + company_sources + self._gsc_performance_sources_for_asset(connection, asset)
         with connection:
             connection.execute(
                 "UPDATE content_briefs SET sources_json=? WHERE id=?",
-                (json.dumps(preserved + company_sources, ensure_ascii=False), brief["id"]),
+                (json.dumps(refreshed_sources, ensure_ascii=False), brief["id"]),
             )
+
+    @staticmethod
+    def _gsc_context_terms(*values: Any) -> set[str]:
+        ignored = {
+            "about", "after", "also", "and", "are", "best", "can", "for", "from", "guide", "how", "into", "its",
+            "led", "light", "lights", "more", "outdoor", "product", "products", "that", "the", "their", "this", "use",
+            "what", "when", "which", "with", "your",
+        }
+        return {
+            token.casefold()
+            for value in values
+            for token in re.findall(r"[A-Za-z0-9]{3,}", str(value or ""))
+            if token.casefold() not in ignored
+        }
+
+    def _gsc_performance_sources_for_asset(self, connection: sqlite3.Connection, asset: sqlite3.Row) -> list[dict[str, Any]]:
+        """Return small, topic-relevant Search Console planning signals.
+
+        This is not an authority-source lookup.  The metrics remain private
+        context for vocabulary, intent, overlap and internal-link decisions;
+        writer prompts explicitly prohibit exposing them as reader evidence.
+        """
+        terms = self._gsc_context_terms(asset["keyword"], asset["title_snapshot"])
+        rows = connection.execute(
+            """SELECT id,query,page_url,clicks,impressions,ctr,position,collected_at
+               FROM project_gsc_query_rows
+               WHERE project_id=? AND TRIM(query)<>''
+               ORDER BY impressions DESC, clicks DESC, id DESC
+               LIMIT 120""",
+            (asset["project_id"],),
+        ).fetchall()
+        ranked: list[tuple[int, float, sqlite3.Row]] = []
+        for row in rows:
+            query_terms = self._gsc_context_terms(row["query"])
+            overlap = len(terms & query_terms)
+            if terms and not overlap:
+                continue
+            ranked.append((overlap, float(row["impressions"] or 0), row))
+        ranked.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        sources: list[dict[str, Any]] = []
+        for _overlap, _impressions, row in ranked[:8]:
+            query = str(row["query"] or "").strip()
+            page_url = str(row["page_url"] or "").strip()
+            if not query or not page_url:
+                continue
+            sources.append({
+                "source_id": f"gsc-performance-{row['id']}",
+                "source_type": "gsc_performance",
+                "availability": "available",
+                "title": f"Search Console intent signal: {query}",
+                "url": page_url,
+                "publisher": "Google Search Console (project-local planning data)",
+                "collected_at": str(row["collected_at"] or ""),
+                "content": (
+                    "Private GSC planning signal. Use this only to understand reader wording, likely intent, "
+                    "current-site overlap, or an internal-link opportunity. Never expose these metrics or use them "
+                    "as reader-facing evidence.\n"
+                    f"Observed query: {query}\nExisting site page: {page_url}\n"
+                    f"Clicks: {float(row['clicks'] or 0):g}; impressions: {float(row['impressions'] or 0):g}; "
+                    f"CTR: {float(row['ctr'] or 0):.4f}; average position: {float(row['position'] or 0):.1f}"
+                ),
+            })
+        return sources
 
     def _authority_sources_for_asset(self, connection: sqlite3.Connection, asset: sqlite3.Row) -> list[dict[str, Any]]:
         rows = connection.execute("SELECT * FROM authority_source_library WHERE project_id=? ORDER BY CASE authority_level WHEN 'primary' THEN 0 WHEN 'authoritative' THEN 1 WHEN 'supporting' THEN 2 ELSE 3 END,updated_at DESC", (asset["project_id"],)).fetchall()
@@ -3536,11 +4997,15 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             for source_id in source_ids:
                 connection.execute("INSERT OR IGNORE INTO content_authority_source_links(project_id,content_asset_id,authority_source_id) VALUES(?,?,?)", (asset["project_id"], asset["id"], source_id))
 
-    def _generate_ai_outline(self, connection: sqlite3.Connection, asset: sqlite3.Row, payload: Mapping[str, Any], generator: Any, provider: str, model: str | None, generation_job_id: int) -> dict[str, Any]:
+    def _generate_ai_outline(self, connection: sqlite3.Connection, asset: sqlite3.Row, payload: Mapping[str, Any], generator: Any, provider: str, model: str | None, generation_job_id: int, *, agent_job_id: int | None = None) -> dict[str, Any]:
         brief = self._current_content_brief(connection, asset)
-        brief_payload = self._content_brief_payload(brief)
+        brief_payload = self._ensure_brief_industry_policy(
+            connection, asset, brief, self._content_brief_payload(brief), generator, provider, model, generation_job_id
+        )
         semantic = brief_payload["brief"].get("semantic", {})
         competitor_analysis = brief_payload["brief"].get("competitor_analysis", {})
+        writing_policy = self._writing_policy(brief_payload["brief"])
+        project_context = brief_payload["brief"].get("project_context", {})
         if isinstance(competitor_analysis, Mapping) and isinstance(competitor_analysis.get("dynamic_outline"), list) and competitor_analysis["dynamic_outline"]:
             sections = competitor_analysis["dynamic_outline"]
             outline_json = {"intro_brief": "Answer the reader need directly.", "sections": sections, "conclusion_brief": "Summarize the decision and invite a B2B enquiry.", "cta_placement": "after conclusion"}
@@ -3549,7 +5014,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         else:
             prepared_sections = None
         learning_memories = brief_payload["brief"].get("learning_memories", [])
-        title_data = {"semantic": semantic, "primary_keyword": asset["keyword"], "title_snapshot": asset["title_snapshot"], "voice": self._optional_text(payload, "voice") or "clear, helpful American English", "learning_memories": learning_memories, "year_rule": "none"}
+        title_data = {"semantic": semantic, "project_context": project_context, "writing_policy": writing_policy, "primary_keyword": asset["keyword"], "title_snapshot": asset["title_snapshot"], "voice": self._optional_text(payload, "voice") or "clear, helpful American English", "learning_memories": learning_memories, "year_rule": "none"}
         if prepared_sections is None:
             metadata, _run = self._run_content_stage(connection, asset, "title", title_data, generator, provider, model, generation_job_id)
             if not isinstance(metadata.get("selected_title"), str) or not metadata["selected_title"].strip():
@@ -3559,7 +5024,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         updated_brief["metadata"] = metadata
         with connection:
             connection.execute("UPDATE content_briefs SET brief_json=? WHERE id=?", (json.dumps(updated_brief, ensure_ascii=False), brief["id"]))
-        outline_data = {"semantic": semantic, "metadata": metadata, "cta": self._optional_text(payload, "cta") or "", "sources": brief_payload["sources"], "learning_memories": learning_memories}
+        outline_data = {"semantic": semantic, "project_context": project_context, "writing_policy": writing_policy, "metadata": metadata, "cta": self._optional_text(payload, "cta") or "", "sources": brief_payload["sources"], "learning_memories": learning_memories}
         if prepared_sections is None:
             outline_json, _run = self._run_content_stage(connection, asset, "outline", outline_data, generator, provider, model, generation_job_id)
         else:
@@ -3568,6 +5033,8 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 plan_data = {
                     "topic": asset["title_snapshot"],
                     "primary_keyword": asset["keyword"],
+                    "project_context": project_context,
+                    "writing_policy": writing_policy,
                     "approved_outline": prepared_sections,
                     "sources": company_sources,
                     "instruction": "Plan company knowledge placement before H2 drafting; keep the approved competitor outline unchanged.",
@@ -3584,12 +5051,12 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         outline_json = dict(outline_json)
         outline_json["sections"] = sections
         with connection:
-            cursor = connection.execute("INSERT INTO content_outlines(content_asset_id,brief_id,status) VALUES(?,?,?)", (asset["id"], brief["id"], "approved"))
+            cursor = connection.execute("INSERT INTO content_outlines(content_asset_id,brief_id,status,agent_job_id) VALUES(?,?,?,?)", (asset["id"], brief["id"], "approved", agent_job_id))
             for position, section in enumerate(sections, 1):
                 if not isinstance(section, Mapping) or not isinstance(section.get("heading"), str) or not section["heading"].strip():
                     raise ContentGenerationProtocolError("AI content outline has an invalid section.")
                 section_data = self._normalise_outline_section(section, position)
-                connection.execute("INSERT INTO content_outline_sections(outline_id,position,heading,purpose,word_budget,section_json) VALUES(?,?,?,?,?,?)", (cursor.lastrowid, position, section_data["heading"], section_data["purpose"], 0, json.dumps(section_data, ensure_ascii=False)))
+                connection.execute("INSERT INTO content_outline_sections(outline_id,position,heading,purpose,word_budget,section_json) VALUES(?,?,?,?,?,?)", (cursor.lastrowid, position, section_data["heading"], section_data["purpose"], max(0, int(section_data.get("target_words") or 0)), json.dumps(section_data, ensure_ascii=False)))
             connection.execute("UPDATE content_assets SET status='outlining',current_outline_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (cursor.lastrowid, asset["id"]))
             row = connection.execute("SELECT * FROM content_outlines WHERE id=?", (cursor.lastrowid,)).fetchone()
         result = self._content_outline_payload(connection, row)
@@ -3641,10 +5108,14 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         outline = connection.execute("SELECT * FROM content_outlines WHERE id=?", (asset["current_outline_id"],)).fetchone()
         if outline is None:
             raise ValueError("current content outline does not exist")
-        brief_data = self._content_brief_payload(brief)
+        brief_data = self._ensure_brief_industry_policy(
+            connection, asset, brief, self._content_brief_payload(brief), generator, provider, model, generation_job_id
+        )
         semantic = brief_data["brief"].get("semantic", {})
         competitor_learning = brief_data["brief"].get("competitor_analysis", {})
         learning_memories = brief_data["brief"].get("learning_memories", [])
+        writing_policy = self._writing_policy(brief_data["brief"])
+        project_context = brief_data["brief"].get("project_context", {})
         metadata = brief_data["brief"].get("metadata", {"selected_title": asset["title_snapshot"], "meta_description": ""})
         if not isinstance(metadata, Mapping): metadata = {"selected_title": asset["title_snapshot"], "meta_description": ""}
         outline_payload = self._content_outline_payload(connection, outline)
@@ -3657,6 +5128,10 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         numbered_list_count = self._numbered_listicle_count(str(asset["title_snapshot"]))
         canonical_heading_key = self._outline_heading_key(str(asset["title_snapshot"]))
         section_drafts: list[dict[str, Any]] = []
+        # A link is a reader-navigation aid, not an SEO quota.  Reserve each
+        # exact destination as soon as its H2 plan is accepted so later H2s
+        # cannot repeat it, even if the model tries to do so.
+        reserved_internal_link_urls: set[str] = set()
         for section in blueprint["sections"]:
             section_source_ids = set(section.get("source_ids", []))
             assigned_company_sources = company_context.get(int(section["position"]), [])
@@ -3678,24 +5153,73 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                     "Use one relevant, source-supported company/product fact naturally in this H2. "
                     "If a supplied company source has an exact public URL, one natural link to that URL is allowed."
                 )
-            chapter_plan_data = {"topic": asset["title_snapshot"], "audience": brief["target_audience"], "intent": semantic.get("intent", {}), "title": metadata.get("selected_title", asset["title_snapshot"]), "current_section": section_context, "article_outline": blueprint, "competitor_learning": competitor_learning, "learning_memories": learning_memories, "sources": section_sources, "language": asset["locale"]}
-            chapter_plan, _run = self._run_content_stage(connection, asset, "chapter_plan", chapter_plan_data, generator, provider, model, generation_job_id)
+            link_candidates = self._internal_link_candidates_for_section(
+                project_site_url=str(project_context.get("site_url") or ""),
+                section=section_context,
+                sources=brief_data["sources"],
+                assigned_company_source_ids=assigned_company_ids,
+            )
+            candidate_source_ids = {str(candidate["source_id"]) for candidate in link_candidates}
+            section_sources.extend(
+                source for source in brief_data["sources"]
+                if isinstance(source, Mapping)
+                and str(source.get("source_id") or "") in candidate_source_ids
+                and not any(str(existing.get("source_id") or "") == str(source.get("source_id") or "") for existing in section_sources if isinstance(existing, Mapping))
+            )
+            section_context["eligible_internal_links"] = link_candidates
+            section_context["internal_link_budget"] = {
+                "article_maximum": 3,
+                "already_reserved": len(reserved_internal_link_urls),
+                "h2_maximum": 1,
+            }
+            chapter_plan_data = {"topic": asset["title_snapshot"], "audience": brief["target_audience"], "intent": semantic.get("intent", {}), "project_context": project_context, "writing_policy": writing_policy, "title": metadata.get("selected_title", asset["title_snapshot"]), "current_section": section_context, "article_outline": blueprint, "competitor_learning": competitor_learning, "learning_memories": learning_memories, "sources": section_sources, "language": asset["locale"]}
+            chapter_plan = self._completed_generation_stage_output(
+                connection, generation_job_id, "chapter_plan", section_context["id"]
+            )
+            if chapter_plan is None:
+                chapter_plan, _run = self._run_content_stage(connection, asset, "chapter_plan", chapter_plan_data, generator, provider, model, generation_job_id)
             if not isinstance(chapter_plan.get("subtopics"), list) or not chapter_plan["subtopics"]:
                 raise ContentGenerationProtocolError("AI content chapter plan returned no usable subtopics.")
+            product_recommendation = self._validated_product_recommendation(
+                chapter_plan.get("product_recommendation"), assigned_company_sources
+            )
+            internal_link_plan = self._validated_internal_link_plan(
+                chapter_plan.get("internal_link_plan"), link_candidates, reserved_internal_link_urls
+            )
+            if internal_link_plan["use"]:
+                reserved_internal_link_urls.add(internal_link_plan["target_url"])
+            chapter_plan["product_recommendation"] = product_recommendation
+            chapter_plan["internal_link_plan"] = internal_link_plan
+            section_context["product_recommendation"] = product_recommendation
+            section_context["internal_link_plan"] = internal_link_plan
             section_context["chapter_plan"] = chapter_plan
             with connection:
                 connection.execute(
                     "UPDATE content_outline_sections SET section_json=? WHERE outline_id=? AND position=?",
                     (json.dumps(section_context, ensure_ascii=False), outline["id"], section["position"]),
                 )
-            section_data = {"topic": asset["title_snapshot"], "audience": brief["target_audience"], "intent": semantic.get("intent", {}), "angle": semantic.get("angle", ""), "title": metadata.get("selected_title", asset["title_snapshot"]), "section": section_context, "chapter_plan": chapter_plan, "competitor_learning": competitor_learning, "learning_memories": learning_memories, "sources": section_sources, "voice": self._optional_text(payload, "voice") or "clear, helpful American English", "language": asset["locale"], "reader_markdown_policy": "Never display internal source IDs or competitor markers. Keep source references in claims_used only."}
-            drafted, _run = self._run_content_stage(connection, asset, "section", section_data, generator, provider, model, generation_job_id)
+            section_data = {"topic": asset["title_snapshot"], "audience": brief["target_audience"], "intent": semantic.get("intent", {}), "project_context": project_context, "writing_policy": writing_policy, "angle": semantic.get("angle", ""), "title": metadata.get("selected_title", asset["title_snapshot"]), "section": section_context, "chapter_plan": chapter_plan, "competitor_learning": competitor_learning, "learning_memories": learning_memories, "sources": section_sources, "voice": self._optional_text(payload, "voice") or "clear, helpful American English", "language": asset["locale"], "reader_markdown_policy": "Never display internal source IDs or competitor markers. Keep source references in claims_used only. Output portable Markdown, never raw HTML. Use Markdown pipe tables, explicit consecutive ordered-list numbers, and - [ ] / - [x] task-list syntax."}
+            drafted = self._completed_generation_stage_output(
+                connection, generation_job_id, "section", section_context["id"]
+            )
+            if drafted is None:
+                drafted, _run = self._run_content_stage(connection, asset, "section", section_data, generator, provider, model, generation_job_id)
             if not isinstance(drafted.get("markdown"), str):
                 raise ContentGenerationProtocolError("AI content section returned no Markdown.")
+            drafted["markdown"], link_written = self._enforce_section_internal_link_plan(
+                drafted["markdown"], internal_link_plan
+            )
+            drafted["internal_link_audit"] = {
+                "plan": internal_link_plan,
+                "written": link_written,
+                "reason": "validated exact project URL and natural-anchor plan" if link_written else "no validated internal link was written",
+            }
             section_drafts.append(drafted)
         assembly_data = {
             "metadata": dict(metadata),
             "intent": semantic.get("intent", {}),
+            "project_context": project_context,
+            "writing_policy": writing_policy,
             "outline": [{"heading": section.get("heading", ""), "purpose": section.get("purpose", ""), "reader_question": section.get("reader_question", "")} for section in blueprint["sections"]],
             "brand": self._optional_text(payload, "brand") or "",
             "learning_memories": learning_memories,
@@ -3715,6 +5239,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             title = str(article.get("title") or metadata.get("selected_title") or asset["title_snapshot"]).strip()
             chapter_markdown = [str(draft["markdown"]).strip() for draft in section_drafts if isinstance(draft.get("markdown"), str) and draft["markdown"].strip()]
             markdown = self._sanitize_reader_markdown("\n\n".join(part for part in [f"# {title}", intro, *chapter_markdown, conclusion] if part))
+        markdown = self._normalise_primary_keyword_emphasis(markdown, str(asset["keyword"] or ""))
         verification = article.get("verify", []) if isinstance(article.get("verify", []), list) else []
         for draft in section_drafts:
             if isinstance(draft.get("verify"), list):
@@ -3910,35 +5435,234 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             used_source_ids.add(source_id)
         return assignments
 
+    @staticmethod
+    def _canonical_internal_url(value: Any) -> str:
+        """Normalize one public URL for exact internal-link allow-list checks."""
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        parsed = urlsplit(raw)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc or parsed.username or parsed.password:
+            return ""
+        path = parsed.path or "/"
+        return urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), path, parsed.query, ""))
+
+    @staticmethod
+    def _internal_host_key(value: str) -> str:
+        """Treat www and apex forms of one project domain as the same site."""
+        host = (urlsplit(value).hostname or "").casefold()
+        return host[4:] if host.startswith("www.") else host
+
+    @classmethod
+    def _internal_link_candidates_for_section(
+        cls,
+        *,
+        project_site_url: str,
+        section: Mapping[str, Any],
+        sources: list[Any],
+        assigned_company_source_ids: set[str],
+    ) -> list[dict[str, str]]:
+        """Return only exact, project-local destinations the current H2 may use.
+
+        GSC can point to an existing page but cannot prove a product fact.  A
+        company page can provide product context only when it has already been
+        assigned to this H2.  Keeping the candidate set small and explicit
+        lets the model explain its choice without being able to invent routes.
+        """
+        project_host = cls._internal_host_key(project_site_url)
+        if not project_host:
+            return []
+        section_terms = cls._gsc_context_terms(
+            section.get("heading"), section.get("reader_question"), section.get("purpose"), section.get("key_points")
+        )
+        ranked: list[tuple[int, dict[str, str]]] = []
+        seen_urls: set[str] = set()
+        for source in sources:
+            if not isinstance(source, Mapping):
+                continue
+            source_id = str(source.get("source_id") or "")
+            source_type = str(source.get("source_type") or "")
+            url = cls._canonical_internal_url(source.get("url"))
+            if not source_id or not url or cls._internal_host_key(url) != project_host or url in seen_urls:
+                continue
+            is_assigned_company_source = source_type == "company_knowledge" and source_id in assigned_company_source_ids
+            is_gsc_source = source_type in {"gsc_performance", "gsc_anchor"}
+            if not (is_assigned_company_source or is_gsc_source):
+                continue
+            source_terms = cls._gsc_context_terms(source.get("title"), source.get("content"))
+            overlap = len(section_terms & source_terms)
+            # Product context is deliberately scoped to the H2 chosen by the
+            # company-context planner. GSC candidates remain optional and are
+            # limited to the strongest matching existing-site pages.
+            score = overlap * 10 + (3 if is_assigned_company_source else 0)
+            ranked.append((score, {
+                "source_id": source_id,
+                "source_type": source_type,
+                "target_url": url,
+                "title": str(source.get("title") or "")[:300],
+                "role": "assigned_product_context" if is_assigned_company_source else "gsc_internal_link_opportunity",
+            }))
+            seen_urls.add(url)
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        return [candidate for _score, candidate in ranked[:4]]
+
+    @classmethod
+    def _validated_product_recommendation(cls, raw_plan: Any, assigned_sources: list[Mapping[str, Any]]) -> dict[str, Any]:
+        """Keep product recommendations tied to the H2's assigned evidence."""
+        empty = {"use": False, "source_id": "", "product_name": "", "supported_role": "", "link_url": "", "placement": "", "reason": ""}
+        if not isinstance(raw_plan, Mapping) or raw_plan.get("use") is not True:
+            return empty
+        by_id = {str(source.get("source_id") or ""): source for source in assigned_sources}
+        source_id = str(raw_plan.get("source_id") or "")
+        source = by_id.get(source_id)
+        if source is None:
+            return empty
+        expected_url = cls._canonical_internal_url(source.get("url"))
+        requested_url = cls._canonical_internal_url(raw_plan.get("link_url"))
+        if requested_url and requested_url != expected_url:
+            return empty
+        product_name = re.sub(r"\s+", " ", str(raw_plan.get("product_name") or "")).strip()[:160]
+        supported_role = re.sub(r"\s+", " ", str(raw_plan.get("supported_role") or "")).strip()[:400]
+        if not product_name or not supported_role:
+            return empty
+        return {
+            "use": True,
+            "source_id": source_id,
+            "product_name": product_name,
+            "supported_role": supported_role,
+            "link_url": expected_url,
+            "placement": re.sub(r"\s+", " ", str(raw_plan.get("placement") or "")).strip()[:240],
+            "reason": re.sub(r"\s+", " ", str(raw_plan.get("reason") or "")).strip()[:400],
+        }
+
+    @classmethod
+    def _validated_internal_link_plan(
+        cls, raw_plan: Any, candidates: list[Mapping[str, str]], reserved_urls: set[str]
+    ) -> dict[str, Any]:
+        """Accept at most one link only when it exactly matches a supplied candidate."""
+        empty = {"use": False, "anchor_text": "", "anchor_type": "", "target_url": "", "target_source_id": "", "placement": "", "reason": ""}
+        if not isinstance(raw_plan, Mapping) or raw_plan.get("use") is not True:
+            return empty
+        source_id = str(raw_plan.get("target_source_id") or "")
+        target_url = cls._canonical_internal_url(raw_plan.get("target_url"))
+        candidate = next((item for item in candidates if item.get("source_id") == source_id and item.get("target_url") == target_url), None)
+        if candidate is None or target_url in reserved_urls:
+            return empty
+        anchor_text = re.sub(r"\s+", " ", str(raw_plan.get("anchor_text") or "")).strip()
+        # An anchor has to read like ordinary visible prose, not markup, a
+        # URL, a call-to-action button, or an opaque keyword string.
+        if not (2 <= len(anchor_text) <= 90) or re.search(r"[\[\]()<>]|https?://", anchor_text, flags=re.IGNORECASE):
+            return empty
+        anchor_type = str(raw_plan.get("anchor_type") or "")
+        if anchor_type not in {"gsc_query", "related_term", "product_name", "descriptive"}:
+            anchor_type = "descriptive"
+        return {
+            "use": True,
+            "anchor_text": anchor_text,
+            "anchor_type": anchor_type,
+            "target_url": target_url,
+            "target_source_id": source_id,
+            "placement": re.sub(r"\s+", " ", str(raw_plan.get("placement") or "")).strip()[:240],
+            "reason": re.sub(r"\s+", " ", str(raw_plan.get("reason") or "")).strip()[:400],
+        }
+
+    @classmethod
+    def _enforce_section_internal_link_plan(cls, markdown: str, plan: Mapping[str, Any]) -> tuple[str, bool]:
+        """Remove model-invented links while preserving their visible wording.
+
+        The writer receives one validated plan. If it ignores that plan or
+        produces a different route, it is safer to retain the sentence as
+        plain text than to publish an unreviewed destination.
+        """
+        target_url = cls._canonical_internal_url(plan.get("target_url")) if plan.get("use") else ""
+        link_written = False
+
+        def keep_only_planned_link(match: re.Match[str]) -> str:
+            nonlocal link_written
+            label = match.group(1)
+            destination = cls._canonical_internal_url(match.group(2))
+            if target_url and destination == target_url and not link_written:
+                link_written = True
+                return f"[{label}]({target_url})"
+            return label
+
+        cleaned = re.sub(r"(?<!!)\[([^\]]+)\]\(([^\s)]+)(?:\s+['\"][^'\"]*['\"])?\)", keep_only_planned_link, markdown)
+        return cleaned, link_written
+
+    @staticmethod
+    def _completed_generation_stage_output(
+        connection: sqlite3.Connection, generation_job_id: int, stage: str, section_id: str,
+    ) -> dict[str, Any] | None:
+        """Reuse a completed chapter checkpoint when only a later H2 failed.
+
+        Each content stage keeps its original input/output in the durable run
+        table. A retry therefore resumes from the first missing H2 instead of
+        paying for, or overwriting, chapters that have already succeeded.
+        """
+        stored_stage = "outline" if stage == "chapter_plan" else stage
+        rows = connection.execute(
+            """SELECT input_json,output_json FROM content_generation_runs
+               WHERE generation_job_id=? AND stage=? AND status='completed'
+               ORDER BY id DESC""",
+            (generation_job_id, stored_stage),
+        ).fetchall()
+        for row in rows:
+            try:
+                stage_input = json.loads(row["input_json"] or "{}")
+                output = json.loads(row["output_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(stage_input, Mapping) or not isinstance(output, Mapping):
+                continue
+            if stage == "chapter_plan" and stage_input.get("workflow_stage") != "chapter_plan":
+                continue
+            section = stage_input.get("current_section") if stage == "chapter_plan" else stage_input.get("section")
+            if isinstance(section, Mapping) and section.get("id") == section_id:
+                return dict(output)
+        return None
+
     def _run_content_stage(self, connection: sqlite3.Connection, asset: sqlite3.Row, stage: str, data: Mapping[str, Any], generator: Any, provider: str, model: str | None, generation_job_id: int) -> tuple[dict[str, Any], dict[str, Any]]:
         # Existing local SQLite databases constrain the persisted stage column
         # to the original stage family. Preserve planning-only audit data in
         # input_json while storing it under that compatible outline family.
         # The API restores workflow_stage for the UI, so no detail is lost.
-        stored_stage = "outline" if stage in {"chapter_plan", "company_context_plan"} else ("section" if stage == "targeted_rewrite" else stage)
+        stored_stage = "semantic" if stage == "industry_rules" else ("outline" if stage in {"chapter_plan", "company_context_plan"} else ("section" if stage == "targeted_rewrite" else stage))
         logged_input = dict(data)
-        if stage in {"chapter_plan", "company_context_plan", "targeted_rewrite"}:
+        if stage in {"industry_rules", "chapter_plan", "company_context_plan", "targeted_rewrite"}:
             logged_input["workflow_stage"] = stage
         with connection:
             cursor = connection.execute("INSERT INTO content_generation_runs(project_id,content_asset_id,stage,provider,model,generation_job_id,status,input_json,prompt_version) VALUES(?,?,?,?,?,?,'running',?,?)", (asset["project_id"], asset["id"], stored_stage, provider, model, generation_job_id, json.dumps(logged_input, ensure_ascii=False), PROMPT_VERSION))
             run_id = int(cursor.lastrowid)
-        try:
-            if callable(getattr(generator, "run_stage", None)):
-                raw = generator.run_stage(stage=stage, data=dict(data))
-            elif callable(getattr(generator, "generate", None)):
-                raw = generator.generate(stage=stage, **dict(data))
-            else:
-                raise ContentGenerationProtocolError("configured content generator has no supported stage method")
-            result = json.loads(raw) if isinstance(raw, str) else raw
-            if not isinstance(result, Mapping):
-                raise ContentGenerationProtocolError(f"AI content {stage} returned invalid JSON.")
-            value = dict(result)
-        except Exception as error:
+        value: dict[str, Any] | None = None
+        last_error: Exception | None = None
+        # A transient provider reset should not discard a whole article batch.
+        # Completed earlier H2 checkpoints are reused on the next job retry;
+        # this local retry handles short-lived failures before that is needed.
+        for attempt in range(3):
+            try:
+                if callable(getattr(generator, "run_stage", None)):
+                    raw = generator.run_stage(stage=stage, data=dict(data))
+                elif callable(getattr(generator, "generate", None)):
+                    raw = generator.generate(stage=stage, **dict(data))
+                else:
+                    raise ContentGenerationProtocolError("configured content generator has no supported stage method")
+                result = json.loads(raw) if isinstance(raw, str) else raw
+                if not isinstance(result, Mapping):
+                    raise ContentGenerationProtocolError(f"AI content {stage} returned invalid JSON.")
+                value = dict(result)
+                break
+            except Exception as error:
+                last_error = error
+                if attempt < 2:
+                    time.sleep(1.2 * (attempt + 1))
+        if value is None:
+            error = last_error or ContentGenerationProtocolError(f"AI content {stage} failed.")
             with connection:
                 connection.execute("UPDATE content_generation_runs SET status='failed',error_summary=?,completed_at=CURRENT_TIMESTAMP WHERE id=?", (str(error) or f"AI content {stage} failed.", run_id))
             if isinstance(error, ContentGenerationProtocolError):
                 raise
-            raise ContentGenerationProtocolError(f"AI content {stage} request failed.") from error
+            detail = re.sub(r"(?i)(api[_-]?key|authorization|bearer|token)\s*[:=]?\s*[^\s,;]+", r"\1=[redacted]", str(error)).strip()
+            raise ContentGenerationProtocolError(f"AI content {stage} request failed: {detail[:240] or type(error).__name__}.") from error
         with connection:
             connection.execute("UPDATE content_generation_runs SET status='completed',output_json=?,completed_at=CURRENT_TIMESTAMP WHERE id=?", (json.dumps(value, ensure_ascii=False), run_id))
         return value, {"id": run_id, "stage": stage, "status": "completed"}
@@ -4007,6 +5731,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             "company_context_source_ids": strings("company_context_source_ids"),
             "company_context_role": section.get("company_context_role") if isinstance(section.get("company_context_role"), str) else "",
             "company_context_link_url": section.get("company_context_link_url") if isinstance(section.get("company_context_link_url"), str) else "",
+            "target_words": max(0, int(section.get("target_words") or 0)),
         }
 
     @staticmethod
@@ -4014,11 +5739,146 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         return re.sub(r"[\W_]+", "", value.casefold(), flags=re.UNICODE)
 
     @staticmethod
+    def _normalise_reader_markdown_format(markdown: str) -> str:
+        """Canonicalize model formatting before storage or reader delivery.
+
+        New prompts require Markdown, but this deterministic boundary also
+        converts legacy/raw HTML tables and repairs loose ordered-list markers.
+        """
+        def clean_cell(fragment: str) -> str:
+            value = re.sub(r"<(script|style|template|iframe|object|embed|svg|math)\b[^>]*>[\s\S]*?</\1\s*>", "", fragment, flags=re.IGNORECASE)
+            value = re.sub(r"<br\s*/?>", " ", value, flags=re.IGNORECASE)
+            value = re.sub(r"<[^>]+>", "", value)
+            value = " ".join(html.unescape(value).split())
+            return value.replace("|", "\\|")
+
+        def convert_table(match: re.Match[str]) -> str:
+            block = match.group(0)
+            rows: list[list[str]] = []
+            for row_block in re.findall(r"<tr\b[^>]*>([\s\S]*?)</tr\s*>", block, flags=re.IGNORECASE):
+                row = [clean_cell(cell) for _tag, cell in re.findall(r"<(th|td)\b[^>]*>([\s\S]*?)</(?:th|td)\s*>", row_block, flags=re.IGNORECASE)]
+                if row: rows.append(row)
+            if not rows: return block
+            width = max(len(row) for row in rows)
+            rows = [row + [""] * (width - len(row)) for row in rows]
+            header = rows[0]
+            body = rows[1:]
+            rendered = ["| " + " | ".join(header) + " |", "| " + " | ".join("---" for _ in header) + " |"]
+            rendered.extend("| " + " | ".join(row) + " |" for row in body)
+            return "\n".join(rendered)
+
+        cleaned = re.sub(r"<table\b[^>]*>[\s\S]*?</table\s*>", convert_table, markdown, flags=re.IGNORECASE)
+        lines = cleaned.splitlines()
+        active_indent: str | None = None
+        next_number = 1
+        for index, line in enumerate(lines):
+            match = re.match(r"^(\s*)(\d+)([.)])(\s+.+)$", line)
+            if match:
+                indent = match.group(1)
+                if active_indent != indent:
+                    active_indent = indent
+                    next_number = int(match.group(2))
+                lines[index] = f"{indent}{next_number}.{match.group(4)}"
+                next_number += 1
+            elif line.strip():
+                active_indent = None
+                next_number = 1
+        return "\n".join(lines)
+
+    @staticmethod
     def _sanitize_reader_markdown(markdown: str) -> str:
-        """Keep internal competitor evidence keys out of visitor-facing articles."""
+        """Keep internal evidence and quality-gate markers out of reader content."""
         cleaned = re.sub(r"\s*\[competitor-[a-z0-9_-]+\]", "", markdown, flags=re.IGNORECASE)
+        # Earlier drafts used [VERIFY] beside an unsupported claim.  The
+        # unresolved item remains in the database and still blocks publishing,
+        # but the reader sees neither the marker nor a verification note.
+        cleaned = re.sub(r"\s*\[(?:verify|verification)(?:\s*:\s*[^\]]*)?\]", "", cleaned, flags=re.IGNORECASE)
+        cleaned = KeywordDiscoveryRequestHandler._remove_internal_verification_columns(cleaned)
+        cleaned = KeywordDiscoveryRequestHandler._normalise_reader_markdown_format(cleaned)
         cleaned = re.sub(r"[ \t]+\n", "\n", cleaned)
         return re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+
+    @staticmethod
+    def _remove_internal_verification_columns(markdown: str) -> str:
+        """Remove legacy Markdown table columns used only for verification notes."""
+        lines = markdown.splitlines()
+
+        def cells(value: str) -> list[str]:
+            return [item.strip() for item in re.split(r"(?<!\\)\|", value.strip().strip("|"))]
+
+        def row(values: list[str]) -> str:
+            return "| " + " | ".join(values) + " |"
+
+        index = 0
+        internal_headers = {"verify", "verification", "verification status", "verification notes"}
+        while index + 1 < len(lines):
+            header = cells(lines[index]) if "|" in lines[index] else []
+            divider = cells(lines[index + 1]) if "|" in lines[index + 1] else []
+            is_divider = bool(divider) and len(header) == len(divider) and all(
+                re.fullmatch(r":?-{3,}:?", value.replace(" ", "")) is not None for value in divider
+            )
+            internal_indexes = [
+                position for position, value in enumerate(header)
+                if re.sub(r"[*_`]+", "", value).strip().casefold() in internal_headers
+            ]
+            if not (is_divider and internal_indexes):
+                index += 1
+                continue
+            keep = [position for position in range(len(header)) if position not in internal_indexes]
+            end = index + 2
+            while end < len(lines) and lines[end].strip() and "|" in lines[end]:
+                end += 1
+            rows = [cells(line) for line in lines[index + 2:end]]
+            if len(keep) >= 2:
+                lines[index:end] = [
+                    row([header[position] for position in keep]),
+                    row(["---" for _ in keep]),
+                    *[row([values[position] if position < len(values) else "" for position in keep]) for values in rows],
+                ]
+                index += len(rows) + 2
+            else:
+                # A one-column table is not valid Markdown; retain its useful
+                # reader value as a short list instead of an empty audit table.
+                replacement = [f"- {values[keep[0]].strip()}" for values in rows if keep and keep[0] < len(values) and values[keep[0]].strip()]
+                lines[index:end] = replacement
+                index += len(replacement)
+        return "\n".join(lines)
+
+    @staticmethod
+    def _english_word_count(markdown: str) -> int:
+        return len(re.findall(r"\b[A-Za-z0-9]+(?:['’-][A-Za-z0-9]+)?\b", markdown))
+
+    @staticmethod
+    def _bold_primary_keyword_count(markdown: str, keyword: str) -> int:
+        if not keyword.strip():
+            return 0
+        return len(re.findall(rf"\*\*{re.escape(keyword.strip())}\*\*", markdown, flags=re.IGNORECASE))
+
+    @staticmethod
+    def _normalise_primary_keyword_emphasis(markdown: str, keyword: str) -> str:
+        """Keep exactly one emphasized exact-match keyword in body prose.
+
+        H2 chapters are generated independently, so a model may follow the
+        global emphasis instruction once per chapter.  Normalize only the
+        Markdown markers; preserve the original wording and capitalization.
+        """
+        keyword = keyword.strip()
+        if not keyword:
+            return markdown
+        pattern = re.compile(rf"\*\*({re.escape(keyword)})\*\*", flags=re.IGNORECASE)
+        cleaned = pattern.sub(r"\1", markdown)
+        exact = re.compile(rf"(?<![\w*])({re.escape(keyword)})(?![\w*])", flags=re.IGNORECASE)
+        lines = cleaned.splitlines()
+        for index, line in enumerate(lines):
+            stripped = line.lstrip()
+            if not stripped or stripped.startswith("#") or stripped.startswith("|"):
+                continue
+            match = exact.search(line)
+            if match is None:
+                continue
+            lines[index] = f"{line[:match.start()]}**{match.group(1)}**{line[match.end():]}"
+            break
+        return "\n".join(lines)
 
     @staticmethod
     def _authority_evidence_context(markdown: str, *, max_chars: int = 4_000) -> str:
@@ -4112,33 +5972,47 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         industry = self._optional_text(payload, "industry") or ""
         site_url = self._optional_text(payload, "site_url") or name
         try:
-            with self._database() as connection:
-                project_id = KeywordImportService(connection).create_project(name, country, language)
-                connection.execute("UPDATE projects SET industry=?, site_url=?, updated_at=CURRENT_TIMESTAMP WHERE id=?", (industry, site_url, project_id))
+            project = self.server.project_repository.create_project(
+                name=name, site_url=site_url, industry=industry,
+                country_code=country, language_code=language,
+            )
         except (sqlite3.Error, ValueError) as error:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
             return
-        self._json(HTTPStatus.CREATED, {"id": project_id})
+        self._json(HTTPStatus.CREATED, {"id": project["id"]})
 
     def _list_projects(self) -> None:
-        with self._database() as connection:
-            rows = connection.execute(
-                "SELECT id,name,site_url,industry,default_country,default_language,created_at,updated_at FROM projects ORDER BY id DESC"
-            ).fetchall()
-        self._json(HTTPStatus.OK, [dict(row) for row in rows])
+        self._json(HTTPStatus.OK, self.server.project_repository.list_projects())
 
     def _list_project_summaries(self) -> None:
-        with self._database() as connection:
-            rows = connection.execute(
-                """SELECT projects.id,projects.name,projects.site_url,projects.industry,projects.default_country,projects.default_language,projects.created_at,projects.updated_at,
-                    (SELECT COUNT(*) FROM keywords WHERE project_id=projects.id AND deleted_at IS NULL) AS keyword_count,
-                    (SELECT COUNT(*) FROM keyword_title_candidates WHERE project_id=projects.id AND status='selected' AND deleted_at IS NULL) AS selected_title_count,
-                    (SELECT COUNT(*) FROM content_assets WHERE project_id=projects.id AND deleted_at IS NULL) AS content_count,
-                    (SELECT COUNT(*) FROM project_knowledge_documents WHERE project_id=projects.id AND status='ready') AS knowledge_count,
-                    (SELECT status FROM content_assets WHERE project_id=projects.id AND deleted_at IS NULL ORDER BY updated_at DESC,id DESC LIMIT 1) AS latest_content_status
-                    FROM projects ORDER BY projects.updated_at DESC,projects.id DESC"""
-            ).fetchall()
-        self._json(HTTPStatus.OK, [dict(row) for row in rows])
+        self._json(HTTPStatus.OK, self.server.project_repository.list_project_summaries())
+
+    def _runtime_database_status(self) -> None:
+        self._json(HTTPStatus.OK, self.server.runtime_database.status())
+
+    def _runtime_database_action(self, action: str, payload: Mapping[str, Any]) -> None:
+        confirmation = str(payload.get("confirmation") or "")
+        try:
+            if action == "shadow/enable":
+                result = self.server.runtime_database.enable_shadow(confirmation=confirmation)
+            elif action == "cutover/check":
+                result = self.server.runtime_database.check_cutover(
+                    credentials_reauthorized=payload.get("credentials_reauthorized") is True
+                )
+            elif action == "cutover":
+                result = self.server.runtime_database.cutover(
+                    confirmation=confirmation,
+                    credentials_reauthorized=payload.get("credentials_reauthorized") is True,
+                )
+            else:
+                result = self.server.runtime_database.rollback(confirmation=confirmation)
+        except ValueError as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        except RuntimeError as error:
+            self._json(HTTPStatus.CONFLICT, {"error": str(error), "gate": self.server.runtime_database.status().get("last_gate")})
+            return
+        self._json(HTTPStatus.OK, result)
 
     def _list_system_tasks(self) -> None:
         with self._database() as connection:
@@ -4148,12 +6022,79 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                    UNION ALL SELECT 'content',id,project_id,status,COALESCE(completed_at,started_at,''),COALESCE(error_summary,'') FROM content_generation_runs
                    UNION ALL SELECT 'website_crawl',id,project_id,status,COALESCE(completed_at,created_at),COALESCE(failure_reason,message,'') FROM project_knowledge_crawl_runs
                    UNION ALL SELECT 'wordpress_publish',id,project_id,status,created_at,COALESCE(error_summary,'') FROM content_wordpress_publications
+                   UNION ALL SELECT 'competitor_collection',id,project_id,status,updated_at,COALESCE(error_summary,'') FROM competitor_catalog_collection_runs
+                   UNION ALL SELECT 'competitor_content_learning',id,project_id,status,updated_at,COALESCE(error_summary,'') FROM competitor_content_learning_runs
+                   UNION ALL SELECT 'competitor_learning',id,project_id,status,COALESCE(completed_at,started_at,created_at),COALESCE(error_summary,topic,'') FROM competitor_learning_runs
                    UNION ALL SELECT 'agent',id,project_id,status,updated_at,COALESCE(error_summary,'') FROM agent_jobs
+                   UNION ALL SELECT 'durable_queue',id,project_id,status,updated_at,
+                       task_type || ' #' || resource_id || ' · 尝试 ' || attempt_count || '/' || max_attempts ||
+                       CASE WHEN trim(last_error)<>'' THEN ' · ' || last_error ELSE '' END
+                       FROM durable_task_queue
                    ORDER BY updated_at DESC LIMIT 100"""
             ).fetchall()
             project_names = {row["id"]: row["name"] for row in connection.execute("SELECT id,name FROM projects").fetchall()}
         payload = [{**dict(row), "project_name": project_names.get(row["project_id"], f"项目 #{row['project_id']}")} for row in rows]
         self._json(HTTPStatus.OK, payload)
+
+    def _execute_durable_queue_job(self, queue_job_id: int) -> None:
+        """Claim one delivery and invoke its existing project-scoped workflow."""
+        supplied_token = self.headers.get("X-SEO-Worker-Token", "")
+        if not supplied_token or not hmac.compare_digest(supplied_token, self.server.worker_token):
+            self._json(HTTPStatus.FORBIDDEN, {"error": "worker authentication failed"})
+            return
+        job = self.server.task_queue.claim(queue_job_id)
+        if job is None:
+            try:
+                current = self.server.task_queue.get(queue_job_id)
+            except ValueError as error:
+                self._json(HTTPStatus.NOT_FOUND, {"error": str(error)})
+                return
+            self._json(HTTPStatus.OK, current)
+            return
+        try:
+            project_id = int(job["project_id"])
+            resource_id = int(job["resource_id"])
+            task_type = str(job["task_type"])
+            self._assert_queue_resource_project(task_type, resource_id, project_id)
+            targets = {
+                "competitor_catalog_collection": f"/api/competitor-url-catalog/collection-runs/{resource_id}/execute",
+                "collected_competitor_learning": f"/api/competitor-content-learning/runs/{resource_id}/execute",
+                "competitor_learning": f"/api/projects/{project_id}/competitor-learning/runs/{resource_id}/execute",
+                "agent_job": f"/api/agent-jobs/{resource_id}/execute",
+            }
+            target = targets.get(task_type)
+            if target is None:
+                raise ValueError("queue task type is not executable")
+            host, port = self.server.server_address[:2]
+            callback_host = "127.0.0.1" if host in {"", "0.0.0.0", "::"} else host
+            request = Request(
+                f"http://{callback_host}:{port}{target}",
+                data=json.dumps({"project_id": project_id}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(request, timeout=1800) as response:
+                if response.status >= 400:
+                    raise RuntimeError(f"workflow endpoint returned HTTP {response.status}")
+            result = self.server.task_queue.complete(queue_job_id)
+        except Exception as error:
+            result = self.server.task_queue.fail(queue_job_id, error)
+        self._json(HTTPStatus.OK, result)
+
+    def _assert_queue_resource_project(self, task_type: str, resource_id: int, project_id: int) -> None:
+        tables = {
+            "competitor_catalog_collection": "competitor_catalog_collection_runs",
+            "collected_competitor_learning": "competitor_content_learning_runs",
+            "competitor_learning": "competitor_learning_runs",
+            "agent_job": "agent_jobs",
+        }
+        table = tables.get(task_type)
+        if table is None:
+            raise ValueError("queue task type is not supported")
+        with self._database() as connection:
+            self._project_exists(connection, project_id)
+            if connection.execute(f"SELECT 1 FROM {table} WHERE id=? AND project_id=?", (resource_id, project_id)).fetchone() is None:
+                raise ValueError("queue resource does not belong to this project")
 
     def _query_project_id(self) -> int | None:
         values = parse_qs(urlsplit(self.path).query).get("project_id", [])
@@ -4173,7 +6114,23 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
     @staticmethod
     def _agent_job_payload(row: Mapping[str, Any]) -> dict[str, Any]:
         value = dict(row)
-        for field in ("input_json", "result_json"):
+        for field in ("input_json", "result_json", "checkpoint_json"):
+            raw = value.pop(field, "{}")
+            try:
+                value[field.removesuffix("_json")] = json.loads(raw or "{}")
+            except (TypeError, json.JSONDecodeError):
+                value[field.removesuffix("_json")] = {}
+        value["lifecycle_state"] = (
+            "paused"
+            if value.get("status") == "waiting_input" and value.get("current_node") == "paused"
+            else value.get("status")
+        )
+        return value
+
+    @staticmethod
+    def _agent_step_payload(row: Mapping[str, Any]) -> dict[str, Any]:
+        value = dict(row)
+        for field in ("input_json", "output_json", "token_usage_json"):
             raw = value.pop(field, "{}")
             try:
                 value[field.removesuffix("_json")] = json.loads(raw or "{}")
@@ -4182,13 +6139,14 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         return value
 
     @staticmethod
-    def _agent_step_payload(row: Mapping[str, Any]) -> dict[str, Any]:
+    def _agent_tool_audit_payload(row: Mapping[str, Any]) -> dict[str, Any]:
         value = dict(row)
-        raw = value.pop("output_json", "{}")
-        try:
-            value["output"] = json.loads(raw or "{}")
-        except (TypeError, json.JSONDecodeError):
-            value["output"] = {}
+        for field in ("input_json", "output_json"):
+            raw = value.pop(field, "{}")
+            try:
+                value[field.removesuffix("_json")] = json.loads(raw or "{}")
+            except (TypeError, json.JSONDecodeError):
+                value[field.removesuffix("_json")] = {}
         return value
 
     @staticmethod
@@ -4217,13 +6175,16 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 return
         if project_id is None or requested_action is None:
             return
+        is_full_content_agent = requested_action == "full_content_agent"
+        if is_full_content_agent and content_asset_id is None:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "content_asset_id is required for full_content_agent."})
+            return
         approval_type = self._optional_text(payload, "approval_type")
         if approval_type not in {None, "blueprint", "publish"}:
             self._json(HTTPStatus.BAD_REQUEST, {"error": "approval_type must be blueprint or publish."})
             return
         try:
             writer_provider, writer_model, reviewer_provider, reviewer_model = self._agent_model_route(payload)
-            workflow = run_content_workflow_skeleton(project_id=project_id, content_asset_id=content_asset_id, requested_action=requested_action)
             with self._database() as connection, connection:
                 self._project_exists(connection, project_id)
                 if content_asset_id is not None and connection.execute(
@@ -4231,27 +6192,78 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                     (content_asset_id, project_id),
                 ).fetchone() is None:
                     raise ValueError("content asset does not exist in this project")
-                initial_status = "waiting_approval" if approval_type else str(workflow["status"])
-                cursor = connection.execute(
-                    """INSERT INTO agent_jobs(project_id,content_asset_id,requested_action,status,current_node,input_json)
-                       VALUES(?,?,?,?,?,?)""",
-                    (project_id, content_asset_id, requested_action, initial_status, str(workflow["current_node"]), json.dumps({
+                if is_full_content_agent and content_asset_id is not None:
+                    self._require_content_competitor_learning(
+                        connection, self._content_asset(connection, project_id, content_asset_id)
+                    )
+                stored_input = {
                         "requested_action": requested_action,
                         "content_asset_id": content_asset_id,
-                        "allowed_tools": workflow["allowed_tools"],
                         "writer_provider": writer_provider,
                         "writer_model": writer_model,
                         "reviewer_provider": reviewer_provider,
                         "reviewer_model": reviewer_model,
-                    }, ensure_ascii=False)),
+                        "target_audience": (self._optional_text(payload, "target_audience") or "")[:1000],
+                        "business_goal": (self._optional_text(payload, "business_goal") or "")[:1000],
+                        "voice": (self._optional_text(payload, "voice") or "")[:1000],
+                        "cta": (self._optional_text(payload, "cta") or "")[:1000],
+                        "brand": (self._optional_text(payload, "brand") or "")[:1000],
+                        "sources": self._content_sources(payload.get("sources", [])),
+                        "constraints": [str(item)[:500] for item in payload.get("constraints", [])[:20] if isinstance(item, str)] if isinstance(payload.get("constraints"), list) else [],
+                    }
+                cursor = connection.execute(
+                    """INSERT INTO agent_jobs(
+                           project_id,content_asset_id,requested_action,status,current_node,workflow_version,input_json
+                       ) VALUES(?,?,?,?,?,?,?)""",
+                    (
+                        project_id, content_asset_id, requested_action, "planning", "created",
+                        "content-agent-v2" if is_full_content_agent else "content-agent-v1",
+                        json.dumps(stored_input, ensure_ascii=False),
+                    ),
                 )
                 job_id = int(cursor.lastrowid)
+                tools = AgentToolService(connection, project_id=project_id, job_id=job_id)
+                workflow = run_content_workflow(
+                    project_id=project_id,
+                    content_asset_id=content_asset_id,
+                    requested_action=requested_action,
+                    tool_invoker=lambda name, value: tools.invoke(name, value).output,
+                )
+                audits = {
+                    row["tool_name"]: row
+                    for row in connection.execute("SELECT * FROM agent_tool_audits WHERE job_id=? ORDER BY id", (job_id,)).fetchall()
+                }
                 for event in workflow["events"]:
+                    audit = audits.get(event["node"])
+                    output = {}
+                    if event["node"] == "load_project_context":
+                        output = workflow.get("project_context", {})
+                    elif event["node"] == "retrieve_project_memories":
+                        output = {"memories": workflow.get("retrieved_memories", [])}
                     connection.execute(
-                        """INSERT INTO agent_steps(job_id,node_name,status,input_summary,output_json,started_at,completed_at)
-                           VALUES(?,?, 'completed', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)""",
-                        (job_id, event["node"], event["message"], json.dumps({"message": event["message"]}, ensure_ascii=False)),
+                        """INSERT INTO agent_steps(job_id,node_name,status,input_summary,output_json,duration_ms,started_at,completed_at)
+                           VALUES(?,?, 'completed', ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)""",
+                        (job_id, event["node"], event["message"], json.dumps(output or {"message": event["message"]}, ensure_ascii=False), int(audit["duration_ms"]) if audit else 0),
                     )
+                initial_status = "waiting_approval" if approval_type else str(workflow["status"])
+                checkpoint = {
+                    "current_node": workflow["current_node"],
+                    "project_context": workflow.get("project_context", {}),
+                    "retrieved_memory_ids": [item.get("memory_id") for item in workflow.get("retrieved_memories", [])],
+                    "retrieved_memories": workflow.get("retrieved_memories", []),
+                }
+                connection.execute(
+                    """UPDATE agent_jobs SET status=?,current_node=?,result_json=?,checkpoint_json=?,updated_at=CURRENT_TIMESTAMP
+                       WHERE id=? AND project_id=?""",
+                    (
+                        initial_status,
+                        str(workflow["current_node"]),
+                        json.dumps({"project_context": workflow.get("project_context", {}), "retrieved_memories": workflow.get("retrieved_memories", [])}, ensure_ascii=False),
+                        json.dumps(checkpoint, ensure_ascii=False),
+                        job_id,
+                        project_id,
+                    ),
+                )
                 approval_id = None
                 if approval_type:
                     approval_payload = payload.get("approval_payload") if isinstance(payload.get("approval_payload"), Mapping) else {}
@@ -4268,6 +6280,8 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         if approval_id is not None:
             response["approval_id"] = approval_id
         self._json(HTTPStatus.CREATED, response)
+        if is_full_content_agent:
+            self.server.enqueue_background_task("agent_job", project_id, job_id)
 
     @staticmethod
     def _agent_model_route(payload: Mapping[str, Any]) -> tuple[str, str | None, str, str | None]:
@@ -4305,12 +6319,28 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 job = self._agent_job_for_project(connection, job_id, project_id)
                 steps = connection.execute("SELECT * FROM agent_steps WHERE job_id=? ORDER BY id", (job_id,)).fetchall()
                 approvals = connection.execute("SELECT * FROM agent_approval_requests WHERE job_id=? ORDER BY id", (job_id,)).fetchall()
+                tool_audits = connection.execute(
+                    "SELECT * FROM agent_tool_audits WHERE job_id=? AND project_id=? ORDER BY id",
+                    (job_id, project_id),
+                ).fetchall()
+                basis_report = connection.execute(
+                    "SELECT * FROM content_generation_basis_reports WHERE agent_job_id=? AND project_id=?",
+                    (job_id, project_id),
+                ).fetchone()
         except (sqlite3.Error, ValueError) as error:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
             return
         value = self._agent_job_payload(job)
         value["steps"] = [self._agent_step_payload(row) for row in steps]
         value["approvals"] = [self._agent_approval_payload(row) for row in approvals]
+        value["tool_audits"] = [self._agent_tool_audit_payload(row) for row in tool_audits]
+        if basis_report is not None:
+            try:
+                value["basis_report"] = json.loads(basis_report["report_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                value["basis_report"] = {}
+        else:
+            value["basis_report"] = None
         self._json(HTTPStatus.OK, value)
 
     @staticmethod
@@ -4321,6 +6351,11 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             value["evidence"] = json.loads(raw or "{}")
         except (TypeError, json.JSONDecodeError):
             value["evidence"] = {}
+        raw_applicability = value.pop("applicability_json", "{}")
+        try:
+            value["applicability"] = json.loads(raw_applicability or "{}")
+        except (TypeError, json.JSONDecodeError):
+            value["applicability"] = {}
         return value
 
     def _memory_for_project(self, connection: sqlite3.Connection, memory_id: int, project_id: int) -> sqlite3.Row:
@@ -4362,11 +6397,19 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                     "SELECT id,decision,note,created_at FROM content_learning_memory_feedback WHERE project_id=? AND memory_id=? ORDER BY id DESC",
                     (project_id, memory_id),
                 ).fetchall()
+                sources = connection.execute(
+                    """SELECT source_type,source_id,source_url,source_content_hash,source_version_id,
+                              evidence_excerpt,captured_at
+                       FROM content_learning_memory_sources
+                       WHERE project_id=? AND memory_id=? ORDER BY captured_at DESC,id DESC""",
+                    (project_id, memory_id),
+                ).fetchall()
         except (sqlite3.Error, ValueError) as error:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)}); return
         value = self._content_learning_memory_payload(row)
         value["content_links"] = [dict(link) for link in links]
         value["feedback"] = [dict(item) for item in feedback]
+        value["sources"] = [dict(item) for item in sources]
         self._json(HTTPStatus.OK, value)
 
     def _create_content_learning_memory(self, payload: Mapping[str, Any]) -> None:
@@ -4499,13 +6542,14 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                ORDER BY pinned DESC,manual_priority DESC,quality_score DESC,updated_at DESC,id DESC""",
             (asset["project_id"],),
         ).fetchall()
-        ranked: list[tuple[float, sqlite3.Row]] = []
+        ranked: list[tuple[float, sqlite3.Row, list[str]]] = []
         for row in rows:
             memory_terms = {
                 term.casefold() for term in re.findall(r"[A-Za-z0-9]{3,}", f"{row['topic']} {row['summary']}")
             }
-            overlap = len(article_terms & memory_terms)
-            if not overlap:
+            matched = sorted(article_terms & memory_terms)
+            overlap = len(matched)
+            if not matched:
                 continue
             # A human can lift a memory that repeatedly helps, or demote one
             # that is technically valid but unsuitable.  Relevance remains a
@@ -4514,20 +6558,26 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             unhelpful = min(int(row["negative_feedback_count"]), 8) * 0.025
             priority = int(row["manual_priority"]) * 0.018
             pinned_bonus = 0.08 if int(row["pinned"]) else 0.0
-            score = max(0.0, min(1.0, float(row["quality_score"]) * 0.58 + min(overlap, 5) * 0.08 + priority + pinned_bonus + helpful - unhelpful))
-            ranked.append((score, row))
+            freshness = str(row["freshness_status"])
+            freshness_factor = 1.0 if freshness == "current" else 0.82 if freshness == "needs_review" else 0.68
+            score = (
+                float(row["quality_score"]) * 0.45
+                + float(row["confidence_score"]) * 0.15
+                + min(overlap, 5) * 0.08 + priority + pinned_bonus + helpful - unhelpful
+            ) * freshness_factor
+            ranked.append((max(0.0, min(1.0, score)), row, matched))
         per_role_limit = {"style": 3, "brand": 2, "fact": 2, "performance": 2}
-        selected: list[tuple[float, sqlite3.Row]] = []
+        selected: list[tuple[float, sqlite3.Row, list[str]]] = []
         used_by_role: dict[str, int] = {}
-        for score, row in sorted(ranked, key=lambda item: (item[0], item[1]["pinned"], item[1]["manual_priority"], item[1]["quality_score"]), reverse=True):
+        for score, row, matched in sorted(ranked, key=lambda item: (item[0], item[1]["pinned"], item[1]["manual_priority"], item[1]["quality_score"]), reverse=True):
             role = self._memory_role(str(row["memory_type"]))
             if used_by_role.get(role, 0) >= per_role_limit[role] or len(selected) >= 7:
                 continue
-            selected.append((score, row))
+            selected.append((score, row, matched))
             used_by_role[role] = used_by_role.get(role, 0) + 1
         with connection:
             connection.execute("DELETE FROM content_memory_links WHERE content_asset_id=? AND selected_by_model=1 AND selected_by_user=0", (asset["id"],))
-            for score, row in selected:
+            for score, row, _matched in selected:
                 connection.execute(
                     """INSERT INTO content_memory_links(content_asset_id,memory_id,role,relevance_score,selected_by_model)
                        VALUES(?,?,?,?,1)
@@ -4535,14 +6585,624 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                     (asset["id"], row["id"], self._memory_role(str(row["memory_type"])), score),
                 )
         result: list[dict[str, Any]] = []
-        for score, row in selected:
+        for score, row, matched in selected:
             value = self._content_learning_memory_payload(row)
             result.append({
                 "memory_id": value["id"], "memory_type": value["memory_type"], "role": self._memory_role(str(value["memory_type"])),
                 "topic": value["topic"], "summary": value["summary"], "evidence": value["evidence"],
-                "source_url": value["source_url"], "relevance_score": round(score, 3),
+                "card_type": value["card_type"], "confidence_score": value["confidence_score"],
+                "freshness_status": value["freshness_status"], "evidence_count": value["evidence_count"],
+                "applicability": value["applicability"], "source_url": value["source_url"],
+                "relevance_score": round(score, 3),
+                "selection_reason": f"主题词匹配：{', '.join(matched[:8])}；质量 {round(float(value['quality_score']) * 100)}；置信度 {round(float(value['confidence_score']) * 100)}；证据 {int(value['evidence_count'])} 条",
             })
         return result
+
+    @staticmethod
+    def _agent_input(row: Mapping[str, Any]) -> dict[str, Any]:
+        try:
+            value = json.loads(row["input_json"] or "{}")
+        except (KeyError, IndexError, TypeError, json.JSONDecodeError):
+            value = {}
+        return value if isinstance(value, dict) else {}
+
+    def _write_content_generation_basis_report(
+        self,
+        connection: sqlite3.Connection,
+        job: sqlite3.Row,
+        checkpoint: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Persist a compact explanation of the evidence used by this draft."""
+
+        draft_id = checkpoint.get("draft_id")
+        draft = connection.execute(
+            "SELECT * FROM content_drafts WHERE id=? AND project_id=? AND content_asset_id=?",
+            (draft_id, job["project_id"], job["content_asset_id"]),
+        ).fetchone() if isinstance(draft_id, int) else None
+        memories = checkpoint.get("retrieved_memories")
+        memory_basis: list[dict[str, Any]] = []
+        if isinstance(memories, list):
+            for item in memories[:20]:
+                if not isinstance(item, Mapping):
+                    continue
+                raw_sources = item.get("sources") if isinstance(item.get("sources"), list) else []
+                memory_basis.append({
+                    "memory_id": item.get("memory_id"),
+                    "memory_type": item.get("memory_type"),
+                    "card_type": item.get("card_type"),
+                    "topic": str(item.get("topic") or "")[:300],
+                    "selection_reason": str(item.get("selection_reason") or "")[:1000],
+                    "source_url": str(item.get("source_url") or "")[:2000],
+                    "sources": [{
+                        "source_type": source.get("source_type"),
+                        "source_id": source.get("source_id"),
+                        "source_url": source.get("source_url"),
+                        "source_content_hash": source.get("source_content_hash"),
+                        "source_version_id": source.get("source_version_id"),
+                        "captured_at": source.get("captured_at"),
+                    } for source in raw_sources[:20] if isinstance(source, Mapping)],
+                })
+        unresolved: list[Any] = []
+        qa: dict[str, Any] = {}
+        if draft is not None:
+            try:
+                unresolved_value = json.loads(draft["unresolved_verify_json"] or "[]")
+                unresolved = unresolved_value if isinstance(unresolved_value, list) else []
+            except (TypeError, json.JSONDecodeError):
+                unresolved = []
+            try:
+                qa_value = json.loads(draft["qa_json"] or "{}")
+                qa = qa_value if isinstance(qa_value, dict) else {}
+            except (TypeError, json.JSONDecodeError):
+                qa = {}
+        job_input = self._agent_input(job)
+        report = {
+            "agent_job_id": int(job["id"]),
+            "project_id": int(job["project_id"]),
+            "content_asset_id": int(job["content_asset_id"]),
+            "brief_id": checkpoint.get("candidate_brief_id"),
+            "outline_id": checkpoint.get("candidate_outline_id"),
+            "draft_id": int(draft["id"]) if draft is not None else None,
+            "generation_job_id": checkpoint.get("generation_job_id"),
+            "memories": memory_basis,
+            "qa": {
+                "status": draft["qa_status"] if draft is not None else None,
+                "checks": qa.get("checks", []),
+                "targeted_rewrite": qa.get("targeted_rewrite", []),
+                "rewrite_count": int(checkpoint.get("rewrite_count") or 0),
+                "history": checkpoint.get("qa_history", []),
+            },
+            "unresolved_verify": unresolved[:50],
+            "model_route": {
+                "writer_provider": job_input.get("writer_provider"),
+                "writer_model": job_input.get("writer_model"),
+                "reviewer_provider": job_input.get("reviewer_provider"),
+                "reviewer_model": job_input.get("reviewer_model"),
+            },
+        }
+        connection.execute(
+            """INSERT INTO content_generation_basis_reports(
+                   project_id,agent_job_id,content_asset_id,draft_id,report_json
+               ) VALUES(?,?,?,?,?)
+               ON CONFLICT(agent_job_id) DO UPDATE SET
+                   draft_id=excluded.draft_id,report_json=excluded.report_json,updated_at=CURRENT_TIMESTAMP""",
+            (job["project_id"], job["id"], job["content_asset_id"], report["draft_id"], json.dumps(report, ensure_ascii=False)),
+        )
+        return report
+
+    def _queue_gsc_feedback_learning(self, project_id: int, payload: Mapping[str, Any]) -> None:
+        """Create a durable GSC feedback job and execute its first attempt."""
+
+        raw_days = payload.get("days", 7)
+        if not isinstance(raw_days, int) or isinstance(raw_days, bool):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "days must be an integer."})
+            return
+        window_days = max(7, min(365, raw_days))
+        try:
+            with self._database() as connection, connection:
+                self._project_exists(connection, project_id)
+                cursor = connection.execute(
+                    """INSERT INTO agent_jobs(
+                           project_id,requested_action,status,current_node,workflow_version,input_json
+                       ) VALUES(?,'gsc_feedback_learning','queued','created','gsc-feedback-v1',?)""",
+                    (project_id, json.dumps({
+                        "requested_action": "gsc_feedback_learning",
+                        "window_days": window_days,
+                        "allowed_tools": [
+                            "load_project_context", "capture_gsc_performance", "update_memory_governance",
+                        ],
+                    }, ensure_ascii=False)),
+                )
+                job_id = int(cursor.lastrowid)
+        except (sqlite3.Error, ValueError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        self.server.enqueue_background_task("agent_job", project_id, job_id)
+        self._json(HTTPStatus.ACCEPTED, {
+            "job_id": job_id,
+            "project_id": project_id,
+            "status": "queued",
+            "workflow_version": "gsc-feedback-v1",
+            "message": "发布后效果学习已进入持久队列，可在系统任务中查看进度。",
+        })
+
+    def _execute_agent_job(self, job_id: int, payload: Mapping[str, Any]) -> None:
+        """Dispatch an allowlisted durable workflow by its persisted identity."""
+
+        project_id = self._integer(payload, "project_id")
+        if project_id is None:
+            return
+        try:
+            with self._database() as connection:
+                job = self._agent_job_for_project(connection, job_id, project_id)
+                workflow = (str(job["requested_action"]), str(job["workflow_version"]))
+        except (sqlite3.Error, ValueError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        if workflow == ("gsc_feedback_learning", "gsc-feedback-v1"):
+            self._execute_gsc_feedback_job(job_id, payload)
+            return
+        self._execute_content_agent_job(job_id, payload)
+
+    def _execute_gsc_feedback_job(self, job_id: int, payload: Mapping[str, Any]) -> None:
+        """Resume the GSC feedback workflow from its last committed node."""
+
+        project_id = self._integer(payload, "project_id")
+        if project_id is None:
+            return
+        try:
+            with self._database() as connection:
+                job = self._agent_job_for_project(connection, job_id, project_id)
+                if job["requested_action"] != "gsc_feedback_learning" or job["workflow_version"] != "gsc-feedback-v1":
+                    raise ValueError("this agent job does not use the executable gsc-feedback-v1 workflow")
+                if job["status"] == "completed":
+                    result = self._agent_job_payload(job).get("result", {})
+                    self._json(HTTPStatus.OK, result)
+                    return
+                if job["status"] in {"cancelled", "waiting_input", "waiting_approval"}:
+                    self._json(HTTPStatus.OK, self._agent_job_payload(job))
+                    return
+                claimed = connection.execute(
+                    """UPDATE agent_jobs SET status='running',started_at=COALESCE(started_at,CURRENT_TIMESTAMP),
+                           updated_at=CURRENT_TIMESTAMP
+                       WHERE id=? AND project_id=? AND status IN ('planning','queued','retrying')""",
+                    (job_id, project_id),
+                )
+                connection.commit()
+                if claimed.rowcount != 1:
+                    self._json(HTTPStatus.OK, self._agent_job_payload(self._agent_job_for_project(connection, job_id, project_id)))
+                    return
+
+                job = self._agent_job_for_project(connection, job_id, project_id)
+                job_input = self._agent_input(job)
+                checkpoint = self._agent_checkpoint(job)
+                feedback = GscFeedbackService(connection, project_id=project_id)
+
+                def capture_handler(tool_payload: Mapping[str, Any]) -> dict[str, Any]:
+                    window_days = tool_payload.get("window_days", 7)
+                    if not isinstance(window_days, int) or isinstance(window_days, bool):
+                        raise ValueError("window_days must be an integer")
+                    return feedback.capture_performance(window_days=window_days)
+
+                def governance_handler(tool_payload: Mapping[str, Any]) -> dict[str, Any]:
+                    snapshot_ids = tool_payload.get("snapshot_ids")
+                    if not isinstance(snapshot_ids, list):
+                        raise ValueError("snapshot_ids must be a list")
+                    return feedback.update_memory_governance(snapshot_ids=snapshot_ids)
+
+                tools = AgentToolService(connection, project_id=project_id, job_id=job_id, handlers={
+                    "capture_gsc_performance": capture_handler,
+                    "update_memory_governance": governance_handler,
+                })
+
+                def invoke_node(tool_name: str, node_name: str, tool_payload: Mapping[str, Any]) -> dict[str, Any]:
+                    checkpoint["current_node"] = node_name
+                    connection.execute(
+                        "UPDATE agent_jobs SET current_node=?,checkpoint_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND project_id=?",
+                        (node_name, json.dumps(checkpoint, ensure_ascii=False), job_id, project_id),
+                    )
+                    attempt = int(connection.execute(
+                        "SELECT COUNT(*) FROM agent_steps WHERE job_id=? AND node_name=?",
+                        (job_id, node_name),
+                    ).fetchone()[0]) + 1
+                    step = connection.execute(
+                        """INSERT INTO agent_steps(
+                               job_id,node_name,attempt,status,input_summary,input_json,started_at
+                           ) VALUES(?,?,?,'running',?,?,CURRENT_TIMESTAMP)""",
+                        (job_id, node_name, attempt, f"Executing allowlisted tool {tool_name}.",
+                         json.dumps({"project_id": project_id, **dict(tool_payload)}, ensure_ascii=False)),
+                    )
+                    connection.commit()
+                    try:
+                        call = tools.invoke(tool_name, {"project_id": project_id, **dict(tool_payload)})
+                    except Exception as error:
+                        connection.rollback()
+                        connection.execute(
+                            "UPDATE agent_steps SET status='failed',error_summary=?,completed_at=CURRENT_TIMESTAMP WHERE id=?",
+                            (str(error)[:2000], step.lastrowid),
+                        )
+                        connection.commit()
+                        raise
+                    output = call.output
+                    checkpoint[node_name] = output
+                    checkpoint["current_node"] = node_name
+                    connection.execute(
+                        """UPDATE agent_steps SET status='completed',output_json=?,duration_ms=?,
+                               token_usage_json='{}',completed_at=CURRENT_TIMESTAMP WHERE id=?""",
+                        (json.dumps(output, ensure_ascii=False), call.duration_ms, step.lastrowid),
+                    )
+                    connection.execute(
+                        "UPDATE agent_jobs SET checkpoint_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND project_id=?",
+                        (json.dumps(checkpoint, ensure_ascii=False), job_id, project_id),
+                    )
+                    connection.commit()
+                    return output
+
+                if not isinstance(checkpoint.get("load_project_context"), Mapping):
+                    invoke_node("load_project_context", "load_project_context", {})
+                if str(self._agent_job_for_project(connection, job_id, project_id)["status"]) != "running":
+                    self._json(HTTPStatus.OK, self._agent_job_payload(self._agent_job_for_project(connection, job_id, project_id)))
+                    return
+
+                capture = checkpoint.get("capture_gsc_performance")
+                if not isinstance(capture, Mapping):
+                    capture = invoke_node(
+                        "capture_gsc_performance", "capture_gsc_performance",
+                        {"window_days": int(job_input.get("window_days") or 7)},
+                    )
+                if str(self._agent_job_for_project(connection, job_id, project_id)["status"]) != "running":
+                    self._json(HTTPStatus.OK, self._agent_job_payload(self._agent_job_for_project(connection, job_id, project_id)))
+                    return
+
+                snapshots = capture.get("snapshots") if isinstance(capture.get("snapshots"), list) else []
+                snapshot_ids = [
+                    int(item["snapshot_id"]) for item in snapshots
+                    if isinstance(item, Mapping) and isinstance(item.get("snapshot_id"), int)
+                ]
+                governance = checkpoint.get("update_memory_governance")
+                if not isinstance(governance, Mapping):
+                    governance = invoke_node(
+                        "update_memory_governance", "update_memory_governance",
+                        {"snapshot_ids": snapshot_ids},
+                    )
+                snapshot_memory_ids = governance.get("snapshot_memory_ids") if isinstance(governance.get("snapshot_memory_ids"), Mapping) else {}
+                result_snapshots = []
+                for item in snapshots:
+                    if not isinstance(item, Mapping):
+                        continue
+                    value = dict(item)
+                    value["memory_id"] = snapshot_memory_ids.get(str(value.get("snapshot_id")))
+                    result_snapshots.append(value)
+                result = {
+                    "job_id": job_id,
+                    "workflow_version": "gsc-feedback-v1",
+                    "snapshots": result_snapshots,
+                    "memories_created": int(governance.get("memories_created") or 0),
+                    "message": "已保存发布内容的 GSC 快照。首个快照仅观察；至少 7 天后的第二次有效快照才形成可用于写作的表现记忆。",
+                }
+                checkpoint["current_node"] = "completed"
+                connection.execute(
+                    """UPDATE agent_jobs SET status='completed',current_node='completed',result_json=?,checkpoint_json=?,
+                           error_summary=NULL,completed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
+                       WHERE id=? AND project_id=? AND status='running'""",
+                    (json.dumps(result, ensure_ascii=False), json.dumps(checkpoint, ensure_ascii=False), job_id, project_id),
+                )
+                connection.commit()
+                self._json(HTTPStatus.OK, result)
+        except (sqlite3.Error, ValueError) as error:
+            try:
+                with self._database() as failure_connection, failure_connection:
+                    failed = failure_connection.execute(
+                        "SELECT * FROM agent_jobs WHERE id=? AND project_id=?", (job_id, project_id),
+                    ).fetchone()
+                    if failed is not None and failed["status"] not in {"cancelled", "waiting_input", "completed"}:
+                        checkpoint = self._agent_checkpoint(failed)
+                        node = str(checkpoint.get("current_node") or failed["current_node"] or "failed")
+                        failure_connection.execute(
+                            """UPDATE agent_jobs SET status='failed',current_node=?,error_summary=?,checkpoint_json=?,
+                                   completed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=? AND project_id=?""",
+                            (node, str(error)[:2000], json.dumps(checkpoint, ensure_ascii=False), job_id, project_id),
+                        )
+            except sqlite3.Error:
+                pass
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error), "job_id": job_id})
+
+    def _execute_content_agent_job(self, job_id: int, payload: Mapping[str, Any]) -> None:
+        """Advance the P3 content Agent from its last durable checkpoint."""
+
+        project_id = self._integer(payload, "project_id")
+        if project_id is None:
+            return
+        try:
+            with self._database() as connection:
+                job = self._agent_job_for_project(connection, job_id, project_id)
+                if job["requested_action"] != "full_content_agent" or job["workflow_version"] != "content-agent-v2":
+                    raise ValueError("this agent job does not use the executable content-agent-v2 workflow")
+                if job["content_asset_id"] is None:
+                    raise ValueError("content agent job has no content asset")
+                if job["status"] in {"completed", "cancelled", "waiting_input"}:
+                    self._json(HTTPStatus.OK, self._agent_job_payload(job))
+                    return
+                claimed = connection.execute(
+                    """UPDATE agent_jobs SET status='running',started_at=COALESCE(started_at,CURRENT_TIMESTAMP),
+                           updated_at=CURRENT_TIMESTAMP
+                       WHERE id=? AND project_id=? AND status IN ('planning','queued','retrying','waiting_approval')""",
+                    (job_id, project_id),
+                )
+                connection.commit()
+                if claimed.rowcount != 1:
+                    current = self._agent_job_for_project(connection, job_id, project_id)
+                    self._json(HTTPStatus.OK, self._agent_job_payload(current))
+                    return
+
+                job = self._agent_job_for_project(connection, job_id, project_id)
+                job_input = self._agent_input(job)
+                checkpoint = self._agent_checkpoint(job)
+                asset = self._content_asset(connection, project_id, int(job["content_asset_id"]))
+                writer_generator, writer_provider, writer_model = self._content_generator({
+                    "provider": job_input.get("writer_provider", "openai"),
+                    "model": job_input.get("writer_model"),
+                })
+                if writer_generator is None:
+                    raise ValueError(f"{writer_provider} must be configured before the content Agent can run")
+                reviewer_generator, reviewer_provider, reviewer_model = self._content_reviewer_generator(
+                    writer_generator=writer_generator,
+                    writer_provider=writer_provider,
+                    writer_model=writer_model,
+                    reviewer_provider=job_input.get("reviewer_provider"),
+                    reviewer_model=job_input.get("reviewer_model"),
+                )
+                if reviewer_generator is None:
+                    raise ValueError(f"{reviewer_provider} must be configured before Agent QA can run")
+
+                generation_job_id = checkpoint.get("generation_job_id")
+                if not isinstance(generation_job_id, int):
+                    generation_job_id = self._start_content_generation_job(
+                        connection, asset, "full_content_agent", writer_provider, writer_model,
+                        reviewer_provider=reviewer_provider, reviewer_model=reviewer_model,
+                        routing_mode="manual", routing_summary="Durable content-agent-v2 writer and independent reviewer route.",
+                    )
+                    checkpoint["generation_job_id"] = generation_job_id
+                    connection.execute(
+                        "UPDATE agent_jobs SET checkpoint_json=? WHERE id=? AND project_id=?",
+                        (json.dumps(checkpoint, ensure_ascii=False), job_id, project_id),
+                    )
+                    connection.commit()
+
+                def persist_checkpoint(node: str) -> None:
+                    checkpoint["current_node"] = node
+                    connection.execute(
+                        "UPDATE agent_jobs SET current_node=?,checkpoint_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND project_id=?",
+                        (node, json.dumps(checkpoint, ensure_ascii=False), job_id, project_id),
+                    )
+                    connection.commit()
+
+                def control_state() -> str:
+                    connection.commit()
+                    return str(self._agent_job_for_project(connection, job_id, project_id)["status"])
+
+                def generate_blueprint(_tool_payload: Mapping[str, Any]) -> dict[str, Any]:
+                    current_asset = self._content_asset(connection, project_id, int(job["content_asset_id"]))
+                    if "original_asset_state" not in checkpoint:
+                        checkpoint["original_asset_state"] = {
+                            "status": current_asset["status"],
+                            "current_brief_id": current_asset["current_brief_id"],
+                            "current_outline_id": current_asset["current_outline_id"],
+                            "current_draft_id": current_asset["current_draft_id"],
+                            "current_generation_run_id": current_asset["current_generation_run_id"],
+                        }
+                        persist_checkpoint("generate_content_blueprint")
+                    generation_payload = dict(job_input)
+                    generation_payload["learning_memories"] = checkpoint.get("retrieved_memories", [])
+                    try:
+                        brief = self._generate_ai_brief(
+                            connection, current_asset, generation_payload, writer_generator,
+                            writer_provider, writer_model, generation_job_id, agent_job_id=job_id,
+                        )
+                        checkpoint["candidate_brief_id"] = int(brief["id"])
+                        current_asset = self._content_asset(connection, project_id, int(job["content_asset_id"]))
+                        outline = self._generate_ai_outline(
+                            connection, current_asset, generation_payload, writer_generator,
+                            writer_provider, writer_model, generation_job_id, agent_job_id=job_id,
+                        )
+                        checkpoint["candidate_outline_id"] = int(outline["id"])
+                        # Blueprint review is automatic: retain the newly
+                        # generated brief/outline as the live checkpoint, then
+                        # proceed directly to the H2 batch. Publishing still
+                        # requires its own human approval later.
+                        connection.execute("UPDATE content_briefs SET status='current' WHERE id=?", (brief["id"],))
+                        connection.execute("UPDATE content_outlines SET status='approved' WHERE id=?", (outline["id"],))
+                        connection.execute(
+                            """UPDATE content_assets SET status='outlining',current_brief_id=?,current_outline_id=?,
+                                   updated_at=CURRENT_TIMESTAMP WHERE id=? AND project_id=?""",
+                            (brief["id"], outline["id"], job["content_asset_id"], project_id),
+                        )
+                        connection.commit()
+                        return {"brief": brief, "outline": outline}
+                    except Exception:
+                        original = checkpoint.get("original_asset_state", {})
+                        connection.execute("UPDATE content_briefs SET status='rejected' WHERE agent_job_id=?", (job_id,))
+                        connection.execute("UPDATE content_outlines SET status='rejected' WHERE agent_job_id=?", (job_id,))
+                        connection.execute(
+                            """UPDATE content_assets SET status=?,current_brief_id=?,current_outline_id=?,
+                                   current_draft_id=?,current_generation_run_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND project_id=?""",
+                            (original.get("status", "planned"), original.get("current_brief_id"), original.get("current_outline_id"),
+                             original.get("current_draft_id"), original.get("current_generation_run_id"), job["content_asset_id"], project_id),
+                        )
+                        connection.commit()
+                        raise
+
+                def generate_article(tool_payload: Mapping[str, Any]) -> dict[str, Any]:
+                    current_asset = self._content_asset(connection, project_id, int(job["content_asset_id"]))
+                    if tool_payload.get("mode") == "targeted_rewrite":
+                        return {"draft": self._generate_ai_targeted_rewrite(
+                            connection, current_asset, writer_generator, writer_provider, writer_model, generation_job_id,
+                        )}
+                    return {"draft": self._generate_ai_draft(
+                        connection, current_asset, job_input, writer_generator, writer_provider, writer_model, generation_job_id,
+                    )}
+
+                def review_article(_tool_payload: Mapping[str, Any]) -> dict[str, Any]:
+                    current_asset = self._content_asset(connection, project_id, int(job["content_asset_id"]))
+                    return self._generate_ai_quality_review(
+                        connection, current_asset, reviewer_generator, reviewer_provider,
+                        reviewer_model, generation_job_id,
+                    )
+
+                tools = AgentToolService(connection, project_id=project_id, job_id=job_id, handlers={
+                    "generate_content_blueprint": generate_blueprint,
+                    "generate_article": generate_article,
+                    "review_article": review_article,
+                })
+
+                def invoke_node(tool_name: str, node_name: str, tool_payload: Mapping[str, Any], provider: str, model: str | None) -> dict[str, Any]:
+                    persist_checkpoint(node_name)
+                    attempt = int(connection.execute(
+                        "SELECT COUNT(*) FROM agent_steps WHERE job_id=? AND node_name=?", (job_id, node_name),
+                    ).fetchone()[0]) + 1
+                    cursor = connection.execute(
+                        """INSERT INTO agent_steps(
+                               job_id,node_name,attempt,status,model_provider,model,input_summary,input_json,prompt_version,started_at
+                           ) VALUES(?,?,?,'running',?,?,?,?,?,CURRENT_TIMESTAMP)""",
+                        (job_id, node_name, attempt, provider, model, f"Executing allowlisted tool {tool_name}.",
+                         json.dumps({"project_id": project_id, "content_asset_id": job["content_asset_id"], "mode": tool_payload.get("mode")}, ensure_ascii=False), PROMPT_VERSION),
+                    )
+                    connection.commit()
+                    try:
+                        call = tools.invoke(tool_name, {"project_id": project_id, **dict(tool_payload)})
+                    except Exception as error:
+                        connection.execute(
+                            "UPDATE agent_steps SET status='failed',error_summary=?,completed_at=CURRENT_TIMESTAMP WHERE id=?",
+                            (str(error)[:2000], cursor.lastrowid),
+                        )
+                        connection.commit()
+                        raise
+                    connection.execute(
+                        """UPDATE agent_steps SET status='completed',output_json=?,duration_ms=?,token_usage_json='{}',
+                               completed_at=CURRENT_TIMESTAMP WHERE id=?""",
+                        (json.dumps({"tool": tool_name, "status": "completed"}, ensure_ascii=False), call.duration_ms, cursor.lastrowid),
+                    )
+                    connection.commit()
+                    return call.output
+
+                if not isinstance(checkpoint.get("candidate_outline_id"), int):
+                    blueprint = invoke_node(
+                        "generate_content_blueprint", "generate_content_blueprint",
+                        {"content_asset_id": job["content_asset_id"]}, writer_provider, writer_model,
+                    )
+                    checkpoint["blueprint"] = {
+                        "brief_id": checkpoint.get("candidate_brief_id"),
+                        "outline_id": checkpoint.get("candidate_outline_id"),
+                        "outline": blueprint.get("outline"),
+                    }
+                    if control_state() in {"cancelled", "waiting_input"}:
+                        self._json(HTTPStatus.OK, self._agent_job_payload(self._agent_job_for_project(connection, job_id, project_id)))
+                        return
+                if not checkpoint.get("blueprint_auto_approved"):
+                    # Seamlessly migrate previously paused jobs that were
+                    # created under the old manual-blueprint workflow.
+                    brief_id = checkpoint.get("candidate_brief_id")
+                    outline_id = checkpoint.get("candidate_outline_id")
+                    if not isinstance(brief_id, int) or not isinstance(outline_id, int):
+                        raise ContentGenerationProtocolError("content Agent has no usable blueprint checkpoint")
+                    connection.execute("UPDATE content_briefs SET status='current' WHERE id=?", (brief_id,))
+                    connection.execute("UPDATE content_outlines SET status='approved' WHERE id=?", (outline_id,))
+                    connection.execute(
+                        """UPDATE content_assets SET status='outlining',current_brief_id=?,current_outline_id=?,
+                               updated_at=CURRENT_TIMESTAMP WHERE id=? AND project_id=?""",
+                        (brief_id, outline_id, job["content_asset_id"], project_id),
+                    )
+                    connection.execute(
+                        """UPDATE agent_approval_requests SET status='approved',decided_by='system',decided_at=CURRENT_TIMESTAMP
+                           WHERE project_id=? AND job_id=? AND approval_type='blueprint' AND status='pending'""",
+                        (project_id, job_id),
+                    )
+                    checkpoint["blueprint_auto_approved"] = True
+                    persist_checkpoint("generate_article")
+
+                if not isinstance(checkpoint.get("draft_id"), int):
+                    article_result = invoke_node(
+                        "generate_article", "generate_article", {"content_asset_id": job["content_asset_id"], "mode": "draft"},
+                        writer_provider, writer_model,
+                    )
+                    draft_value = article_result.get("draft") if isinstance(article_result.get("draft"), Mapping) else {}
+                    checkpoint["draft_id"] = draft_value.get("id")
+                    checkpoint["rewrite_count"] = int(checkpoint.get("rewrite_count") or 0)
+                    persist_checkpoint("review_article")
+                    if control_state() in {"cancelled", "waiting_input"}:
+                        self._json(HTTPStatus.OK, self._agent_job_payload(self._agent_job_for_project(connection, job_id, project_id)))
+                        return
+
+                while True:
+                    review_result = invoke_node(
+                        "review_article", "review_article", {"content_asset_id": job["content_asset_id"], "draft_id": checkpoint.get("draft_id")},
+                        reviewer_provider, reviewer_model,
+                    )
+                    review = review_result.get("review") if isinstance(review_result.get("review"), Mapping) else {}
+                    checkpoint.setdefault("qa_history", []).append({
+                        "draft_id": checkpoint.get("draft_id"),
+                        "status": review.get("status"),
+                        "rewrite_targets": len(review.get("targeted_rewrite", [])) if isinstance(review.get("targeted_rewrite"), list) else 0,
+                    })
+                    if review.get("status") == "approved":
+                        persist_checkpoint("generation_basis_report")
+                        current_job = self._agent_job_for_project(connection, job_id, project_id)
+                        report = self._write_content_generation_basis_report(connection, current_job, checkpoint)
+                        self._finish_content_generation_job(connection, generation_job_id, status="completed")
+                        checkpoint["current_node"] = "completed"
+                        connection.execute(
+                            """UPDATE agent_jobs SET status='completed',current_node='completed',result_json=?,checkpoint_json=?,
+                                   error_summary=NULL,completed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
+                               WHERE id=? AND project_id=? AND status='running'""",
+                            (json.dumps({"draft_id": checkpoint.get("draft_id"), "basis_report": report}, ensure_ascii=False),
+                             json.dumps(checkpoint, ensure_ascii=False), job_id, project_id),
+                        )
+                        connection.commit()
+                        break
+                    rewrite_targets = review.get("targeted_rewrite") if isinstance(review.get("targeted_rewrite"), list) else []
+                    rewrite_count = int(checkpoint.get("rewrite_count") or 0)
+                    if rewrite_targets and rewrite_count < 2:
+                        if control_state() in {"cancelled", "waiting_input"}:
+                            break
+                        rewrite_result = invoke_node(
+                            "generate_article", "targeted_rewrite", {"content_asset_id": job["content_asset_id"], "mode": "targeted_rewrite"},
+                            writer_provider, writer_model,
+                        )
+                        rewritten = rewrite_result.get("draft") if isinstance(rewrite_result.get("draft"), Mapping) else {}
+                        checkpoint["draft_id"] = rewritten.get("id")
+                        checkpoint["rewrite_count"] = rewrite_count + 1
+                        persist_checkpoint("review_article")
+                        continue
+                    persist_checkpoint("human_review_required")
+                    current_job = self._agent_job_for_project(connection, job_id, project_id)
+                    report = self._write_content_generation_basis_report(connection, current_job, checkpoint)
+                    connection.execute(
+                        """UPDATE agent_jobs SET status='waiting_input',current_node='human_review_required',result_json=?,
+                               checkpoint_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND project_id=? AND status='running'""",
+                        (json.dumps({"draft_id": checkpoint.get("draft_id"), "basis_report": report}, ensure_ascii=False),
+                         json.dumps(checkpoint, ensure_ascii=False), job_id, project_id),
+                    )
+                    connection.commit()
+                    break
+                self._json(HTTPStatus.OK, self._agent_job_payload(self._agent_job_for_project(connection, job_id, project_id)))
+        except (sqlite3.Error, ValueError, ContentGenerationProtocolError, CompetitorContentProtocolError) as error:
+            try:
+                with self._database() as connection, connection:
+                    failed = connection.execute("SELECT * FROM agent_jobs WHERE id=? AND project_id=?", (job_id, project_id)).fetchone()
+                    if failed is not None and failed["status"] not in {"cancelled", "waiting_input", "waiting_approval", "completed"}:
+                        checkpoint = self._agent_checkpoint(failed)
+                        node = str(checkpoint.get("current_node") or failed["current_node"] or "failed")
+                        generation_job_id = checkpoint.get("generation_job_id")
+                        if isinstance(generation_job_id, int):
+                            self._finish_content_generation_job(connection, generation_job_id, status="failed", failed_stage=node, error_summary=str(error)[:2000])
+                        connection.execute(
+                            """UPDATE agent_jobs SET status='failed',current_node=?,error_summary=?,checkpoint_json=?,
+                                   completed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=? AND project_id=?""",
+                            (node, str(error)[:2000], json.dumps(checkpoint, ensure_ascii=False), job_id, project_id),
+                        )
+            except sqlite3.Error:
+                pass
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
 
     def _retry_agent_job(self, job_id: int, payload: Mapping[str, Any]) -> None:
         project_id = self._integer(payload, "project_id")
@@ -4553,21 +7213,121 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 job = self._agent_job_for_project(connection, job_id, project_id)
                 if job["status"] not in {"failed", "cancelled"}:
                     raise ValueError("only failed or cancelled agent jobs can be retried")
-                connection.execute(
-                    """UPDATE agent_jobs SET status='queued',current_node='retry_requested',error_summary=NULL,
-                       completed_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                checkpoint = self._agent_checkpoint(job)
+                resume_node = checkpoint.get("current_node")
+                if not isinstance(resume_node, str) or not resume_node.strip():
+                    resume_node = job["current_node"] if job["current_node"] not in {"failed", "cancelled"} else "prepare_workflow"
+                retry_attempt = int(connection.execute(
+                    "SELECT COUNT(*) FROM agent_steps WHERE job_id=? AND node_name='retry_requested'",
                     (job_id,),
+                ).fetchone()[0]) + 1
+                # An explicit retry supersedes any delivery lease left active
+                # by the failed attempt. Without this, enqueue() deduplicates
+                # against that stale row and the Agent can remain queued until
+                # the old 35-minute lease expires.
+                connection.execute(
+                    """UPDATE durable_task_queue
+                       SET status='failed',last_error='Superseded by an explicit Agent retry.',
+                           lease_expires_at=NULL,completed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
+                       WHERE dedup_key=? AND status IN ('queued','running','retry_wait')""",
+                    (f"agent_job:{project_id}:{job_id}",),
+                )
+                connection.execute(
+                    """UPDATE agent_jobs SET status='queued',current_node=?,error_summary=NULL,
+                       completed_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                    (resume_node, job_id),
                 )
                 connection.execute(
                     """INSERT INTO agent_steps(job_id,node_name,attempt,status,input_summary,output_json,started_at,completed_at)
-                       VALUES(?, 'retry_requested', 1, 'completed', 'Retry was requested from the last durable state.', '{}', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)""",
-                    (job_id,),
+                       VALUES(?, 'retry_requested', ?, 'completed', 'Retry was requested from the last durable state.', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)""",
+                    (job_id, retry_attempt, json.dumps({"resume_node": resume_node}, ensure_ascii=False)),
                 )
                 row = self._agent_job_for_project(connection, job_id, project_id)
         except (sqlite3.Error, ValueError) as error:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
             return
         self._json(HTTPStatus.OK, self._agent_job_payload(row))
+        if row["requested_action"] == "full_content_agent" and row["workflow_version"] == "content-agent-v2":
+            self.server.enqueue_background_task("agent_job", project_id, job_id)
+        elif row["requested_action"] == "gsc_feedback_learning" and row["workflow_version"] == "gsc-feedback-v1":
+            self.server.enqueue_background_task("agent_job", project_id, job_id)
+
+    @staticmethod
+    def _agent_checkpoint(row: Mapping[str, Any]) -> dict[str, Any]:
+        try:
+            checkpoint = json.loads(row["checkpoint_json"] or "{}")
+        except (KeyError, IndexError, TypeError, json.JSONDecodeError):
+            checkpoint = {}
+        return checkpoint if isinstance(checkpoint, dict) else {}
+
+    def _pause_agent_job(self, job_id: int, payload: Mapping[str, Any]) -> None:
+        """Persist a cooperative pause without discarding the resume node."""
+
+        project_id = self._integer(payload, "project_id")
+        if project_id is None:
+            return
+        try:
+            with self._database() as connection, connection:
+                job = self._agent_job_for_project(connection, job_id, project_id)
+                if job["status"] not in {"queued", "planning", "running", "retrying"}:
+                    raise ValueError("only queued, planning, running, or retrying agent jobs can be paused")
+                checkpoint = self._agent_checkpoint(job)
+                checkpoint["pause"] = {
+                    "resume_node": job["current_node"],
+                    "previous_status": job["status"],
+                }
+                connection.execute(
+                    """UPDATE agent_jobs SET status='waiting_input',current_node='paused',checkpoint_json=?,
+                       updated_at=CURRENT_TIMESTAMP WHERE id=? AND project_id=?""",
+                    (json.dumps(checkpoint, ensure_ascii=False), job_id, project_id),
+                )
+                connection.execute(
+                    """INSERT INTO agent_steps(job_id,node_name,status,input_summary,output_json,started_at,completed_at)
+                       VALUES(?, 'pause_requested', 'completed', 'Pause was requested by the user.', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)""",
+                    (job_id, json.dumps({"resume_node": job["current_node"]}, ensure_ascii=False)),
+                )
+                row = self._agent_job_for_project(connection, job_id, project_id)
+        except (sqlite3.Error, ValueError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        self._json(HTTPStatus.OK, self._agent_job_payload(row))
+
+    def _resume_agent_job(self, job_id: int, payload: Mapping[str, Any]) -> None:
+        """Queue a paused job from its last durable checkpoint."""
+
+        project_id = self._integer(payload, "project_id")
+        if project_id is None:
+            return
+        try:
+            with self._database() as connection, connection:
+                job = self._agent_job_for_project(connection, job_id, project_id)
+                if job["status"] != "waiting_input" or job["current_node"] != "paused":
+                    raise ValueError("only paused agent jobs can be resumed")
+                checkpoint = self._agent_checkpoint(job)
+                pause = checkpoint.pop("pause", {})
+                resume_node = pause.get("resume_node") if isinstance(pause, Mapping) else None
+                if not isinstance(resume_node, str) or not resume_node.strip():
+                    resume_node = checkpoint.get("current_node", "prepare_workflow")
+                checkpoint["last_resumed_node"] = resume_node
+                connection.execute(
+                    """UPDATE agent_jobs SET status='queued',current_node=?,checkpoint_json=?,
+                       completed_at=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=? AND project_id=?""",
+                    (resume_node, json.dumps(checkpoint, ensure_ascii=False), job_id, project_id),
+                )
+                connection.execute(
+                    """INSERT INTO agent_steps(job_id,node_name,status,input_summary,output_json,started_at,completed_at)
+                       VALUES(?, 'resume_requested', 'completed', 'Resume was requested from the last durable checkpoint.', ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)""",
+                    (job_id, json.dumps({"resume_node": resume_node}, ensure_ascii=False)),
+                )
+                row = self._agent_job_for_project(connection, job_id, project_id)
+        except (sqlite3.Error, ValueError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        self._json(HTTPStatus.OK, self._agent_job_payload(row))
+        if row["requested_action"] == "full_content_agent" and row["workflow_version"] == "content-agent-v2":
+            self.server.enqueue_background_task("agent_job", project_id, job_id)
+        elif row["requested_action"] == "gsc_feedback_learning" and row["workflow_version"] == "gsc-feedback-v1":
+            self.server.enqueue_background_task("agent_job", project_id, job_id)
 
     def _cancel_agent_job(self, job_id: int, payload: Mapping[str, Any]) -> None:
         project_id = self._integer(payload, "project_id")
@@ -4606,15 +7366,79 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                     raise ValueError("approval request does not exist in this project")
                 if approval["status"] != "pending":
                     raise ValueError("approval request has already been decided")
+                job = self._agent_job_for_project(connection, int(approval["job_id"]), project_id)
                 connection.execute("UPDATE agent_approval_requests SET status=?,decided_by=?,decided_at=CURRENT_TIMESTAMP WHERE id=?", (decision, decided_by[:100], approval_id))
-                next_status = "queued" if decision == "approved" else "cancelled"
-                next_node = "approval_approved" if decision == "approved" else "approval_rejected"
-                connection.execute(
-                    """UPDATE agent_jobs SET status=?,current_node=?,
-                       completed_at=CASE WHEN ?='cancelled' THEN CURRENT_TIMESTAMP ELSE NULL END,
-                       updated_at=CURRENT_TIMESTAMP WHERE id=?""",
-                    (next_status, next_node, next_status, approval["job_id"]),
+                is_content_blueprint = (
+                    approval["approval_type"] == "blueprint"
+                    and job["requested_action"] == "full_content_agent"
+                    and job["workflow_version"] == "content-agent-v2"
                 )
+                if is_content_blueprint:
+                    checkpoint = self._agent_checkpoint(job)
+                    brief_id = checkpoint.get("candidate_brief_id")
+                    outline_id = checkpoint.get("candidate_outline_id")
+                    if not isinstance(brief_id, int) or not isinstance(outline_id, int):
+                        raise ValueError("content blueprint checkpoint is incomplete")
+                    brief = connection.execute(
+                        """SELECT briefs.id FROM content_briefs briefs
+                           JOIN content_assets assets ON assets.id=briefs.content_asset_id
+                           WHERE briefs.id=? AND briefs.agent_job_id=? AND assets.project_id=? AND assets.id=?""",
+                        (brief_id, job["id"], project_id, job["content_asset_id"]),
+                    ).fetchone()
+                    outline = connection.execute(
+                        """SELECT outlines.id FROM content_outlines outlines
+                           JOIN content_assets assets ON assets.id=outlines.content_asset_id
+                           WHERE outlines.id=? AND outlines.agent_job_id=? AND assets.project_id=? AND assets.id=?""",
+                        (outline_id, job["id"], project_id, job["content_asset_id"]),
+                    ).fetchone()
+                    if brief is None or outline is None:
+                        raise ValueError("content blueprint does not belong to this project and agent job")
+                    if decision == "approved":
+                        connection.execute(
+                            "UPDATE content_briefs SET status='superseded' WHERE content_asset_id=? AND id<>? AND status='current'",
+                            (job["content_asset_id"], brief_id),
+                        )
+                        connection.execute("UPDATE content_briefs SET status='current' WHERE id=?", (brief_id,))
+                        connection.execute("UPDATE content_outlines SET status='approved' WHERE id=?", (outline_id,))
+                        connection.execute(
+                            """UPDATE content_assets SET status='outlining',current_brief_id=?,current_outline_id=?,
+                                   updated_at=CURRENT_TIMESTAMP WHERE id=? AND project_id=?""",
+                            (brief_id, outline_id, job["content_asset_id"], project_id),
+                        )
+                        checkpoint["current_node"] = "blueprint_approved"
+                        next_status = "queued"
+                        next_node = "blueprint_approved"
+                    else:
+                        original = checkpoint.get("original_asset_state") if isinstance(checkpoint.get("original_asset_state"), Mapping) else {}
+                        connection.execute("UPDATE content_briefs SET status='rejected' WHERE id=?", (brief_id,))
+                        connection.execute("UPDATE content_outlines SET status='rejected' WHERE id=?", (outline_id,))
+                        connection.execute(
+                            """UPDATE content_assets SET status=?,current_brief_id=?,current_outline_id=?,current_draft_id=?,
+                                   current_generation_run_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND project_id=?""",
+                            (original.get("status", "planned"), original.get("current_brief_id"), original.get("current_outline_id"),
+                             original.get("current_draft_id"), original.get("current_generation_run_id"), job["content_asset_id"], project_id),
+                        )
+                        generation_job_id = checkpoint.get("generation_job_id")
+                        if isinstance(generation_job_id, int):
+                            self._finish_content_generation_job(connection, generation_job_id, status="completed")
+                        checkpoint["current_node"] = "blueprint_rejected"
+                        next_status = "cancelled"
+                        next_node = "blueprint_rejected"
+                    connection.execute(
+                        """UPDATE agent_jobs SET status=?,current_node=?,checkpoint_json=?,
+                               completed_at=CASE WHEN ?='cancelled' THEN CURRENT_TIMESTAMP ELSE NULL END,
+                               updated_at=CURRENT_TIMESTAMP WHERE id=? AND project_id=?""",
+                        (next_status, next_node, json.dumps(checkpoint, ensure_ascii=False), next_status, job["id"], project_id),
+                    )
+                else:
+                    next_status = "queued" if decision == "approved" else "cancelled"
+                    next_node = "approval_approved" if decision == "approved" else "approval_rejected"
+                    connection.execute(
+                        """UPDATE agent_jobs SET status=?,current_node=?,
+                           completed_at=CASE WHEN ?='cancelled' THEN CURRENT_TIMESTAMP ELSE NULL END,
+                           updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                        (next_status, next_node, next_status, approval["job_id"]),
+                    )
                 connection.execute(
                     """INSERT INTO agent_steps(job_id,node_name,status,input_summary,output_json,started_at,completed_at)
                        VALUES(?,?,?,?,?,CURRENT_TIMESTAMP,CURRENT_TIMESTAMP)""",
@@ -4625,31 +7449,29 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
             return
         self._json(HTTPStatus.OK, self._agent_job_payload(row))
+        if decision == "approved" and row["requested_action"] == "full_content_agent" and row["workflow_version"] == "content-agent-v2":
+            self.server.enqueue_background_task("agent_job", project_id, int(row["id"]))
 
     def _update_project(self, project_id: int, payload: Mapping[str, Any]) -> None:
         fields = {"name": self._optional_text(payload, "name"), "site_url": self._optional_text(payload, "site_url"), "industry": self._optional_text(payload, "industry"), "default_country": self._optional_text(payload, "country_code"), "default_language": self._optional_text(payload, "language_code")}
-        updates = [(key, value) for key, value in fields.items() if value is not None]
+        updates = {key: value for key, value in fields.items() if value is not None}
         if not updates:
             self._json(HTTPStatus.BAD_REQUEST, {"error": "At least one project field is required."})
             return
-        statement = ",".join(f"{key}=?" for key, _value in updates) + ",updated_at=CURRENT_TIMESTAMP"
         try:
-            with self._database() as connection:
-                cursor = connection.execute(f"UPDATE projects SET {statement} WHERE id=?", (*[value for _key, value in updates], project_id))
-                if cursor.rowcount != 1:
-                    raise ValueError("project does not exist")
-                row = connection.execute("SELECT id,name,site_url,industry,default_country,default_language,created_at,updated_at FROM projects WHERE id=?", (project_id,)).fetchone()
+            row = self.server.project_repository.update_project(project_id, updates)
         except (sqlite3.Error, ValueError) as error:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
             return
-        self._json(HTTPStatus.OK, dict(row))
+        self._json(HTTPStatus.OK, row)
 
     def _delete_project(self, project_id: int) -> None:
         try:
-            with self._database() as connection:
-                cursor = connection.execute("DELETE FROM projects WHERE id=?", (project_id,))
-                if cursor.rowcount != 1:
-                    raise ValueError("project does not exist")
+            self.server.project_repository.delete_project(project_id)
+            with self._credential_database() as credential_connection, credential_connection:
+                credential_connection.execute(
+                    "DELETE FROM wordpress_credentials WHERE project_id=?", (project_id,)
+                )
         except (sqlite3.Error, ValueError) as error:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
             return
@@ -5157,6 +7979,8 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             self._json(HTTPStatus.BAD_REQUEST, {"error": "count must be an integer from 1 to 20."})
             return
         title_type = self._optional_text(payload, "title_type")
+        research_recovery = payload.get("research_recovery") is True
+        failed_title = self._optional_text(payload, "failed_title")
         raw_competitor_titles = payload.get("competitor_titles", [])
         if not isinstance(raw_competitor_titles, list) or any(not isinstance(title, str) for title in raw_competitor_titles):
             self._json(HTTPStatus.BAD_REQUEST, {"error": "competitor_titles must be a string list."})
@@ -5168,22 +7992,44 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 intent = connection.execute("SELECT search_intent FROM keyword_reviews WHERE keyword_id=? ORDER BY id DESC LIMIT 1", (keyword_id,)).fetchone()
                 category = connection.execute("SELECT categories.name FROM keyword_category_assignments assignments JOIN keyword_categories categories ON categories.id=assignments.category_id WHERE assignments.keyword_id=? ORDER BY assignments.created_at DESC LIMIT 1", (keyword_id,)).fetchone()
                 competitor_titles = self._merge_serp_title_memory(connection, project_id, keyword_id, competitor_titles)
-                request_data = {"keyword": keyword["keyword"], "locale": locale, "count": count, "search_intent": intent[0] if intent else None, "category": category[0] if category else None, "title_type": title_type, "competitor_titles": competitor_titles}
-                provider = "ai" if isinstance(self.server.title_generator, OpenAICompatibleTitleGenerator) else "rule"
+                request_data = {"keyword": keyword["keyword"], "locale": locale, "count": count, "search_intent": intent[0] if intent else None, "category": category[0] if category else None, "title_type": title_type, "competitor_titles": competitor_titles, "research_recovery": research_recovery, "failed_title": failed_title}
+                if isinstance(self.server.title_generator, OpenAICompatibleTitleGenerator):
+                    provider = _ai_assignments(self.server.ai_settings_path)["title_generation"]
+                    active_configuration = _provider_configuration(self.server.ai_settings_path, provider)
+                    model = active_configuration[2] if active_configuration else None
+                else:
+                    provider, model = "rule", None
+                # Commit the audit row before calling the remote model. A
+                # provider failure must not roll the evidence of that failure
+                # back with the candidate transaction.
                 with connection:
                     cursor = connection.execute(
-                        """INSERT INTO title_generation_jobs(project_id,keyword_id,status,request_json,provider,requested_count,started_at)
-                           VALUES(?,?, 'running', ?,?,?, CURRENT_TIMESTAMP)""",
-                        (project_id, keyword_id, json.dumps(request_data, ensure_ascii=False), provider, count),
+                        """INSERT INTO title_generation_jobs(project_id,keyword_id,status,request_json,provider,model,requested_count,started_at)
+                           VALUES(?,?, 'running', ?,?,?,?, CURRENT_TIMESTAMP)""",
+                        (project_id, keyword_id, json.dumps(request_data, ensure_ascii=False), provider, model, count),
                     )
                     job_id = int(cursor.lastrowid)
+                try:
                     raw = self.server.title_generator.generate(**request_data)
                     candidates = self._title_candidates_from_response(raw, count)
+                except (ValueError, TypeError, TitleGenerationProtocolError, json.JSONDecodeError) as error:
+                    summary = (str(error) or "Title generation failed.")[:500]
+                    error_code = "provider_error" if isinstance(error, TitleGenerationProtocolError) else "invalid_response"
+                    with connection:
+                        connection.execute(
+                            """UPDATE title_generation_jobs
+                               SET status='failed',error_code=?,error_summary=?,completed_at=CURRENT_TIMESTAMP
+                               WHERE id=?""",
+                            (error_code, summary, job_id),
+                        )
+                    self._json(HTTPStatus.BAD_GATEWAY, {"error": summary, "job_id": job_id, "provider": provider, "model": model})
+                    return
+                with connection:
                     for candidate in candidates:
                         self._insert_title_candidate(connection, project_id, keyword_id, candidate, source_type="ai", generation_job_id=job_id)
                     connection.execute("UPDATE title_generation_jobs SET status='succeeded',generated_count=?,completed_at=CURRENT_TIMESTAMP WHERE id=?", (len(candidates), job_id))
                 row = connection.execute("SELECT * FROM title_generation_jobs WHERE id=?", (job_id,)).fetchone()
-        except (sqlite3.Error, ValueError, TypeError, TitleGenerationProtocolError, json.JSONDecodeError) as error:
+        except (sqlite3.Error, ValueError, TypeError) as error:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(error) or "Title generation failed."})
             return
         self._json(HTTPStatus.CREATED, self._title_job_payload(row))
@@ -5528,14 +8374,16 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         elif not isinstance(raw_ids, list) or not raw_ids or any(not isinstance(value, int) or isinstance(value, bool) or value < 1 for value in raw_ids):
             self._json(HTTPStatus.BAD_REQUEST, {"error": "keyword_ids must be a non-empty list of positive integers."})
             return
-        with self._database() as connection:
-            if clear_all:
-                cursor = connection.execute("UPDATE keywords SET deleted_at=CURRENT_TIMESTAMP WHERE project_id=? AND deleted_at IS NULL", (project_id,))
-            else:
-                marks = ",".join("?" for _ in raw_ids)
-                cursor = connection.execute(f"UPDATE keywords SET deleted_at=CURRENT_TIMESTAMP WHERE project_id=? AND deleted_at IS NULL AND id IN ({marks})", (project_id, *raw_ids))
-            connection.commit()
-        self._json(HTTPStatus.OK, {"deleted": cursor.rowcount})
+        try:
+            deleted = self.server.keyword_repository.soft_delete(
+                project_id,
+                keyword_ids=raw_ids,
+                clear_all=clear_all,
+            )
+        except (sqlite3.Error, ValueError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        self._json(HTTPStatus.OK, {"deleted": deleted})
 
     def _import_keywords(self, payload: Mapping[str, Any]) -> None:
         project_id = self._integer(payload, "project_id")
@@ -5575,30 +8423,12 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         except ValueError:
             self._json(HTTPStatus.BAD_REQUEST, {"error": "project_id must be an integer."})
             return
-        with self._database() as connection:
-            rows = connection.execute(
-                """SELECT keywords.id,keywords.keyword,keywords.country_code,keywords.language_code,keywords.demand_estimate,
-                   metrics.average_monthly_searches AS search_volume,metrics.competition_level,
-                   metrics.competition_index,metrics.metric_date,
-                   (SELECT categories.name FROM keyword_category_assignments AS assignments
-                      JOIN keyword_categories AS categories ON categories.id=assignments.category_id
-                      WHERE assignments.keyword_id=keywords.id ORDER BY assignments.created_at DESC LIMIT 1) AS category,
-                   (SELECT reviews.search_intent FROM keyword_reviews AS reviews
-                      WHERE reviews.keyword_id=keywords.id ORDER BY reviews.id DESC LIMIT 1) AS search_intent,
-                   (SELECT reviews.is_seo_content_fit FROM keyword_reviews AS reviews
-                      WHERE reviews.keyword_id=keywords.id ORDER BY reviews.id DESC LIMIT 1) AS is_seo_content_fit
-                   ,(SELECT candidates.title FROM keyword_title_candidates AS candidates
-                      WHERE candidates.keyword_id=keywords.id AND candidates.status='selected' AND candidates.deleted_at IS NULL LIMIT 1) AS selected_title
-                   ,(SELECT COUNT(*) FROM keyword_title_candidates AS candidates
-                      WHERE candidates.keyword_id=keywords.id AND candidates.deleted_at IS NULL) AS title_candidate_count
-                   FROM keywords
-                   LEFT JOIN keyword_metric_snapshots AS metrics ON metrics.id=(
-                     SELECT latest.id FROM keyword_metric_snapshots AS latest WHERE latest.keyword_id=keywords.id
-                     ORDER BY latest.metric_date DESC,latest.id DESC LIMIT 1)
-                   WHERE keywords.project_id=? AND keywords.deleted_at IS NULL ORDER BY keywords.keyword COLLATE NOCASE,keywords.id""",
-                (project_id,),
-            ).fetchall()
-        self._json(HTTPStatus.OK, [dict(row) for row in rows])
+        try:
+            rows = self.server.keyword_repository.list_keywords(project_id)
+        except (sqlite3.Error, ValueError) as error:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        self._json(HTTPStatus.OK, rows)
 
     @staticmethod
     def _keyword_title_candidates_path(path: str) -> int | None:
@@ -5640,7 +8470,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
     @staticmethod
     def _content_asset_action_path(path: str) -> tuple[int, str] | None:
         parts = path.strip("/").split("/")
-        if len(parts) != 4 or parts[:2] != ["api", "content-assets"] or parts[3] not in {"briefs", "outlines", "generate", "generate-brief", "generate-outline", "generate-draft", "review-quality", "rewrite-targeted", "research-competitors", "image-prompts", "generate-images", "prepare-publish", "publish-wordpress"}: return None
+        if len(parts) != 4 or parts[:2] != ["api", "content-assets"] or parts[3] not in {"briefs", "outlines", "generate", "generate-brief", "generate-outline", "generate-draft", "review-quality", "rewrite-targeted", "preview-competitors", "preview-outline", "preview-content", "restart", "research-competitors", "image-prompts", "generate-images", "prepare-publish", "publish-wordpress"}: return None
         try: return int(parts[2]), parts[3]
         except ValueError: return None
 
@@ -5730,6 +8560,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         payload["generation_runs"] = [self._content_run_payload(run) for run in runs]
         payload["generation_jobs"] = [dict(job) for job in jobs]
         payload["competitor_research"] = self._competitor_research_payload(connection, research["id"]) if research else None
+        payload["production_readiness"] = self._content_competitor_learning_gate(connection, row)
         payload["authority_sources"] = [self._authority_source_payload(source) for source in authority_sources]
         payload["authority_search_results"] = [dict(result) for result in authority_search_results]
         payload["section_images"] = [dict(image) for image in images]
@@ -5770,7 +8601,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         value = dict(row)
         value["input"] = json.loads(value.pop("input_json") or "{}")
         workflow_stage = value["input"].get("workflow_stage")
-        if workflow_stage in {"chapter_plan", "company_context_plan", "targeted_rewrite"}:
+        if workflow_stage in {"industry_rules", "chapter_plan", "company_context_plan", "targeted_rewrite"}:
             value["stage"] = workflow_stage
         raw_output = value.pop("output_json")
         value["output"] = json.loads(raw_output) if raw_output else None
@@ -5958,9 +8789,27 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         return float(value)
 
     @contextmanager
-    def _database(self) -> Iterator[sqlite3.Connection]:
-        connection = initialize_database(self.server.database_path)
-        connection.row_factory = sqlite3.Row
+    def _database(self) -> Iterator[Any]:
+        if self.server.runtime_database.mode is RuntimeDatabaseMode.POSTGRES:
+            if self.server.runtime_postgres_factory is None:
+                raise RuntimeError("PostgreSQL runtime connection is not configured")
+            connection = self.server.runtime_postgres_factory.connect()
+        else:
+            connection = initialize_database(self.server.database_path)
+            connection.row_factory = sqlite3.Row
+        try:
+            yield connection
+        finally:
+            connection.close()
+
+    @contextmanager
+    def _credential_database(self) -> Iterator[sqlite3.Connection]:
+        # Compatibility bridge for upgrades that still have DPAPI ciphertext
+        # in the legacy SQLite credential tables. New writes always go only to
+        # the independent vault.
+        if str(self.server.database_path) != ":memory:":
+            self.server.credential_vault.import_existing(self.server.database_path)
+        connection = self.server.credential_vault.connect()
         try:
             yield connection
         finally:
@@ -6064,7 +8913,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         self.send_response(status); self.send_header("Content-Type", "application/json; charset=utf-8"); self.send_header("Content-Length", str(len(content))); self.end_headers(); self.wfile.write(content)
 
 
-def create_server(host: str = "127.0.0.1", port: int = 0, database_path: str | Path = ":memory:", suggest_client: Any | None = None, keyword_reviewer: Any | None = None, title_generator: Any | None = None, serp_title_client: Any | None = None, ai_settings_path: Path | None = None, content_generator: Any | None = None, competitor_content_client: Any | None = None, competitor_search_client: Any | None = None) -> KeywordDiscoveryServer:
+def create_server(host: str = "127.0.0.1", port: int = 0, database_path: str | Path = ":memory:", suggest_client: Any | None = None, keyword_reviewer: Any | None = None, title_generator: Any | None = None, serp_title_client: Any | None = None, ai_settings_path: Path | None = None, content_generator: Any | None = None, competitor_content_client: Any | None = None, competitor_search_client: Any | None = None, database_mode: str | None = None, database_url: str | None = None, runtime_state_path: str | Path | None = None, credential_vault_path: str | Path | None = None) -> KeywordDiscoveryServer:
     server = KeywordDiscoveryServer((host, port), KeywordDiscoveryRequestHandler)
     server.database_path = database_path
     server.ai_settings_path = ai_settings_path or AI_SETTINGS_FILE
@@ -6079,15 +8928,123 @@ def create_server(host: str = "127.0.0.1", port: int = 0, database_path: str | P
     # Content-page extraction is independent HTTP parsing; only the Google SERP
     # discovery path is delegated to Serper.dev in production.
     server.competitor_search_client = competitor_search_client
+    server.collection_service = CollectionService()
+    # A file-backed SQLite source must have its schema before legacy encrypted
+    # credentials can be imported into the independent local vault.
+    if str(database_path) != ":memory:":
+        source_bootstrap = initialize_database(server.database_path)
+        source_bootstrap.close()
+    default_vault_path = (
+        Path(credential_vault_path) if credential_vault_path is not None
+        else (Path(database_path).parent / "runtime-credentials.sqlite3" if str(database_path) != ":memory:" else Path(os.getenv("TEMP", ".")) / f"seo-runtime-credentials-{uuid.uuid4().hex}.sqlite3")
+    )
+    server.credential_vault = CredentialVault(default_vault_path, import_database_path=None if str(database_path) == ":memory:" else database_path)
+    server.runtime_database = RuntimeDatabaseController(
+        server.database_path,
+        database_url=database_url,
+        state_path=runtime_state_path,
+        requested_mode=database_mode,
+        credential_vault=server.credential_vault,
+    )
+    sqlite_projects = SQLiteProjectRepository(server.database_path)
+    sqlite_keywords = SQLiteKeywordRepository(server.database_path)
+    sqlite_collection = SQLiteCollectionRepository(server.database_path)
+    target_url = server.runtime_database.database_url
+    server.runtime_postgres_factory = (
+        PostgresRuntimeConnectionFactory(server.database_path, target_url) if target_url else None
+    )
+    postgres_projects = PostgresRuntimeProjectRepository(server.runtime_postgres_factory) if server.runtime_postgres_factory else None
+    postgres_keywords = PostgresRuntimeKeywordRepository(server.runtime_postgres_factory) if server.runtime_postgres_factory else None
+    postgres_collection = PostgresRuntimeCollectionRepository(server.runtime_postgres_factory) if server.runtime_postgres_factory else None
+    server.project_repository = ShadowProjectRepository(sqlite_projects, postgres_projects, server.runtime_database)
+    server.keyword_repository = ShadowKeywordRepository(sqlite_keywords, postgres_keywords, server.runtime_database)
+    server.collection_repository = ShadowCollectionRepository(sqlite_collection, postgres_collection, server.runtime_database)
     server.gsc_oauth_states = {}
     server.gsc_browser_client = GscBrowserCaptureClient()
     # Apply migrations before the scheduler gets a second SQLite connection.
     # Otherwise a brand-new database can race on schema_migrations at startup.
-    bootstrap_connection = initialize_database(server.database_path)
+    if server.runtime_database.mode is RuntimeDatabaseMode.POSTGRES:
+        if server.runtime_postgres_factory is None:
+            raise RuntimeError("PostgreSQL runtime connection is not configured")
+        bootstrap_connection = server.runtime_postgres_factory.connect()
+    else:
+        bootstrap_connection = initialize_database(server.database_path)
+        bootstrap_connection.row_factory = sqlite3.Row
+    with bootstrap_connection:
+        server.recovered_collection_runs = server.collection_service.recover_interrupted_runs(bootstrap_connection)
+        # Ordinary content generation is handled by the HTTP request thread and
+        # cannot survive a process restart. Keep the audit row, but never leave
+        # an interrupted request looking active forever. Durable full-content
+        # Agent jobs are excluded because their generation row intentionally
+        # stays open while the workflow waits at approval checkpoints.
+        bootstrap_connection.execute(
+            """UPDATE content_generation_jobs
+               SET status='failed',failed_stage='interrupted',
+                   error_summary='Generation was interrupted by a service restart. Retry from the content workspace.',
+                   completed_at=CURRENT_TIMESTAMP
+               WHERE status='running' AND requested_action<>'full_content_agent'"""
+        )
+        bootstrap_connection.execute(
+            """UPDATE content_generation_runs
+               SET status='failed',error_summary='Stage was interrupted by a service restart and superseded by checkpoint recovery.',
+                   completed_at=CURRENT_TIMESTAMP
+               WHERE status='running'"""
+        )
+        bootstrap_connection.execute(
+            """UPDATE competitor_research_runs
+               SET status='failed',error_summary='Competitor research was interrupted by a service restart. Retry this title to start a new traceable collection run.',
+                   completed_at=CURRENT_TIMESTAMP
+               WHERE status='running'"""
+        )
+        bootstrap_connection.execute(
+            """UPDATE agent_steps
+               SET status='failed',error_summary='Step was interrupted by a service restart and recovered from its checkpoint.',
+                   completed_at=CURRENT_TIMESTAMP
+               WHERE status='running'"""
+        )
+        bootstrap_connection.execute(
+            """UPDATE agent_jobs SET status='queued',updated_at=CURRENT_TIMESTAMP
+               WHERE workflow_version='content-agent-v2' AND requested_action='full_content_agent'
+                 AND status IN ('running','retrying')"""
+        )
+        server.recovered_content_agent_jobs = [
+            (int(row["project_id"]), int(row["id"]))
+            for row in bootstrap_connection.execute(
+                """SELECT id,project_id FROM agent_jobs
+                   WHERE workflow_version='content-agent-v2' AND requested_action='full_content_agent'
+                     AND status IN ('queued','planning') ORDER BY id"""
+            ).fetchall()
+        ]
+        bootstrap_connection.execute(
+            """UPDATE agent_jobs SET status='queued',updated_at=CURRENT_TIMESTAMP
+               WHERE workflow_version='gsc-feedback-v1' AND requested_action='gsc_feedback_learning'
+                 AND status IN ('running','retrying')"""
+        )
+        server.recovered_gsc_feedback_jobs = [
+            (int(row["project_id"]), int(row["id"]))
+            for row in bootstrap_connection.execute(
+                """SELECT id,project_id FROM agent_jobs
+                   WHERE workflow_version='gsc-feedback-v1' AND requested_action='gsc_feedback_learning'
+                     AND status IN ('queued','planning') ORDER BY id"""
+            ).fetchall()
+        ]
     bootstrap_connection.close()
+    callback_host = "127.0.0.1" if host in {"", "0.0.0.0", "::"} else host
+    callback_url = f"http://{callback_host}:{server.server_address[1]}"
+    server.worker_token = os.getenv("SEO_WORKER_TOKEN") or uuid.uuid4().hex
+    server.task_queue = DurableTaskQueue(
+        server.database_path,
+        callback_url=callback_url,
+        worker_token=server.worker_token,
+        connection_factory=(
+            lambda: server.runtime_postgres_factory.connect()
+            if server.runtime_database.mode is RuntimeDatabaseMode.POSTGRES and server.runtime_postgres_factory is not None
+            else initialize_database(server.database_path)
+        ),
+    )
     server.periodic_learning_stop = threading.Event()
     server.periodic_learning_wake = threading.Event()
-    threading.Thread(target=_periodic_competitor_learning_loop, args=(server,), daemon=True, name="periodic-competitor-learning").start()
+    server.periodic_learning_thread = None
     return server
 
 
@@ -6112,12 +9069,81 @@ def _dispatch_competitor_learning_run(server: KeywordDiscoveryServer, project_id
         return
 
 
+def _dispatch_competitor_catalog_collection(server: KeywordDiscoveryServer, project_id: int, run_id: int) -> None:
+    """Execute a user-requested catalog collection without blocking the page."""
+    host, port = server.server_address[:2]
+    for attempt in range(3):
+        try:
+            request = Request(
+                f"http://{host}:{port}/api/competitor-url-catalog/collection-runs/{run_id}/execute",
+                data=json.dumps({"project_id": project_id}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(request, timeout=900):
+                return
+        except Exception:
+            # Startup recovery can race the first serve_forever poll. The
+            # durable queued run remains safe if all short retries fail.
+            if attempt < 2:
+                time.sleep(0.1 * (attempt + 1))
+
+
+def _dispatch_collected_competitor_content_learning(server: KeywordDiscoveryServer, project_id: int, run_id: int) -> None:
+    """Run collection-library learning in the background so the UI stays responsive."""
+    host, port = server.server_address[:2]
+    try:
+        request = Request(
+            f"http://{host}:{port}/api/competitor-content-learning/runs/{run_id}/execute",
+            data=json.dumps({"project_id": project_id}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urlopen(request, timeout=900):
+            pass
+    except Exception:
+        # The durable run stays visible; the endpoint itself records failures
+        # after execution begins, without hiding an upstream model error.
+        return
+
+
+def _dispatch_content_agent_job(server: KeywordDiscoveryServer, project_id: int, job_id: int) -> None:
+    """Advance one durable content Agent job through its audited HTTP route."""
+
+    host, port = server.server_address[:2]
+    for attempt in range(20):
+        try:
+            request = Request(
+                f"http://{host}:{port}/api/agent-jobs/{job_id}/execute",
+                data=json.dumps({"project_id": project_id}).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urlopen(request, timeout=1800):
+                return
+        except Exception:
+            if attempt < 19:
+                time.sleep(min(1.0, 0.1 * (attempt + 1)))
+
+
+def _dispatch_gsc_feedback_job(server: KeywordDiscoveryServer, project_id: int, job_id: int) -> None:
+    """Resume one durable GSC feedback job through the shared Agent route."""
+
+    _dispatch_content_agent_job(server, project_id, job_id)
+
+
 def _periodic_competitor_learning_loop(server: KeywordDiscoveryServer) -> None:
     """Queue due project schedules without blocking page navigation or requests."""
     while not server.periodic_learning_stop.is_set():
         try:
-            connection = initialize_database(server.database_path)
-            connection.row_factory = sqlite3.Row
+            server.task_queue.reclaim_expired_leases()
+            if server.runtime_database.mode is RuntimeDatabaseMode.POSTGRES:
+                if server.runtime_postgres_factory is None:
+                    raise RuntimeError("PostgreSQL runtime connection is not configured")
+                connection = server.runtime_postgres_factory.connect()
+            else:
+                connection = initialize_database(server.database_path)
+                connection.row_factory = sqlite3.Row
             with connection:
                 schedules = connection.execute(
                     """SELECT * FROM competitor_learning_schedules
@@ -6142,7 +9168,7 @@ def _periodic_competitor_learning_loop(server: KeywordDiscoveryServer) -> None:
                     queued.append((int(schedule["project_id"]), int(cursor.lastrowid)))
             connection.close()
             for project_id, run_id in queued:
-                threading.Thread(target=_dispatch_competitor_learning_run, args=(server, project_id, run_id), daemon=True, name=f"scheduled-competitor-learning-{run_id}").start()
+                server.enqueue_background_task("competitor_learning", project_id, run_id)
         except Exception:
             # The next cycle retries database availability.  Task rows, once
             # created, remain visible rather than disappearing with the loop.

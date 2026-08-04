@@ -8,23 +8,17 @@ services only through these named, server-side tools.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, Literal, TypedDict
+from typing import Any, Callable, Literal, TypedDict
 
 from langgraph.graph import END, START, StateGraph
 
 
 WorkflowStatus = Literal["queued", "planning", "running", "waiting_input", "completed", "failed"]
 
-AGENT_TOOL_ALLOWLIST = frozenset({
-    "load_project_context",
-    "retrieve_project_memories",
-    "research_competitors",
-    "extract_style_cards",
-    "plan_content_blueprint",
-    "generate_article",
-    "review_article_quality",
-    "prepare_publish",
-})
+from seo_control.application.agent_tools import AGENT_TOOL_ALLOWLIST
+
+
+ToolInvoker = Callable[[str, Mapping[str, Any]], Mapping[str, Any]]
 
 
 class AgentWorkflowInputError(ValueError):
@@ -38,11 +32,13 @@ class ContentWorkflowState(TypedDict, total=False):
     status: WorkflowStatus
     current_node: str
     allowed_tools: list[str]
-    events: list[dict[str, str]]
+    events: list[dict[str, Any]]
+    project_context: dict[str, Any]
+    retrieved_memories: list[dict[str, Any]]
     error_summary: str | None
 
 
-def _event(state: Mapping[str, Any], *, node: str, message: str) -> list[dict[str, str]]:
+def _event(state: Mapping[str, Any], *, node: str, message: str) -> list[dict[str, Any]]:
     previous = state.get("events")
     events = [dict(item) for item in previous] if isinstance(previous, list) else []
     events.append({"node": node, "message": message})
@@ -81,16 +77,81 @@ def _prepare_workflow(state: ContentWorkflowState) -> ContentWorkflowState:
     }
 
 
-def build_content_workflow() -> Any:
-    """Create the non-side-effecting root graph used by later agent modules."""
+def build_content_workflow(tool_invoker: ToolInvoker | None = None) -> Any:
+    """Create the workflow bootstrap graph.
+
+    Without an invoker this keeps the legacy non-side-effecting skeleton used
+    by isolated tests.  With an invoker, project context and memories are read
+    through real audited server-side tools before the job is queued for its
+    next durable stage.
+    """
 
     graph = StateGraph(ContentWorkflowState)
     graph.add_node("validate_project_context", _validate_project_context)
+    if tool_invoker is not None:
+        def load_project_context(state: ContentWorkflowState) -> ContentWorkflowState:
+            output = dict(tool_invoker("load_project_context", {
+                "project_id": state["project_id"],
+                "content_asset_id": state.get("content_asset_id"),
+            }))
+            return {
+                "status": "planning",
+                "current_node": "load_project_context",
+                "project_context": output,
+                "events": _event(state, node="load_project_context", message="Current project context was loaded through an audited server-side tool."),
+            }
+
+        def retrieve_project_memories(state: ContentWorkflowState) -> ContentWorkflowState:
+            asset = state.get("project_context", {}).get("content_asset")
+            if isinstance(asset, Mapping):
+                query = f"{asset.get('title_snapshot', '')} {asset.get('keyword', '')}".strip()
+            else:
+                query = str(state.get("requested_action") or "")
+            output = dict(tool_invoker("retrieve_project_memories", {
+                "project_id": state["project_id"],
+                "query": query,
+                "limit": 7,
+            }))
+            memories = output.get("memories") if isinstance(output.get("memories"), list) else []
+            return {
+                "status": "planning",
+                "current_node": "retrieve_project_memories",
+                "retrieved_memories": [dict(item) for item in memories if isinstance(item, Mapping)],
+                "events": _event(state, node="retrieve_project_memories", message=f"Retrieved {len(memories)} explainable project memories."),
+            }
+
+        graph.add_node("load_project_context", load_project_context)
+        graph.add_node("retrieve_project_memories", retrieve_project_memories)
     graph.add_node("prepare_workflow", _prepare_workflow)
     graph.add_edge(START, "validate_project_context")
-    graph.add_edge("validate_project_context", "prepare_workflow")
+    if tool_invoker is None:
+        graph.add_edge("validate_project_context", "prepare_workflow")
+    else:
+        graph.add_edge("validate_project_context", "load_project_context")
+        graph.add_edge("load_project_context", "retrieve_project_memories")
+        graph.add_edge("retrieve_project_memories", "prepare_workflow")
     graph.add_edge("prepare_workflow", END)
     return graph.compile()
+
+
+def run_content_workflow(
+    *,
+    project_id: int,
+    requested_action: str,
+    tool_invoker: ToolInvoker,
+    content_asset_id: int | None = None,
+) -> ContentWorkflowState:
+    """Run the implemented workflow prefix through audited Agent tools."""
+
+    initial_state: ContentWorkflowState = {
+        "project_id": project_id,
+        "content_asset_id": content_asset_id,
+        "requested_action": requested_action,
+        "status": "queued",
+        "current_node": "created",
+        "events": [],
+    }
+    return build_content_workflow(tool_invoker).invoke(initial_state)
 
 
 def run_content_workflow_skeleton(

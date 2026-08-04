@@ -60,6 +60,48 @@ Use **led stair lights outdoor** where suitable.
         self.assertIn('href="https://www.ul.com/"', html)
         self.assertIn("<strong>led stair lights outdoor</strong>", html)
 
+    def test_raw_html_table_is_rebuilt_as_safe_wordpress_table(self) -> None:
+        markdown = """<table onclick="steal()"><thead><tr><th scope="col">Item<script>alert(1)</script></th></tr></thead><tbody><tr><th scope="row">Driver</th><td style="color:red" onclick="steal()">Verify model</td></tr></tbody></table>"""
+        html = KeywordDiscoveryRequestHandler._markdown_to_wordpress_html(markdown)
+        self.assertIn('<figure class="wp-block-table seo-control-table-wrap"', html)
+        self.assertIn('<th scope="col">Item</th>', html)
+        self.assertIn('<th scope="row">Driver</th>', html)
+        self.assertIn("<td>Verify model</td>", html)
+        for unsafe in ("onclick", "color:red", "script", "alert(1)"):
+            self.assertNotIn(unsafe, html)
+
+    def test_loose_numbered_and_task_lists_render_as_single_semantic_lists(self) -> None:
+        markdown = """1. First check
+
+1. Second check
+
+- [ ] Pending inspection
+- [x] Documentation complete"""
+        html = KeywordDiscoveryRequestHandler._markdown_to_wordpress_html(markdown)
+        self.assertEqual(1, html.count("<ol>"))
+        self.assertIn("<ol><li>First check</li><li>Second check</li></ol>", html)
+        self.assertIn('class="task-list"', html)
+        self.assertIn('type="checkbox" disabled aria-label="Pending checklist item"', html)
+        self.assertIn('type="checkbox" disabled checked aria-label="Completed checklist item"', html)
+
+    def test_reader_markdown_normalizes_legacy_tables_and_ordered_markers(self) -> None:
+        legacy = """<table><tr><th>Factor</th><th>Check</th></tr><tr><td>Rain</td><td>Verify | document</td></tr></table>
+
+1. Inspect
+
+1. Record"""
+        markdown = KeywordDiscoveryRequestHandler._sanitize_reader_markdown(legacy)
+        self.assertIn("| Factor | Check |", markdown)
+        self.assertIn(r"Verify \| document", markdown)
+        self.assertNotIn("<table", markdown)
+        self.assertIn("1. Inspect", markdown)
+        self.assertIn("2. Record", markdown)
+
+    def test_arbitrary_html_remains_escaped_in_wordpress_output(self) -> None:
+        html = KeywordDiscoveryRequestHandler._markdown_to_wordpress_html('<div onclick="steal()">Unsafe</div>')
+        self.assertIn("&lt;div", html)
+        self.assertNotIn("<div", html)
+
     def test_wordpress_publisher_creates_draft_before_final_publish(self) -> None:
         initial = KeywordDiscoveryRequestHandler._wordpress_post_form(
             "create-nonce", post_id=0, original_status="auto-draft", status="draft",

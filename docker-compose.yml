@@ -61,6 +61,8 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-seo_agent}:${POSTGRES_PASSWORD:-local-only-change-me}@postgres:5432/${POSTGRES_DB:-seo_agent}
       REDIS_URL: redis://redis:6379/0
       LEGACY_SQLITE_PATH: /legacy-data/seo-control.sqlite3
+      SEO_WORKER_TOKEN: ${SEO_WORKER_TOKEN:-local-worker-change-me}
+      SEO_WORKSPACE_CALLBACK_URL: ${SEO_WORKSPACE_CALLBACK_URL:-http://host.docker.internal:8000}
     depends_on:
       postgres:
         condition: service_healthy
@@ -68,7 +70,7 @@ services:
         condition: service_healthy
     volumes:
       - ./data:/legacy-data:ro
-    command: ["celery", "-A", "platform_api.celery_app.celery_app", "worker", "--loglevel=INFO"]
+    command: ["celery", "-A", "platform_api.celery_app.celery_app", "worker", "--loglevel=INFO", "-Q", "celery,workspace"]
 
 volumes:
   postgres_data:

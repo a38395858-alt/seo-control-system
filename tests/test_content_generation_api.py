@@ -31,6 +31,8 @@ class FakeContentGenerator:
     def run_stage(self, *, stage: str, data: dict) -> dict:
         self.stages.append(stage)
         self.stage_inputs.setdefault(stage, []).append(data)
+        if stage == "industry_rules":
+            return {"industry": "SEO software", "industry_confidence": 0.9, "industry_basis": "inferred", "audience_language": "US English", "tone_rules": ["Practical"], "structure_rules": ["Decision-led"], "terminology_rules": [], "evidence_policy": {"risk_level": "standard", "preferred_sources": ["Official documentation"], "high_risk_claims": ["Pricing"], "required_disclosures": []}, "content_patterns": [], "prohibited_claims": ["Guaranteed rankings"], "conversion_rules": [], "localization_rules": []}
         if stage == "semantic":
             return {"intent": {"dominant": "commercial", "secondary": [], "reader_job": "compare tools"}, "audience_context": "US buyers", "entities": [], "questions": ["Which tool fits?"], "facts": [], "gaps_or_conflicts": [{"item": "No supplied sources", "action": "verify"}], "angle": "decision guide", "must_cover": ["comparison criteria"], "must_avoid": ["unsupported claims"]}
         if stage == "title":
@@ -95,11 +97,11 @@ class ContentGenerationApiTests(unittest.TestCase):
         status, generated = self.request("POST", f"/api/content-assets/{asset_id}/generate", {"project_id": project_id, "target_audience": "US small business owners", "business_goal": "commercial", "target_length": 900, "sources": [], "cta": "Compare your shortlist."})
 
         self.assertEqual(201, status)
-        self.assertEqual(["semantic", "title", "outline", "chapter_plan", "section", "assembly", "content_tags"], self.generator.stages)
+        self.assertEqual(["industry_rules", "semantic", "title", "outline", "chapter_plan", "section", "assembly", "content_tags"], self.generator.stages)
         self.assertEqual(1, generated["draft"]["version"])  # type: ignore[index]
         self.assertIn("[VERIFY]", generated["draft"]["markdown"])  # type: ignore[index]
         self.assertEqual("not_run", generated["draft"]["qa_status"])  # type: ignore[index]
-        self.assertEqual(6, len(generated["runs"]))  # type: ignore[arg-type]
+        self.assertEqual(7, len(generated["runs"]))  # type: ignore[arg-type]
         self.assertNotIn("target_length", self.generator.stage_inputs["outline"][0])
         drafted_section = self.generator.stage_inputs["section"][0]["section"]
         self.assertEqual(["Start with needs"], drafted_section["key_points"])
@@ -108,7 +110,7 @@ class ContentGenerationApiTests(unittest.TestCase):
         self.assertEqual("Explain the current decision in depth.", drafted_section["chapter_plan"]["writing_goal"])
         self.assertNotIn("section_drafts", self.generator.stage_inputs["assembly"][0])
         self.assertIn("## How to compare options", generated["draft"]["markdown"])  # type: ignore[index]
-        self.assertEqual("content_competitor_learning_v15", generated["runs"][0]["prompt_version"])  # type: ignore[index]
+        self.assertEqual("people_first_evidence_routed_v20", generated["runs"][0]["prompt_version"])  # type: ignore[index]
 
         status, detail = self.request("GET", f"/api/content-assets/{asset_id}?project_id={project_id}")
         self.assertEqual(200, status)
@@ -256,6 +258,96 @@ class ContentGenerationApiTests(unittest.TestCase):
         self.assertEqual(memory["id"], detail["learning_memories"][0]["id"])  # type: ignore[index]
         self.assertEqual("style", detail["learning_memories"][0]["role"])  # type: ignore[index]
 
+    def test_generation_adds_project_gsc_as_private_intent_context(self) -> None:
+        project_id, asset_id = self.asset(title_text="Outdoor LED Strip Lights: A Selection Guide")
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            connection.execute(
+                """INSERT INTO project_gsc_query_rows(
+                       project_id,property_url,query,page_url,clicks,impressions,ctr,position
+                   ) VALUES(?,?,?,?,?,?,?,?)""",
+                (project_id, "https://example.test", "outdoor led strip lights waterproof", "https://example.test/outdoor-led-strips", 8, 240, 0.033, 9.5),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        status, _generated = self.request(
+            "POST",
+            f"/api/content-assets/{asset_id}/generate",
+            {"project_id": project_id, "target_audience": "US buyers", "business_goal": "commercial", "sources": []},
+        )
+
+        self.assertEqual(201, status)
+        sources = self.generator.stage_inputs["semantic"][0]["sources"]
+        gsc_sources = [source for source in sources if source.get("source_type") == "gsc_performance"]
+        self.assertEqual(1, len(gsc_sources))
+        self.assertEqual("https://example.test/outdoor-led-strips", gsc_sources[0]["url"])
+        self.assertIn("Private GSC planning signal", gsc_sources[0]["content"])
+
+    def test_prompt_preview_shows_scoped_source_roles_without_running_a_model(self) -> None:
+        project_id, asset_id = self.asset()
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            connection.execute(
+                """INSERT INTO project_gsc_query_rows(
+                       project_id,property_url,query,page_url,clicks,impressions,ctr,position
+                   ) VALUES(?,?,?,?,?,?,?,?)""",
+                (project_id, "https://example.test", "seo tools checklist", "https://example.test/seo-tools", 8, 240, 0.033, 9.5),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        status, preview = self.request(
+            "POST",
+            f"/api/content-assets/{asset_id}/prompt-preview",
+            {
+                "project_id": project_id,
+                "target_audience": "US small business owners",
+                "business_goal": "commercial research",
+                "preview_action": "generate",
+                "sources": [{"source_id": "company-catalog", "source_type": "company_knowledge", "title": "Product catalog", "content": "Private source body", "availability": "available"}],
+            },
+        )
+
+        self.assertEqual(200, status)
+        self.assertEqual("people_first_evidence_routed_v20", preview["prompt_version"])  # type: ignore[index]
+        self.assertEqual("generate", preview["requested_action"])  # type: ignore[index]
+        self.assertIn("evidence-grounded", preview["system_prompt"])  # type: ignore[index]
+        self.assertEqual(
+            ["industry_rules", "semantic", "title", "outline", "chapter_plan", "section", "assembly", "qa"],
+            [stage["stage"] for stage in preview["stages"]],  # type: ignore[index]
+        )
+        groups = {group["key"]: group for group in preview["source_summary"]}  # type: ignore[index]
+        self.assertEqual(1, groups["company_knowledge"]["count"])
+        self.assertEqual(1, groups["gsc"]["count"])
+        self.assertNotIn("Private source body", str(preview))
+        self.assertEqual([], self.generator.stages)
+
+    def test_delete_authority_source_is_committed_and_removed_from_the_project_library(self) -> None:
+        project_id, _asset_id = self.asset()
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            cursor = connection.execute(
+                """INSERT INTO authority_source_library(
+                       project_id,title,source_type,content,authority_level,tags_json,classification_json
+                   ) VALUES(?,?,?,?,?,?,?)""",
+                (project_id, "Temporary authority source", "government", "Test-only authority content", "authoritative", "[]", "{}"),
+            )
+            source_id = cursor.lastrowid
+            connection.commit()
+        finally:
+            connection.close()
+
+        status, deleted = self.request("DELETE", f"/api/authority-sources/{source_id}", {"project_id": project_id})
+
+        self.assertEqual(200, status)
+        self.assertEqual(1, deleted["deleted"])  # type: ignore[index]
+        status, remaining = self.request("GET", f"/api/authority-sources?project_id={project_id}")
+        self.assertEqual(200, status)
+        self.assertEqual([], remaining)
+
     def test_selected_provider_failure_never_falls_back_or_overwrites_a_previous_draft(self) -> None:
         project_id, asset_id = self.asset()
         success = {"project_id": project_id, "provider": "gemini", "target_audience": "US buyers", "business_goal": "commercial", "sources": []}
@@ -299,7 +391,7 @@ class ContentGenerationApiTests(unittest.TestCase):
         )
 
         self.assertEqual(201, status)
-        self.assertEqual(["title", "outline", "chapter_plan", "section", "assembly", "content_tags"], self.generator.stages)
+        self.assertEqual(["industry_rules", "title", "outline", "chapter_plan", "section", "assembly", "content_tags"], self.generator.stages)
         self.assertNotIn("brief", generated)  # type: ignore[operator]
         _, detail = self.request("GET", f"/api/content-assets/{asset_id}?project_id={project_id}")
         self.assertEqual(brief["id"], detail["brief"]["id"])  # type: ignore[index]

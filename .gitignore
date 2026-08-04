@@ -8,8 +8,15 @@
 data/*.sqlite
 data/*.sqlite3
 data/ai-settings.json
+data/runtime-database-state.json
 data/logs/
 data/google-serp-browser-profile/
+data/*.stdout.log
+data/*.stderr.log
+
+# Local test artifacts and service output
+tmp/
+*.response.json
 
 # Python
 __pycache__/
