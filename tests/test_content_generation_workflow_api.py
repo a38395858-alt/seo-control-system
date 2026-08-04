@@ -8,6 +8,7 @@ results without making a real network request or exposing credentials.
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -113,6 +114,17 @@ class FakeContentGenerator:
                     "verify": ["[VERIFY] current vendor pricing"],
                 }
             )
+        if stage == "full_article":
+            return json.dumps(
+                {
+                    "title": "SEO Tools for Small Businesses: A Practical Guide",
+                    "meta_description": "A practical framework for comparing SEO tools.",
+                    "markdown": "# SEO Tools for Small Businesses: A Practical Guide\n\nChoose tools by the work you need to complete.\n\n## How to compare SEO tools\n\nCompare the workflow, practical checks, and evidence boundary before choosing.\n\n## Questions to ask before you buy\n\nConfirm fit before committing.",
+                    "sources_used": [],
+                    "claims_used": [],
+                    "verify": ["Current vendor pricing requires first-party confirmation"],
+                }
+            )
         if stage == "qa":
             return json.dumps({"status": "needs_verification", "checks": [{"name": "factual support", "status": "verify", "note": "No first-party pricing source supplied."}], "final_markdown": "# SEO Tools for Small Businesses: A Practical Guide\n\n[VERIFY] current vendor pricing", "unresolved_verify": ["[VERIFY] current vendor pricing"]})
         raise AssertionError(f"Unexpected content generation stage: {stage!r}")
@@ -152,7 +164,7 @@ class ContentGenerationWorkflowApiTests(unittest.TestCase):
             method=method,
         )
         try:
-            with urlopen(request, timeout=3) as response:
+            with urlopen(request, timeout=15) as response:
                 return response.status, json.loads(response.read().decode("utf-8"))
         except HTTPError as error:
             return error.code, json.loads(error.read().decode("utf-8"))
@@ -190,7 +202,35 @@ class ContentGenerationWorkflowApiTests(unittest.TestCase):
             "POST", "/api/content-assets", {"project_id": project_id, "selected_title_candidate_id": title_id, "content_type": "guide"}
         )
         self.assertEqual(201, status)
-        return project_id, asset["id"]  # type: ignore[index]
+        asset_id = asset["id"]  # type: ignore[index]
+        self._mark_competitor_learning_complete(project_id, asset_id)
+        return project_id, asset_id
+
+    def _mark_competitor_learning_complete(self, project_id: int, asset_id: int) -> None:
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            cursor = connection.execute(
+                """INSERT INTO competitor_research_runs(
+                       project_id,content_asset_id,query,locale,status,discovered_count,usable_count,analysis_json,completed_at
+                   ) VALUES(?,?,?,?, 'completed',1,1,?,CURRENT_TIMESTAMP)""",
+                (project_id, asset_id, "seo tools for small business", "US/en", json.dumps({"writing_patterns": ["reader decision order"]})),
+            )
+            run_id = cursor.lastrowid
+            cursor = connection.execute(
+                """INSERT INTO competitor_content_memory(
+                       project_id,normalized_url,url,domain,page_title,content,content_hash,structure_json
+                   ) VALUES(?,?,?,?,?,?,?,?)""",
+                (project_id, "https://competitor.example/seo-tools", "https://competitor.example/seo-tools", "competitor.example", "Competitor guide", "Competitor article for structural-learning fixture.", "fixture-hash", "{}"),
+            )
+            connection.execute(
+                """INSERT INTO competitor_research_items(
+                       research_run_id,memory_id,rank,search_title,url,domain,status
+                   ) VALUES(?,?,?,?,?,?, 'selected')""",
+                (run_id, cursor.lastrowid, 1, "Competitor guide", "https://competitor.example/seo-tools", "competitor.example"),
+            )
+            connection.commit()
+        finally:
+            connection.close()
 
     def test_staged_generation_persists_brief_outline_draft_and_auditable_model_metadata(self) -> None:
         project_id, asset_id = self.create_asset()
@@ -214,7 +254,7 @@ class ContentGenerationWorkflowApiTests(unittest.TestCase):
             "POST", f"/api/content-assets/{asset_id}/generate-draft", {"project_id": project_id, "provider": "gemini"}
         )
         self.assertEqual(201, status)
-        self.assertIn("[VERIFY]", draft["draft"]["markdown"])  # type: ignore[index]
+        self.assertNotIn("[VERIFY]", draft["draft"]["markdown"])  # type: ignore[index]
         self.assertEqual("gemini", draft["draft"]["provider"])  # type: ignore[index]
 
         status, detail = self.request_json("GET", f"/api/content-assets/{asset_id}?project_id={project_id}")
@@ -226,11 +266,11 @@ class ContentGenerationWorkflowApiTests(unittest.TestCase):
         self.assertEqual(draft["draft"]["id"], detail["current_draft"]["id"])  # type: ignore[index]
         self.assertEqual(1, len(detail["drafts"]))  # type: ignore[index]
         runs = detail["generation_runs"]  # type: ignore[index]
-        self.assertEqual(["industry_rules", "semantic", "title", "outline", "chapter_plan", "section", "chapter_plan", "section", "assembly"], [run["stage"] for run in runs])
+        self.assertEqual(["industry_rules", "title", "outline", "full_article"], [run["stage"] for run in runs])
         self.assertTrue(all(run["status"] == "completed" for run in runs))
         self.assertTrue(all(run["provider"] == "gemini" for run in runs))
         self.assertTrue(all(run["prompt_version"] == PROMPT_VERSION for run in runs))
-        policy_stages = {"semantic", "title", "outline", "chapter_plan", "section", "assembly"}
+        policy_stages = {"semantic", "title", "outline", "full_article"}
         for run in runs:
             if run["stage"] in policy_stages:
                 self.assertEqual("SEO software", run["input"]["writing_policy"]["industry_rules"]["industry"])

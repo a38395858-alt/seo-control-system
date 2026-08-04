@@ -1,4 +1,4 @@
-"""Red contract tests for the staged, versioned content-generation workflow."""
+"""Contracts for the evidence-grounded, full-article generation workflow."""
 
 from __future__ import annotations
 
@@ -45,6 +45,8 @@ class FakeContentGenerator:
             return {"section_id": data["section"]["id"], "markdown": "## How to compare options\n\nStart with your needs. [VERIFY]", "claims_used": [], "verify": ["No sources supplied"]}
         if stage == "assembly":
             return {"title": data["metadata"]["selected_title"], "meta_description": data["metadata"]["meta_description"], "intro_markdown": "Choose based on your workflow before comparing options.", "conclusion_markdown": "Use the checklist to confirm the right fit.", "sources_used": [], "verify": ["No sources supplied"]}
+        if stage == "full_article":
+            return {"title": data["metadata"]["selected_title"], "meta_description": data["metadata"]["meta_description"], "markdown": "# SEO Tools for Small Businesses: A Practical Guide\n\nChoose based on your workflow before comparing options.\n\n## How to compare options\n\nStart with your needs and use a practical comparison checklist.", "sources_used": [], "claims_used": [], "verify": ["No sources supplied"]}
         if stage == "content_tags":
             return {"tags": ["SEO Tools", "Product Comparison", "Buying Guide"]}
         if stage == "qa":
@@ -54,11 +56,11 @@ class FakeContentGenerator:
         raise AssertionError(stage)
 
 
-class FailingAssemblyContentGenerator(FakeContentGenerator):
+class FailingFullArticleContentGenerator(FakeContentGenerator):
     def run_stage(self, *, stage: str, data: dict) -> dict:
-        if stage == "assembly":
+        if stage == "full_article":
             self.stages.append(stage)
-            raise RuntimeError("selected provider assembly timeout")
+            raise RuntimeError("selected provider full_article timeout")
         return super().run_stage(stage=stage, data=data)
 
 
@@ -90,32 +92,65 @@ class ContentGenerationApiTests(unittest.TestCase):
         _, title = self.request("POST", "/api/title-candidates", {"project_id": project_id, "keyword_id": keywords[0]["id"], "title": title_text})  # type: ignore[index]
         self.request("POST", f"/api/title-candidates/{title['id']}/select", {"project_id": project_id})  # type: ignore[index]
         _, asset = self.request("POST", "/api/content-assets", {"project_id": project_id, "selected_title_candidate_id": title["id"]})  # type: ignore[index]
-        return project_id, asset["id"]  # type: ignore[index]
+        asset_id = asset["id"]  # type: ignore[index]
+        self._mark_competitor_learning_complete(project_id, asset_id)
+        return project_id, asset_id
+
+    def _mark_competitor_learning_complete(self, project_id: int, asset_id: int) -> None:
+        """Create the durable prerequisite required before an article may be written."""
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            analysis = {"writing_patterns": ["Answer intent before criteria"], "source_count": 1}
+            cursor = connection.execute(
+                """INSERT INTO competitor_research_runs(
+                       project_id,content_asset_id,query,locale,status,discovered_count,usable_count,analysis_json,completed_at
+                   ) VALUES(?,?,?,?, 'completed',1,1,?,CURRENT_TIMESTAMP)""",
+                (project_id, asset_id, "seo tools for small business", "US/en", json.dumps(analysis)),
+            )
+            run_id = cursor.lastrowid
+            cursor = connection.execute(
+                """INSERT INTO competitor_content_memory(
+                       project_id,normalized_url,url,domain,page_title,content,content_hash,structure_json
+                   ) VALUES(?,?,?,?,?,?,?,?)""",
+                (project_id, "https://competitor.example/seo-tools", "https://competitor.example/seo-tools", "competitor.example", "Competitor SEO tool guide", "A readable competitor article used only for structural learning.", "fixture-hash", "{}"),
+            )
+            memory_id = cursor.lastrowid
+            connection.execute(
+                """INSERT INTO competitor_research_items(
+                       research_run_id,memory_id,rank,search_title,url,domain,status
+                   ) VALUES(?,?,?,?,?,?, 'selected')""",
+                (run_id, memory_id, 1, "Competitor SEO tool guide", "https://competitor.example/seo-tools", "competitor.example"),
+            )
+            connection.commit()
+        finally:
+            connection.close()
 
     def test_generate_runs_skill_stages_and_saves_versioned_draft(self) -> None:
         project_id, asset_id = self.asset()
         status, generated = self.request("POST", f"/api/content-assets/{asset_id}/generate", {"project_id": project_id, "target_audience": "US small business owners", "business_goal": "commercial", "target_length": 900, "sources": [], "cta": "Compare your shortlist."})
 
         self.assertEqual(201, status)
-        self.assertEqual(["industry_rules", "semantic", "title", "outline", "chapter_plan", "section", "assembly", "content_tags"], self.generator.stages)
+        self.assertEqual(["industry_rules", "title", "outline", "full_article"], self.generator.stages)
         self.assertEqual(1, generated["draft"]["version"])  # type: ignore[index]
-        self.assertIn("[VERIFY]", generated["draft"]["markdown"])  # type: ignore[index]
+        self.assertNotIn("[VERIFY]", generated["draft"]["markdown"])  # type: ignore[index]
         self.assertEqual("not_run", generated["draft"]["qa_status"])  # type: ignore[index]
-        self.assertEqual(7, len(generated["runs"]))  # type: ignore[arg-type]
+        self.assertEqual(4, len(generated["runs"]))  # type: ignore[arg-type]
         self.assertNotIn("target_length", self.generator.stage_inputs["outline"][0])
-        drafted_section = self.generator.stage_inputs["section"][0]["section"]
-        self.assertEqual(["Start with needs"], drafted_section["key_points"])
-        self.assertEqual(["[VERIFY]"], drafted_section["evidence_gaps"])
-        self.assertEqual("table", drafted_section["format"])
-        self.assertEqual("Explain the current decision in depth.", drafted_section["chapter_plan"]["writing_goal"])
-        self.assertNotIn("section_drafts", self.generator.stage_inputs["assembly"][0])
+        article_request = self.generator.stage_inputs["full_article"][0]
+        section_spec = article_request["outline"]["sections"][0]
+        self.assertEqual(["Start with needs"], section_spec["key_points"])
+        self.assertEqual("table", section_spec["format"])
+        self.assertGreaterEqual(section_spec["keyword_requirements"]["minimum_supporting_terms"], 2)
+        self.assertGreaterEqual(section_spec["depth_requirements"]["minimum_non_overlapping_subtopics"], 3)
+        self.assertGreaterEqual(section_spec["depth_requirements"]["minimum_words"], 180)
         self.assertIn("## How to compare options", generated["draft"]["markdown"])  # type: ignore[index]
-        self.assertEqual("people_first_evidence_routed_v20", generated["runs"][0]["prompt_version"])  # type: ignore[index]
+        self.assertEqual("people_first_full_article_v21", generated["runs"][0]["prompt_version"])  # type: ignore[index]
 
         status, detail = self.request("GET", f"/api/content-assets/{asset_id}?project_id={project_id}")
         self.assertEqual(200, status)
         self.assertEqual(1, len(detail["drafts"]))  # type: ignore[index]
-        self.assertEqual(["SEO Tools", "Product Comparison", "Buying Guide"], detail["tags"])  # type: ignore[index]
+        self.assertEqual(3, len(detail["tags"]))  # type: ignore[arg-type]
+        self.assertNotIn("[VERIFY]", " ".join(detail["tags"]))  # type: ignore[arg-type]
         self.assertEqual("completed", detail["runs"][-1]["status"])  # type: ignore[index]
 
     def test_robots_blocked_competitor_url_is_preserved_without_body(self) -> None:
@@ -226,7 +261,7 @@ class ContentGenerationApiTests(unittest.TestCase):
         self.assertIn("DeepSeek", job["routing_summary"])
         self.assertIn("ChatGPT", job["routing_summary"])
         self.assertIn("qa", self.generator.stages)
-        self.assertEqual("needs_verification", generated["draft"]["qa_status"])  # type: ignore[index]
+        self.assertEqual("needs_revision", generated["draft"]["qa_status"])  # type: ignore[index]
 
     def test_generation_uses_only_relevant_project_learning_memory_and_records_the_link(self) -> None:
         project_id, asset_id = self.asset()
@@ -251,7 +286,7 @@ class ContentGenerationApiTests(unittest.TestCase):
         )
 
         self.assertEqual(201, status)
-        learned = self.generator.stage_inputs["semantic"][0]["learning_memories"]
+        learned = self.generator.stage_inputs["outline"][0]["learning_memories"]
         self.assertEqual(memory["id"], learned[0]["memory_id"])  # type: ignore[index]
         self.assertNotIn("content", learned[0])
         _, detail = self.request("GET", f"/api/content-assets/{asset_id}?project_id={project_id}")
@@ -279,7 +314,7 @@ class ContentGenerationApiTests(unittest.TestCase):
         )
 
         self.assertEqual(201, status)
-        sources = self.generator.stage_inputs["semantic"][0]["sources"]
+        sources = self.generator.stage_inputs["outline"][0]["sources"]
         gsc_sources = [source for source in sources if source.get("source_type") == "gsc_performance"]
         self.assertEqual(1, len(gsc_sources))
         self.assertEqual("https://example.test/outdoor-led-strips", gsc_sources[0]["url"])
@@ -312,11 +347,11 @@ class ContentGenerationApiTests(unittest.TestCase):
         )
 
         self.assertEqual(200, status)
-        self.assertEqual("people_first_evidence_routed_v20", preview["prompt_version"])  # type: ignore[index]
+        self.assertEqual("people_first_full_article_v21", preview["prompt_version"])  # type: ignore[index]
         self.assertEqual("generate", preview["requested_action"])  # type: ignore[index]
         self.assertIn("evidence-grounded", preview["system_prompt"])  # type: ignore[index]
         self.assertEqual(
-            ["industry_rules", "semantic", "title", "outline", "chapter_plan", "section", "assembly", "qa"],
+            ["industry_rules", "semantic", "title", "outline", "full_article", "qa"],
             [stage["stage"] for stage in preview["stages"]],  # type: ignore[index]
         )
         groups = {group["key"]: group for group in preview["source_summary"]}  # type: ignore[index]
@@ -352,7 +387,7 @@ class ContentGenerationApiTests(unittest.TestCase):
         project_id, asset_id = self.asset()
         success = {"project_id": project_id, "provider": "gemini", "target_audience": "US buyers", "business_goal": "commercial", "sources": []}
         self.assertEqual(201, self.request("POST", f"/api/content-assets/{asset_id}/generate", success)[0])
-        self.server.content_generator = FailingAssemblyContentGenerator()
+        self.server.content_generator = FailingFullArticleContentGenerator()
 
         status, failed = self.request(
             "POST",
@@ -362,10 +397,10 @@ class ContentGenerationApiTests(unittest.TestCase):
 
         self.assertEqual(502, status)
         self.assertIn("ChatGPT", failed["error"])  # type: ignore[index]
-        self.assertIn("assembly", failed["error"].lower())  # type: ignore[index]
+        self.assertIn("full_article", failed["error"].lower())  # type: ignore[index]
         self.assertEqual("openai", failed["generation_job"]["provider"])  # type: ignore[index]
         self.assertEqual("failed", failed["generation_job"]["status"])  # type: ignore[index]
-        self.assertEqual("assembly", failed["generation_job"]["failed_stage"])  # type: ignore[index]
+        self.assertEqual("full_article", failed["generation_job"]["failed_stage"])  # type: ignore[index]
 
         _, detail = self.request("GET", f"/api/content-assets/{asset_id}?project_id={project_id}")
         self.assertEqual("gemini", detail["current_draft"]["provider"])  # type: ignore[index]
@@ -391,13 +426,13 @@ class ContentGenerationApiTests(unittest.TestCase):
         )
 
         self.assertEqual(201, status)
-        self.assertEqual(["industry_rules", "title", "outline", "chapter_plan", "section", "assembly", "content_tags"], self.generator.stages)
+        self.assertEqual(["industry_rules", "title", "outline", "industry_rules", "full_article"], self.generator.stages)
         self.assertNotIn("brief", generated)  # type: ignore[operator]
         _, detail = self.request("GET", f"/api/content-assets/{asset_id}?project_id={project_id}")
         self.assertEqual(brief["id"], detail["brief"]["id"])  # type: ignore[index]
         self.assertIsNotNone(detail["current_draft"])  # type: ignore[index]
 
-    def test_full_generation_stops_after_assembly_without_calling_a_qa_model_stage(self) -> None:
+    def test_full_generation_uses_one_full_article_call_without_calling_a_qa_model_stage(self) -> None:
         project_id, asset_id = self.asset(title_text="Best SEO Tools for Small Businesses: Pricing and Features Compared")
         status, generated = self.request(
             "POST",
@@ -424,12 +459,12 @@ class ContentGenerationApiTests(unittest.TestCase):
 
         self.assertEqual(201, status)
         self.assertEqual(["qa"], self.generator.stages)
-        self.assertEqual("needs_verification", reviewed["draft"]["qa_status"])  # type: ignore[index]
+        self.assertEqual("needs_revision", reviewed["draft"]["qa_status"])  # type: ignore[index]
         self.assertEqual("openai", reviewed["quality_review"]["review"]["reviewer"]["provider"])  # type: ignore[index]
         self.assertEqual("fake-content-model", reviewed["quality_review"]["review"]["reviewer"]["model"])  # type: ignore[index]
         _, detail = self.request("GET", f"/api/content-assets/{asset_id}?project_id={project_id}")
         self.assertEqual(1, len(detail["drafts"]))  # type: ignore[index]
-        self.assertEqual("needs_verification", detail["current_draft"]["qa_status"])  # type: ignore[index]
+        self.assertEqual("needs_revision", detail["current_draft"]["qa_status"])  # type: ignore[index]
         self.assertTrue(any(run["stage"] == "qa" for run in detail["generation_runs"]))  # type: ignore[index]
 
     def test_targeted_rewrite_creates_a_linked_new_version_and_preserves_the_previous_draft(self) -> None:

@@ -698,6 +698,8 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 gsc_sources = self._gsc_performance_sources_for_asset(connection, asset)
                 competitor_sources, _analysis = self._research_sources(connection, asset["id"])
                 learning_memories = self._select_content_learning_memories(connection, asset)
+                outline_row = connection.execute("SELECT * FROM content_outlines WHERE id=?", (asset["current_outline_id"],)).fetchone() if asset["current_outline_id"] is not None else None
+                outline_sections = self._content_outline_payload(connection, outline_row)["sections"] if outline_row is not None else []
         except (sqlite3.Error, ValueError) as error:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)})
             return
@@ -720,10 +722,20 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             }
             for label, key, items, rule in source_groups
         ]
-        stages = ["industry_rules", "semantic", "title", "outline", "chapter_plan", "section", "assembly", "qa"]
+        prompt_sections = []
+        for section in outline_sections:
+            if not isinstance(section, Mapping):
+                continue
+            prepared = dict(section)
+            prompt_sections.append({
+                "heading": str(prepared.get("heading") or ""),
+                "keyword_requirements": self._section_keyword_requirements(prepared, str(asset["keyword"] or "")),
+                "depth_requirements": self._section_depth_requirements(prepared),
+            })
+        stages = ["industry_rules", "semantic", "title", "outline", "full_article", "qa"]
         if requested_action == "generate-brief": stages = ["industry_rules", "semantic"]
         elif requested_action == "generate-outline": stages = ["title", "outline"]
-        elif requested_action == "generate-draft": stages = ["chapter_plan", "section", "assembly"]
+        elif requested_action == "generate-draft": stages = ["full_article"]
         self._json(HTTPStatus.OK, {
             "prompt_version": PROMPT_VERSION,
             "requested_action": requested_action,
@@ -735,6 +747,10 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 "business_goal": self._optional_text(payload, "business_goal") or "informational",
             },
             "source_summary": source_summary,
+            "full_article_requirements": {
+                "sections": prompt_sections,
+                "overall": self._article_depth_requirements(prompt_sections) if prompt_sections else None,
+            },
             "system_prompt": SYSTEM_PROMPT,
             "stages": [{"stage": stage, "instruction": _stage_instruction(stage)} for stage in stages],
         })
@@ -4335,11 +4351,11 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
 
     @staticmethod
     def _content_stage_label(stage: str) -> str:
-        return {"semantic": "语义分析", "title": "标题与元信息", "outline": "文章大纲", "section": "章节写作", "assembly": "组装全文", "configuration": "模型配置", "preparation": "任务准备"}.get(stage, stage)
+        return {"semantic": "语义分析", "title": "标题与元信息", "outline": "文章大纲", "section": "章节写作", "assembly": "组装全文", "full_article": "整篇文章写作", "configuration": "模型配置", "preparation": "任务准备"}.get(stage, stage)
 
     @staticmethod
     def _content_failed_stage(error: str) -> str:
-        matched = re.search(r"AI content (industry_rules|semantic|title|outline|chapter_plan|section|assembly|qa)", error)
+        matched = re.search(r"AI content (industry_rules|semantic|title|outline|chapter_plan|section|assembly|full_article|qa)", error)
         return matched.group(1) if matched else "generation"
 
     @staticmethod
@@ -5127,130 +5143,63 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         )
         numbered_list_count = self._numbered_listicle_count(str(asset["title_snapshot"]))
         canonical_heading_key = self._outline_heading_key(str(asset["title_snapshot"]))
-        section_drafts: list[dict[str, Any]] = []
-        # A link is a reader-navigation aid, not an SEO quota.  Reserve each
-        # exact destination as soon as its H2 plan is accepted so later H2s
-        # cannot repeat it, even if the model tries to do so.
-        reserved_internal_link_urls: set[str] = set()
+        full_article_sections: list[dict[str, Any]] = []
+        allowed_link_urls: set[str] = set()
+        selected_source_ids: set[str] = set()
         for section in blueprint["sections"]:
-            section_source_ids = set(section.get("source_ids", []))
             assigned_company_sources = company_context.get(int(section["position"]), [])
             assigned_company_ids = {str(source.get("source_id")) for source in assigned_company_sources}
-            section_sources = [
-                source for source in brief_data["sources"]
-                if isinstance(source, Mapping) and (source.get("source_id") in section_source_ids or str(source.get("source_id")) in assigned_company_ids)
-            ]
             section_context = {"id": f"s{section['position']}", **section}
             if numbered_list_count and self._outline_heading_key(str(section.get("heading") or "")) == canonical_heading_key:
                 section_context["numbered_listicle_count"] = numbered_list_count
-                section_context["numbered_listicle_instruction"] = (
-                    f"This is the title-promise listicle chapter. It must present exactly {numbered_list_count} "
-                    "distinct, named ideas as numbered H3 items, each with a best-fit use case and a practical trade-off."
-                )
+                section_context["numbered_listicle_instruction"] = f"Present exactly {numbered_list_count} distinct named ideas, each with a best-fit use case and a practical trade-off."
             if assigned_company_sources:
                 section_context["company_context_source_ids"] = sorted(assigned_company_ids)
-                section_context["company_context_instruction"] = (
-                    "Use one relevant, source-supported company/product fact naturally in this H2. "
-                    "If a supplied company source has an exact public URL, one natural link to that URL is allowed."
-                )
+                section_context["company_context_instruction"] = "Use one relevant first-party product or company fact only when it helps this H2's reader decision."
             link_candidates = self._internal_link_candidates_for_section(
-                project_site_url=str(project_context.get("site_url") or ""),
-                section=section_context,
-                sources=brief_data["sources"],
-                assigned_company_source_ids=assigned_company_ids,
-            )
-            candidate_source_ids = {str(candidate["source_id"]) for candidate in link_candidates}
-            section_sources.extend(
-                source for source in brief_data["sources"]
-                if isinstance(source, Mapping)
-                and str(source.get("source_id") or "") in candidate_source_ids
-                and not any(str(existing.get("source_id") or "") == str(source.get("source_id") or "") for existing in section_sources if isinstance(existing, Mapping))
+                project_site_url=str(project_context.get("site_url") or ""), section=section_context,
+                sources=brief_data["sources"], assigned_company_source_ids=assigned_company_ids,
             )
             section_context["eligible_internal_links"] = link_candidates
-            section_context["internal_link_budget"] = {
-                "article_maximum": 3,
-                "already_reserved": len(reserved_internal_link_urls),
-                "h2_maximum": 1,
-            }
-            chapter_plan_data = {"topic": asset["title_snapshot"], "audience": brief["target_audience"], "intent": semantic.get("intent", {}), "project_context": project_context, "writing_policy": writing_policy, "title": metadata.get("selected_title", asset["title_snapshot"]), "current_section": section_context, "article_outline": blueprint, "competitor_learning": competitor_learning, "learning_memories": learning_memories, "sources": section_sources, "language": asset["locale"]}
-            chapter_plan = self._completed_generation_stage_output(
-                connection, generation_job_id, "chapter_plan", section_context["id"]
-            )
-            if chapter_plan is None:
-                chapter_plan, _run = self._run_content_stage(connection, asset, "chapter_plan", chapter_plan_data, generator, provider, model, generation_job_id)
-            if not isinstance(chapter_plan.get("subtopics"), list) or not chapter_plan["subtopics"]:
-                raise ContentGenerationProtocolError("AI content chapter plan returned no usable subtopics.")
-            product_recommendation = self._validated_product_recommendation(
-                chapter_plan.get("product_recommendation"), assigned_company_sources
-            )
-            internal_link_plan = self._validated_internal_link_plan(
-                chapter_plan.get("internal_link_plan"), link_candidates, reserved_internal_link_urls
-            )
-            if internal_link_plan["use"]:
-                reserved_internal_link_urls.add(internal_link_plan["target_url"])
-            chapter_plan["product_recommendation"] = product_recommendation
-            chapter_plan["internal_link_plan"] = internal_link_plan
-            section_context["product_recommendation"] = product_recommendation
-            section_context["internal_link_plan"] = internal_link_plan
-            section_context["chapter_plan"] = chapter_plan
+            section_context["keyword_requirements"] = self._section_keyword_requirements(section_context, str(asset["keyword"] or ""))
+            section_context["depth_requirements"] = self._section_depth_requirements(section_context)
+            section_context["internal_link_budget"] = {"article_maximum": 3, "h2_maximum": 1}
+            allowed_link_urls.update(candidate["target_url"] for candidate in link_candidates if candidate.get("target_url"))
+            allowed_link_urls.update(self._canonical_internal_url(source.get("url")) for source in assigned_company_sources if self._canonical_internal_url(source.get("url")))
+            selected_source_ids.update(str(source_id) for source_id in section_context.get("source_ids", []) if isinstance(source_id, str))
+            selected_source_ids.update(assigned_company_ids)
+            selected_source_ids.update(str(candidate["source_id"]) for candidate in link_candidates if candidate.get("source_id"))
             with connection:
-                connection.execute(
-                    "UPDATE content_outline_sections SET section_json=? WHERE outline_id=? AND position=?",
-                    (json.dumps(section_context, ensure_ascii=False), outline["id"], section["position"]),
-                )
-            section_data = {"topic": asset["title_snapshot"], "audience": brief["target_audience"], "intent": semantic.get("intent", {}), "project_context": project_context, "writing_policy": writing_policy, "angle": semantic.get("angle", ""), "title": metadata.get("selected_title", asset["title_snapshot"]), "section": section_context, "chapter_plan": chapter_plan, "competitor_learning": competitor_learning, "learning_memories": learning_memories, "sources": section_sources, "voice": self._optional_text(payload, "voice") or "clear, helpful American English", "language": asset["locale"], "reader_markdown_policy": "Never display internal source IDs or competitor markers. Keep source references in claims_used only. Output portable Markdown, never raw HTML. Use Markdown pipe tables, explicit consecutive ordered-list numbers, and - [ ] / - [x] task-list syntax."}
-            drafted = self._completed_generation_stage_output(
-                connection, generation_job_id, "section", section_context["id"]
-            )
-            if drafted is None:
-                drafted, _run = self._run_content_stage(connection, asset, "section", section_data, generator, provider, model, generation_job_id)
-            if not isinstance(drafted.get("markdown"), str):
-                raise ContentGenerationProtocolError("AI content section returned no Markdown.")
-            drafted["markdown"], link_written = self._enforce_section_internal_link_plan(
-                drafted["markdown"], internal_link_plan
-            )
-            drafted["internal_link_audit"] = {
-                "plan": internal_link_plan,
-                "written": link_written,
-                "reason": "validated exact project URL and natural-anchor plan" if link_written else "no validated internal link was written",
-            }
-            section_drafts.append(drafted)
-        assembly_data = {
-            "metadata": dict(metadata),
-            "intent": semantic.get("intent", {}),
-            "project_context": project_context,
-            "writing_policy": writing_policy,
-            "outline": [{"heading": section.get("heading", ""), "purpose": section.get("purpose", ""), "reader_question": section.get("reader_question", "")} for section in blueprint["sections"]],
-            "brand": self._optional_text(payload, "brand") or "",
-            "learning_memories": learning_memories,
-            "cta": self._optional_text(payload, "cta") or "",
-            "assembly_policy": "Write only introduction and conclusion Markdown fragments. Do not output or rewrite H2 chapter bodies.",
+                connection.execute("UPDATE content_outline_sections SET section_json=? WHERE outline_id=? AND position=?", (json.dumps(section_context, ensure_ascii=False), outline["id"], section["position"]))
+            full_article_sections.append(section_context)
+        scoped_sources = [source for source in brief_data["sources"] if isinstance(source, Mapping) and str(source.get("source_id") or "") in selected_source_ids]
+        authority_urls = {
+            self._canonical_internal_url(source.get("url")) for source in scoped_sources
+            if source.get("source_type") == "authority_source" and self._canonical_internal_url(source.get("url"))
         }
-        article, assembly_run = self._run_content_stage(connection, asset, "assembly", assembly_data, generator, provider, model, generation_job_id)
-        if isinstance(article.get("markdown"), str):
-            # Compatibility with historical/injected generators. Production
-            # adapters use the lightweight frame contract below.
-            markdown = self._sanitize_reader_markdown(article["markdown"])
-        else:
-            intro = self._assembly_fragment(article.get("intro_markdown"))
-            conclusion = self._assembly_fragment(article.get("conclusion_markdown"))
-            if not intro and not conclusion:
-                raise ContentGenerationProtocolError("AI content assembly returned no usable article frame.")
-            title = str(article.get("title") or metadata.get("selected_title") or asset["title_snapshot"]).strip()
-            chapter_markdown = [str(draft["markdown"]).strip() for draft in section_drafts if isinstance(draft.get("markdown"), str) and draft["markdown"].strip()]
-            markdown = self._sanitize_reader_markdown("\n\n".join(part for part in [f"# {title}", intro, *chapter_markdown, conclusion] if part))
+        article_data = {
+            "metadata": dict(metadata), "primary_keyword": str(asset["keyword"] or ""), "audience": brief["target_audience"],
+            "intent": semantic.get("intent", {}), "project_context": project_context, "writing_policy": writing_policy,
+            "angle": semantic.get("angle", ""), "competitor_learning": competitor_learning, "learning_memories": learning_memories,
+            "outline": {"intro_brief": outline_payload.get("intro_brief", ""), "sections": full_article_sections, "conclusion_brief": outline_payload.get("conclusion_brief", "")},
+            "overall_requirements": self._article_depth_requirements(full_article_sections),
+            "sources": scoped_sources, "brand": self._optional_text(payload, "brand") or "", "cta": self._optional_text(payload, "cta") or "",
+            "voice": self._optional_text(payload, "voice") or "clear, helpful American English", "language": asset["locale"],
+            "reader_markdown_policy": "Return one complete Markdown article. Never display internal source IDs or verification labels; use portable Markdown tables and lists only.",
+        }
+        article, article_run = self._run_content_stage(connection, asset, "full_article", article_data, generator, provider, model, generation_job_id)
+        if not isinstance(article.get("markdown"), str) or not article["markdown"].strip():
+            raise ContentGenerationProtocolError("AI full article returned no Markdown.")
+        markdown = self._sanitize_reader_markdown(article["markdown"])
+        markdown = self._enforce_full_article_links(markdown, allowed_link_urls | authority_urls)
         markdown = self._normalise_primary_keyword_emphasis(markdown, str(asset["keyword"] or ""))
         verification = article.get("verify", []) if isinstance(article.get("verify", []), list) else []
-        for draft in section_drafts:
-            if isinstance(draft.get("verify"), list):
-                verification.extend(item for item in draft["verify"] if isinstance(item, str))
         verification = list(dict.fromkeys(verification))
         sources_used = article.get("sources_used", []) if isinstance(article.get("sources_used", []), list) else []
         if not sources_used:
             sources_used = list(dict.fromkeys(
                 source_id
-                for draft in section_drafts if isinstance(draft.get("claims_used"), list)
-                for claim in draft["claims_used"] if isinstance(claim, Mapping) and isinstance(claim.get("source_ids"), list)
+                for claim in article.get("claims_used", []) if isinstance(claim, Mapping) and isinstance(claim.get("source_ids"), list)
                 for source_id in claim["source_ids"] if isinstance(source_id, str)
             ))
         compatibility_qa = {"status": "not_run", "checks": [], "unresolved_verify": verification}
@@ -5268,40 +5217,96 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                    project_id,content_asset_id,outline_id,generation_run_id,generation_job_id,parent_draft_id,
                    version,title,meta_description,markdown,sources_used_json,unresolved_verify_json,qa_json,
                    qa_status,provider,model
-               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (asset["project_id"], asset["id"], outline["id"], assembly_run["id"], generation_job_id, parent_draft_id, version, str(article.get("title") or metadata.get("selected_title") or asset["title_snapshot"]), str(article.get("meta_description") or metadata.get("meta_description") or ""), markdown, json.dumps(sources_used, ensure_ascii=False), json.dumps(verification, ensure_ascii=False), json.dumps(compatibility_qa, ensure_ascii=False), "not_run", provider, model))
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (asset["project_id"], asset["id"], outline["id"], article_run["id"], generation_job_id, parent_draft_id, version, str(article.get("title") or metadata.get("selected_title") or asset["title_snapshot"]), str(article.get("meta_description") or metadata.get("meta_description") or ""), markdown, json.dumps(sources_used, ensure_ascii=False), json.dumps(verification, ensure_ascii=False), json.dumps(compatibility_qa, ensure_ascii=False), "not_run", provider, model))
             source_count = int(connection.execute("SELECT COUNT(*) FROM content_authority_source_links WHERE project_id=? AND content_asset_id=?", (asset["project_id"], asset["id"])).fetchone()[0])
             asset_status = "ready_to_publish" if source_count else "needs_revision"
-            connection.execute("UPDATE content_assets SET status=?,current_draft_id=?,current_generation_run_id=?,tags_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (asset_status, cursor.lastrowid, assembly_run["id"], json.dumps(content_tags, ensure_ascii=False), asset["id"]))
+            connection.execute("UPDATE content_assets SET status=?,current_draft_id=?,current_generation_run_id=?,tags_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (asset_status, cursor.lastrowid, article_run["id"], json.dumps(content_tags, ensure_ascii=False), asset["id"]))
             draft = connection.execute("SELECT * FROM content_drafts WHERE id=?", (cursor.lastrowid,)).fetchone()
         return self._content_draft_payload(draft)
 
     @staticmethod
-    def _generate_content_tags(*, asset: sqlite3.Row, semantic: Any, headings: list[str], markdown: str, generator: Any) -> list[str]:
-        """Return a small, stable tag set without making tagging able to fail a draft.
-
-        Tags are a navigation aid, not article evidence.  The content model is
-        asked for precise Chinese labels after the article is complete; a
-        deterministic fallback guarantees that every successful draft still
-        receives two or three useful filters when the model is unavailable.
-        """
-        result: Any = None
+    def _section_keyword_requirements(section: Mapping[str, Any], primary_keyword: str) -> dict[str, Any]:
+        """Give the full-article writer an H2-specific relevance floor, not a stuffing quota."""
+        raw = section.get("keyword_requirements")
+        supplied = raw.get("supporting_terms") if isinstance(raw, Mapping) else []
+        terms = [re.sub(r"\s+", " ", str(item)).strip() for item in supplied if isinstance(item, str)] if isinstance(supplied, list) else []
+        terms = [item[:90] for item in terms if 2 <= len(item) <= 90]
+        if not terms:
+            stop_words = {"about", "after", "also", "and", "are", "best", "can", "for", "from", "guide", "how", "into", "its", "that", "the", "their", "this", "use", "what", "when", "which", "with", "your"}
+            seed = " ".join([str(section.get("heading") or ""), *[str(item) for item in section.get("key_points", []) if isinstance(item, str)]])
+            terms = [token for token in re.findall(r"[A-Za-z][A-Za-z0-9-]{2,}", seed) if token.casefold() not in stop_words][:4]
+        terms = list(dict.fromkeys(terms))[:4]
+        minimum = raw.get("minimum_supporting_terms") if isinstance(raw, Mapping) else None
         try:
-            result = generator.run_stage(
-                stage="content_tags",
-                data={
-                    "canonical_title": str(asset["title_snapshot"]),
-                    "primary_keyword": str(asset["keyword"] or ""),
-                    "intent": semantic.get("intent", {}) if isinstance(semantic, Mapping) else {},
-                    "headings": headings[:8],
-                    "article_excerpt": markdown[:5000],
-                },
-            )
-        except Exception:
-            # A tag request must never discard a finished long-form article.
-            result = None
-        raw_tags = result.get("tags") if isinstance(result, Mapping) else None
-        tags = KeywordDiscoveryRequestHandler._normalise_content_tags(raw_tags)
-        return tags if len(tags) >= 2 else KeywordDiscoveryRequestHandler._fallback_content_tags(asset, semantic, markdown)
+            minimum = int(minimum)
+        except (TypeError, ValueError):
+            minimum = min(2, len(terms))
+        if minimum <= 0:
+            minimum = min(2, len(terms))
+        return {
+            "primary_keyword": primary_keyword,
+            "primary_keyword_rule": "Use in the opening only; do not repeat it mechanically in every H2.",
+            "supporting_terms": terms,
+            "minimum_supporting_terms": max(0, min(minimum, len(terms))),
+        }
+
+    @staticmethod
+    def _section_depth_requirements(section: Mapping[str, Any]) -> dict[str, Any]:
+        """Persist a measurable depth floor for every H2 before the single drafting call."""
+        raw = section.get("depth_requirements")
+        raw = raw if isinstance(raw, Mapping) else {}
+        try:
+            minimum_subtopics = int(raw.get("minimum_subtopics"))
+        except (TypeError, ValueError):
+            minimum_subtopics = max(3, min(5, len(section.get("key_points", [])) or 3))
+        if minimum_subtopics <= 0:
+            minimum_subtopics = max(3, min(5, len(section.get("key_points", [])) or 3))
+        try:
+            recommended_words = int(section.get("target_words") or 0)
+        except (TypeError, ValueError):
+            recommended_words = 0
+        return {
+            "minimum_non_overlapping_subtopics": max(2, min(minimum_subtopics, 5)),
+            "minimum_words": max(180, min(420, recommended_words or 280)),
+            "reader_outcome": str(raw.get("reader_outcome") or section.get("purpose") or "Help the reader make the next decision.")[:300],
+            "required_practical_detail": str(raw.get("practical_detail") or section.get("reader_question") or "Give a practical check, condition, trade-off, or action.")[:300],
+        }
+
+    @staticmethod
+    def _article_depth_requirements(sections: list[Mapping[str, Any]]) -> dict[str, Any]:
+        section_minimums = [int((section.get("depth_requirements") or {}).get("minimum_words") or 0) for section in sections]
+        return {
+            "minimum_total_words": max(900, sum(section_minimums) + 140),
+            "required_h2_count": len(sections),
+            "depth_rule": "Every H2 must answer its distinct reader question and meet its own non-overlapping subtopic requirement; do not meet length by repeating introductions, conclusions, or generic cautions.",
+            "keyword_rule": "Use the primary keyword once in the opening and use supporting terms only where they clarify the H2 topic. Natural relevance is more important than repetition.",
+        }
+
+    @classmethod
+    def _enforce_full_article_links(cls, markdown: str, allowed_urls: set[str]) -> str:
+        """Keep only exact, project-scoped or authority URLs supplied to the one-pass writer."""
+        written_internal: set[str] = set()
+
+        def keep_only_allowed(match: re.Match[str]) -> str:
+            label = match.group(1)
+            destination = cls._canonical_internal_url(match.group(2))
+            if not destination or destination not in allowed_urls:
+                return label
+            is_internal = destination in allowed_urls
+            if is_internal and destination in written_internal:
+                return label
+            if is_internal:
+                if len(written_internal) >= 3:
+                    return label
+                written_internal.add(destination)
+            return f"[{label}]({destination})"
+
+        return re.sub(r"(?<!!)\[([^\]]+)\]\(([^\s)]+)(?:\s+['\"][^'\"]*['\"])?\)", keep_only_allowed, markdown)
+
+    @staticmethod
+    def _generate_content_tags(*, asset: sqlite3.Row, semantic: Any, headings: list[str], markdown: str, generator: Any) -> list[str]:
+        """Keep tags deterministic so one draft uses exactly one writing prompt."""
+        return KeywordDiscoveryRequestHandler._fallback_content_tags(asset, semantic, markdown)
 
     @staticmethod
     def _normalise_content_tags(raw_tags: Any) -> list[str]:
@@ -5626,9 +5631,9 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         # to the original stage family. Preserve planning-only audit data in
         # input_json while storing it under that compatible outline family.
         # The API restores workflow_stage for the UI, so no detail is lost.
-        stored_stage = "semantic" if stage == "industry_rules" else ("outline" if stage in {"chapter_plan", "company_context_plan"} else ("section" if stage == "targeted_rewrite" else stage))
+        stored_stage = "semantic" if stage == "industry_rules" else ("outline" if stage in {"chapter_plan", "company_context_plan"} else ("assembly" if stage == "full_article" else ("section" if stage == "targeted_rewrite" else stage)))
         logged_input = dict(data)
-        if stage in {"industry_rules", "chapter_plan", "company_context_plan", "targeted_rewrite"}:
+        if stage in {"industry_rules", "chapter_plan", "company_context_plan", "full_article", "targeted_rewrite"}:
             logged_input["workflow_stage"] = stage
         with connection:
             cursor = connection.execute("INSERT INTO content_generation_runs(project_id,content_asset_id,stage,provider,model,generation_job_id,status,input_json,prompt_version) VALUES(?,?,?,?,?,?,'running',?,?)", (asset["project_id"], asset["id"], stored_stage, provider, model, generation_job_id, json.dumps(logged_input, ensure_ascii=False), PROMPT_VERSION))
@@ -5720,8 +5725,16 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         def strings(field: str) -> list[str]:
             value = section.get(field, [])
             return [item.strip() for item in value if isinstance(item, str) and item.strip()] if isinstance(value, list) else []
+        def strings_from(value: Any) -> list[str]:
+            return [item.strip() for item in value if isinstance(item, str) and item.strip()][:4] if isinstance(value, list) else []
         level = section.get("level") if section.get("level") in {"h2", "h3"} else "h2"
         format_value = section.get("format") if section.get("format") in {"paragraphs", "list", "table"} else "paragraphs"
+        raw_keywords = section.get("keyword_requirements") if isinstance(section.get("keyword_requirements"), Mapping) else {}
+        raw_depth = section.get("depth_requirements") if isinstance(section.get("depth_requirements"), Mapping) else {}
+        try: minimum_terms = int(raw_keywords.get("minimum_supporting_terms") or 0)
+        except (TypeError, ValueError): minimum_terms = 0
+        try: minimum_subtopics = int(raw_depth.get("minimum_subtopics") or 0)
+        except (TypeError, ValueError): minimum_subtopics = 0
         return {
             "id": section.get("id") if isinstance(section.get("id"), str) and section["id"].strip() else f"s{position}",
             "heading": heading.strip(), "level": level,
@@ -5731,6 +5744,8 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             "company_context_source_ids": strings("company_context_source_ids"),
             "company_context_role": section.get("company_context_role") if isinstance(section.get("company_context_role"), str) else "",
             "company_context_link_url": section.get("company_context_link_url") if isinstance(section.get("company_context_link_url"), str) else "",
+            "keyword_requirements": {"supporting_terms": strings_from(raw_keywords.get("supporting_terms")), "minimum_supporting_terms": max(0, min(minimum_terms, 4))},
+            "depth_requirements": {"minimum_subtopics": max(0, min(minimum_subtopics, 5)), "reader_outcome": str(raw_depth.get("reader_outcome") or "")[:300], "practical_detail": str(raw_depth.get("practical_detail") or "")[:300]},
             "target_words": max(0, int(section.get("target_words") or 0)),
         }
 
@@ -8601,7 +8616,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         value = dict(row)
         value["input"] = json.loads(value.pop("input_json") or "{}")
         workflow_stage = value["input"].get("workflow_stage")
-        if workflow_stage in {"industry_rules", "chapter_plan", "company_context_plan", "targeted_rewrite"}:
+        if workflow_stage in {"industry_rules", "chapter_plan", "company_context_plan", "full_article", "targeted_rewrite"}:
             value["stage"] = workflow_stage
         raw_output = value.pop("output_json")
         value["output"] = json.loads(raw_output) if raw_output else None
