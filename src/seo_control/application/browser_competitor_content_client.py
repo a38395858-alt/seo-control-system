@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import time
 from html.parser import HTMLParser
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
@@ -230,7 +231,7 @@ class BrowserCompetitorContentClient:
     web server is unsafe and slower than bounded concurrent HTTP requests.
     """
 
-    def __init__(self, browser: BrowserSerpTitleClient | None = None, *, max_page_chars: int = 60_000, timeout: int = 8, max_workers: int = 5) -> None:
+    def __init__(self, browser: BrowserSerpTitleClient | None = None, *, max_page_chars: int = 60_000, timeout: int = 20, max_workers: int = 5) -> None:
         self.browser = browser or BrowserSerpTitleClient()
         self.max_page_chars = max_page_chars
         self.timeout = timeout
@@ -335,13 +336,32 @@ class BrowserCompetitorContentClient:
         jobs should use the separate Scrapy scheduler, where AutoThrottle,
         persistent de-duplication and per-domain queues are available.
         """
-        response = requests.get(
-            url,
-            headers={"User-Agent": "SEOContentResearchBot/1.0 (+local-content-research)"},
-            timeout=(4, self.timeout),
-            allow_redirects=True,
-        )
-        response.raise_for_status()
+        # A number of normal corporate sites close pooled or anonymous-looking
+        # TLS connections.  Use a browser-like, short-lived HTTP request and a
+        # single bounded retry before recording the URL as inaccessible.
+        # This stays within the same robots decision made by ``extract``.
+        response: requests.Response | None = None
+        last_error: requests.RequestException | None = None
+        for attempt in range(2):
+            try:
+                response = requests.get(
+                    url,
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (compatible; SEOContentResearchBot/1.0; +local-content-research)",
+                        "Accept": "text/html,application/xhtml+xml",
+                        "Connection": "close",
+                    },
+                    timeout=(8, self.timeout),
+                    allow_redirects=True,
+                )
+                response.raise_for_status()
+                break
+            except requests.RequestException as error:
+                last_error = error
+                if attempt == 0:
+                    time.sleep(0.8)
+        if response is None:
+            raise last_error or requests.RequestException("Competitor HTTP fetch failed.")
         content_type = response.headers.get("Content-Type", "").split(";", 1)[0].casefold()
         if content_type not in {"text/html", "application/xhtml+xml"}:
             raise CompetitorContentProtocolError("Competitor URL is not an HTML content page.")

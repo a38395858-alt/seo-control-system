@@ -6,6 +6,7 @@ import unittest
 from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
+from urllib.error import URLError
 
 
 SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
@@ -40,6 +41,24 @@ class SerperSearchClientTests(unittest.TestCase):
             ],
             items,
         )
+
+    @patch("seo_control.application.serper_search_client.time.sleep")
+    @patch("seo_control.application.serper_search_client.urlopen")
+    def test_retries_tls_network_error_with_a_fresh_short_connection(self, mock_open, _mock_sleep) -> None:
+        mock_open.side_effect = [
+            URLError("TLS closed"),
+            _Response({"organic": [{"position": 1, "title": "Recovered", "link": "https://example.com/recovered"}]}),
+        ]
+
+        items = SerperSearchClient("test-key").search(query="IP rating", max_results=1)
+
+        self.assertEqual("Recovered", items[0]["title"])
+        self.assertEqual(2, mock_open.call_count)
+        first_request = mock_open.call_args_list[0].args[0]
+        second_request = mock_open.call_args_list[1].args[0]
+        self.assertIsNot(first_request, second_request)
+        self.assertEqual("close", first_request.get_header("Connection"))
+        self.assertEqual("application/json", first_request.get_header("Accept"))
 
 
 if __name__ == "__main__":

@@ -6,8 +6,10 @@ import sys
 import threading
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from pathlib import Path
+
+import requests
 
 SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
 if str(SRC_ROOT) not in sys.path:
@@ -100,6 +102,24 @@ class CompetitorContentClientTests(unittest.TestCase):
             with self.assertRaisesRegex(Exception, "blocked by robots"):
                 client.extract(url="https://blocked.example/article")
         fetch.assert_not_called()
+
+    @patch("seo_control.application.browser_competitor_content_client.time.sleep")
+    @patch("seo_control.application.browser_competitor_content_client.requests.get")
+    def test_static_fetch_retries_with_short_lived_browser_like_headers(self, mock_get, _mock_sleep) -> None:
+        first = Mock(); first.raise_for_status.side_effect = requests.ConnectionError("TLS reset")
+        second = Mock(); second.raise_for_status.return_value = None
+        second.headers = {"Content-Type": "text/html; charset=utf-8"}
+        second.content = b"<html><title>Guide</title><p>" + (b"Useful outdoor LED guidance. " * 40) + b"</p></html>"
+        second.encoding = "utf-8"
+        mock_get.side_effect = [first, second]
+        client = BrowserCompetitorContentClient(browser=object())  # type: ignore[arg-type]
+
+        html = client._fetch_static_html("https://example.test/guide")
+
+        self.assertIn("Useful outdoor LED guidance", html)
+        self.assertEqual(2, mock_get.call_count)
+        self.assertEqual("close", mock_get.call_args.kwargs["headers"]["Connection"])
+        self.assertEqual((8, 20), mock_get.call_args.kwargs["timeout"])
 
 
 if __name__ == "__main__": unittest.main()

@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import socket
+import ssl
 import time
 from typing import Any
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
@@ -34,21 +37,47 @@ class SerperSearchClient:
         if tbs:
             request_payload["tbs"] = tbs
         payload = json.dumps(request_payload).encode("utf-8")
-        request = Request(self.endpoint, data=payload, headers={"X-API-KEY": self.api_key, "Content-Type": "application/json"}, method="POST")
         raw = ""
         last_error: Exception | None = None
-        for attempt in range(3):
+        # Serper can close a reused TLS connection before it sends headers.
+        # Build a fresh short-lived request for every safe, read-only retry.
+        max_attempts = 6
+        transient_http_codes = {408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
+        for attempt in range(max_attempts):
+            request = Request(
+                self.endpoint,
+                data=payload,
+                headers={
+                    "X-API-KEY": self.api_key,
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "Connection": "close",
+                    "User-Agent": "SEO-Control-Competitor-Research/1.0",
+                },
+                method="POST",
+            )
             try:
                 with urlopen(request, timeout=self.timeout) as response:  # nosec B310 - configured Serper HTTPS endpoint
                     raw = response.read().decode("utf-8")
                 last_error = None
                 break
-            except Exception as error:
+            except HTTPError as error:
+                if error.code not in transient_http_codes:
+                    raise SerperSearchProtocolError(f"Serper request was rejected with HTTP {error.code}.") from error
                 last_error = error
-                if attempt < 2:
-                    time.sleep(0.6 * (attempt + 1))
+            except (URLError, ssl.SSLError, TimeoutError, socket.timeout, ConnectionResetError, ConnectionAbortedError, BrokenPipeError) as error:
+                last_error = error
+            except OSError as error:
+                last_error = error
+            if attempt + 1 < max_attempts:
+                time.sleep(0.75 * (2**attempt))
         if last_error is not None:
-            raise SerperSearchProtocolError(f"Serper request failed after 3 attempts: {type(last_error).__name__}.") from last_error
+            if isinstance(last_error, HTTPError):
+                raise SerperSearchProtocolError(f"Serper request failed after {max_attempts} attempts: upstream HTTP {last_error.code}.") from last_error
+            reason = last_error.reason if isinstance(last_error, URLError) else last_error
+            if isinstance(reason, (TimeoutError, socket.timeout)):
+                raise SerperSearchProtocolError(f"Serper request timed out after {max_attempts} attempts.") from last_error
+            raise SerperSearchProtocolError(f"Serper network request failed after {max_attempts} attempts: {type(reason).__name__}.") from last_error
         try:
             document = json.loads(raw)
         except json.JSONDecodeError as error:
