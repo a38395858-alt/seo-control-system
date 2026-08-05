@@ -97,7 +97,7 @@ CONTENT_SECTION_IMAGE_DIMENSIONS = (800, 600)
 # API advertises. Twenty seconds keeps a full H2 batch below the observed
 # burst threshold while still letting the user finish it in one operation.
 SILICONFLOW_IMAGE_REQUEST_INTERVAL_SECONDS = 20
-DEFAULT_AI_ASSIGNMENTS = {"keyword_review": "openai", "title_generation": "openai", "content_generation": "openai"}
+DEFAULT_AI_ASSIGNMENTS = {"keyword_review": "openai", "title_generation": "openai", "content_generation": "deepseek"}
 CONTENT_PROVIDER_LABELS = {"openai": "ChatGPT", "gemini": "Gemini", "deepseek": "DeepSeek"}
 AUTHORITY_SEARCH_FILE_EXCLUSIONS = "-filetype:pdf -filetype:doc -filetype:docx -filetype:xls -filetype:xlsx -filetype:ppt -filetype:pptx -filetype:csv -filetype:zip"
 AUTHORITY_NON_ARTICLE_PATH_MARKERS = ("/documentcenter/", "/docview", "/pdfjsviewer/", "/virtual-library/", "/weblink/", "/records/", "/download/", "/bidopportunities/")
@@ -4403,7 +4403,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             # Test and local injected generators advertise the model they
             # actually run.  A UI request must not forge their audit record.
             return injected, requested or str(getattr(injected, "provider", "custom")), getattr(injected, "model", None)
-        provider = requested or _ai_assignments(self.server.ai_settings_path).get("content_generation", "openai")
+        provider = requested or _ai_assignments(self.server.ai_settings_path).get("content_generation", "deepseek")
         if not getattr(self.server, "allow_environment_ai_fallback", True) and not _ai_settings_document(self.server.ai_settings_path).get("providers"):
             return None, provider, None
         configuration = _provider_configuration(self.server.ai_settings_path, provider)
