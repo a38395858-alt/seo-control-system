@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import ssl
 import sys
 import unittest
 from pathlib import Path
@@ -100,6 +101,24 @@ class ContentGeneratorTests(unittest.TestCase):
         self.assertEqual(["Stair Lighting", "Guide"], result["tags"])
         self.assertEqual(2, request_mock.call_count)
 
+    def test_deepseek_tls_eof_retries_on_a_new_short_lived_connection(self) -> None:
+        generator = OpenAICompatibleContentGenerator("test-key", "https://example.test/v1", "deepseek-test", provider="deepseek")
+        response = MagicMock()
+        response.read.return_value = json.dumps({"choices": [{"message": {"content": '{"tags":["Stair Lighting"]}'}}]}).encode("utf-8")
+        context = MagicMock()
+        context.__enter__.return_value = response
+        context.__exit__.return_value = False
+        with patch("seo_control.application.content_generator.time.sleep"), patch(
+            "seo_control.application.content_generator.urlopen",
+            side_effect=[URLError(ssl.SSLEOFError(8, "EOF occurred in violation of protocol")), context],
+        ) as request_mock:
+            result = generator.run_stage(stage="content_tags", data={})
+
+        self.assertEqual(["Stair Lighting"], result["tags"])
+        self.assertEqual(2, request_mock.call_count)
+        retry_request = request_mock.call_args.args[0]
+        self.assertEqual("close", retry_request.get_header("Connection"))
+
     def test_stage_request_sends_the_versioned_instruction_and_json_contract(self) -> None:
         generator = OpenAICompatibleContentGenerator("test-key", "https://example.test/v1", "gpt-5.4", provider="openai")
         response = MagicMock()
@@ -117,9 +136,9 @@ class ContentGeneratorTests(unittest.TestCase):
         self.assertEqual("outline", contract["stage"])
         self.assertIn("title promise", contract["instruction"])
         self.assertIn("source IDs", contract["instruction"])
-        self.assertIn("Source column", contract["instruction"])
+        self.assertIn("reader-facing Source or Verification column", contract["instruction"])
         self.assertIn("sections", contract["output_schema"])
-        self.assertEqual("people_first_evidence_routed_v20", PROMPT_VERSION)
+        self.assertEqual("people_first_full_article_v21", PROMPT_VERSION)
         self.assertIn("company_knowledge", contract["instruction"])
         self.assertIn("exact public product/company URL", contract["instruction"])
         self.assertIn("company_context_plan", contract["output_schema"])

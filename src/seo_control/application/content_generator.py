@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import socket
+import ssl
 import time
 from typing import Any, Mapping
 from urllib.error import HTTPError, URLError
@@ -193,19 +194,25 @@ class OpenAICompatibleContentGenerator:
                 {"role": "user", "content": json.dumps({"stage": stage, "instruction": _stage_instruction(stage), "data": data, "output_schema": _schema_for(stage)}, ensure_ascii=False)},
             ],
         }
-        request = Request(
-            f"{self._base_url}/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {self._api_key}"},
-            method="POST",
-        )
         transient_http_codes = {408, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524}
-        # A managed gateway can reset one long-running H2 request even when
-        # its neighboring stages succeeded. Retrying is safe: this stage has
-        # no publishing side effect and the Agent retains a durable checkpoint.
-        max_attempts = 4
+        # DeepSeek occasionally terminates a long TLS response before sending
+        # headers.  Every stage is idempotent until its durable checkpoint is
+        # written, so a short-lived connection plus bounded retry is safe.
+        max_attempts = 6 if self.provider == "deepseek" else 4
         result: dict[str, Any] | None = None
         for attempt in range(max_attempts):
+            request = Request(
+                f"{self._base_url}/chat/completions",
+                data=json.dumps(payload).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Accept": "application/json",
+                    "Connection": "close",
+                    "User-Agent": "SEO-Control-Content-Agent/1.0",
+                },
+                method="POST",
+            )
             try:
                 with urlopen(request, timeout=self._timeout) as response:
                     body = json.loads(response.read().decode("utf-8"))
@@ -223,14 +230,15 @@ class OpenAICompatibleContentGenerator:
                 raise ContentGenerationProtocolError(f"AI content {stage} upstream HTTP {error.code}.") from error
             except (TimeoutError, socket.timeout) as error:
                 raise ContentGenerationProtocolError(f"AI content {stage} timed out after {int(self._timeout)} seconds.") from error
-            except URLError as error:
-                if isinstance(error.reason, (TimeoutError, socket.timeout)):
+            except (URLError, ssl.SSLError, ConnectionResetError, ConnectionAbortedError, BrokenPipeError) as error:
+                reason = error.reason if isinstance(error, URLError) else error
+                if isinstance(reason, (TimeoutError, socket.timeout)):
                     raise ContentGenerationProtocolError(f"AI content {stage} timed out after {int(self._timeout)} seconds.") from error
                 if attempt + 1 < max_attempts:
                     time.sleep(1.5 * (2**attempt))
                     continue
                 raise ContentGenerationProtocolError(
-                    f"AI content {stage} network request failed after {max_attempts} attempts: {_safe_network_error_detail(error.reason)}"
+                    f"AI content {stage} network request failed after {max_attempts} attempts: {_safe_network_error_detail(reason)}"
                 ) from error
             except (OSError, ValueError, KeyError, IndexError, TypeError) as error:
                 raise ContentGenerationProtocolError(
