@@ -5178,13 +5178,14 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             self._canonical_internal_url(source.get("url")) for source in scoped_sources
             if source.get("source_type") == "authority_source" and self._canonical_internal_url(source.get("url"))
         }
+        article_sources = self._compact_full_article_sources(scoped_sources)
         article_data = {
             "metadata": dict(metadata), "primary_keyword": str(asset["keyword"] or ""), "audience": brief["target_audience"],
             "intent": semantic.get("intent", {}), "project_context": project_context, "writing_policy": writing_policy,
             "angle": semantic.get("angle", ""), "competitor_learning": competitor_learning, "learning_memories": learning_memories,
             "outline": {"intro_brief": outline_payload.get("intro_brief", ""), "sections": full_article_sections, "conclusion_brief": outline_payload.get("conclusion_brief", "")},
             "overall_requirements": self._article_depth_requirements(full_article_sections),
-            "sources": scoped_sources, "brand": self._optional_text(payload, "brand") or "", "cta": self._optional_text(payload, "cta") or "",
+            "sources": article_sources, "brand": self._optional_text(payload, "brand") or "", "cta": self._optional_text(payload, "cta") or "",
             "voice": self._optional_text(payload, "voice") or "clear, helpful American English", "language": asset["locale"],
             "reader_markdown_policy": "Return one complete Markdown article. Never display internal source IDs or verification labels; use portable Markdown tables and lists only.",
         }
@@ -5224,6 +5225,36 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             connection.execute("UPDATE content_assets SET status=?,current_draft_id=?,current_generation_run_id=?,tags_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (asset_status, cursor.lastrowid, article_run["id"], json.dumps(content_tags, ensure_ascii=False), asset["id"]))
             draft = connection.execute("SELECT * FROM content_drafts WHERE id=?", (cursor.lastrowid,)).fetchone()
         return self._content_draft_payload(draft)
+
+    @staticmethod
+    def _compact_full_article_sources(sources: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
+        """Bound one-pass writer context without losing source identity or scope.
+
+        The original source remains persisted in the Brief. This creates only
+        a prompt-time excerpt, so one large research document cannot make a
+        valid long-form response exceed its upstream connection window.
+        """
+        limits = {
+            "authority_source": 6_000,
+            "company_knowledge": 5_000,
+            "competitor_page": 2_500,
+            "gsc_performance": 1_200,
+            "gsc_anchor": 1_200,
+        }
+        remaining = 24_000
+        compacted: list[dict[str, Any]] = []
+        for source in sources:
+            if remaining <= 0:
+                break
+            value = dict(source)
+            cap = min(limits.get(str(value.get("source_type") or ""), 3_000), remaining)
+            content = " ".join(str(value.get("content") or "").split())
+            if len(content) > cap:
+                content = f"{content[:cap].rsplit(' ', 1)[0]} …"
+            value["content"] = content
+            compacted.append(value)
+            remaining -= len(content)
+        return compacted
 
     @staticmethod
     def _section_keyword_requirements(section: Mapping[str, Any], primary_keyword: str) -> dict[str, Any]:

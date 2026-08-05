@@ -185,6 +185,10 @@ class OpenAICompatibleContentGenerator:
 
     def run_stage(self, *, stage: str, data: Mapping[str, Any]) -> dict[str, Any]:
         temperature = 0.15 if stage in {"authority_research_plan", "source_classification"} else (0.3 if stage == "semantic" else 0.7)
+        # A complete SEO article is materially larger than analysis, planning,
+        # or QA JSON. Give the one-pass writer enough time to return the full
+        # response instead of repeatedly aborting a healthy long generation.
+        request_timeout = max(self._timeout, 240.0) if stage == "full_article" else self._timeout
         payload = {
             "model": self.model,
             "temperature": temperature,
@@ -214,7 +218,7 @@ class OpenAICompatibleContentGenerator:
                 method="POST",
             )
             try:
-                with urlopen(request, timeout=self._timeout) as response:
+                with urlopen(request, timeout=request_timeout) as response:
                     body = json.loads(response.read().decode("utf-8"))
                 content = body["choices"][0]["message"]["content"]
                 # Gemini-compatible proxies may wrap a valid object in a Markdown
@@ -229,11 +233,11 @@ class OpenAICompatibleContentGenerator:
                     continue
                 raise ContentGenerationProtocolError(f"AI content {stage} upstream HTTP {error.code}.") from error
             except (TimeoutError, socket.timeout) as error:
-                raise ContentGenerationProtocolError(f"AI content {stage} timed out after {int(self._timeout)} seconds.") from error
+                raise ContentGenerationProtocolError(f"AI content {stage} timed out after {int(request_timeout)} seconds.") from error
             except (URLError, ssl.SSLError, ConnectionResetError, ConnectionAbortedError, BrokenPipeError) as error:
                 reason = error.reason if isinstance(error, URLError) else error
                 if isinstance(reason, (TimeoutError, socket.timeout)):
-                    raise ContentGenerationProtocolError(f"AI content {stage} timed out after {int(self._timeout)} seconds.") from error
+                    raise ContentGenerationProtocolError(f"AI content {stage} timed out after {int(request_timeout)} seconds.") from error
                 if attempt + 1 < max_attempts:
                     time.sleep(1.5 * (2**attempt))
                     continue

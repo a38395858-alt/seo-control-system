@@ -85,6 +85,30 @@ class ContentGeneratorTests(unittest.TestCase):
             with self.assertRaisesRegex(ContentGenerationProtocolError, r"assembly timed out after 90 seconds"):
                 generator.run_stage(stage="assembly", data={})
 
+    def test_full_article_uses_a_longer_timeout_than_small_stages(self) -> None:
+        generator = OpenAICompatibleContentGenerator("test-key", "https://example.test/v1", "gpt-test", provider="deepseek", timeout=90)
+        response = MagicMock()
+        response.read.return_value = json.dumps({"choices": [{"message": {"content": '{"title":"Test","meta_description":"","markdown":"# Test","sources_used":[],"claims_used":[],"verify":[]}'}}]}).encode("utf-8")
+        context = MagicMock(); context.__enter__.return_value = response; context.__exit__.return_value = False
+        with patch("seo_control.application.content_generator.urlopen", return_value=context) as request_mock:
+            result = generator.run_stage(stage="full_article", data={})
+        self.assertEqual("# Test", result["markdown"])
+        self.assertEqual(240.0, request_mock.call_args.kwargs["timeout"])
+
+    def test_full_article_source_context_is_bounded_without_losing_source_ids(self) -> None:
+        sources = [
+            {"source_id": "authority-1", "source_type": "authority_source", "content": "authority " * 8_000},
+            {"source_id": "competitor-2", "source_type": "competitor_page", "content": "competitor " * 8_000},
+            {"source_id": "company-3", "source_type": "company_knowledge", "content": "company " * 8_000},
+        ]
+
+        compacted = KeywordDiscoveryRequestHandler._compact_full_article_sources(sources)
+
+        self.assertEqual(["authority-1", "competitor-2", "company-3"], [item["source_id"] for item in compacted])
+        self.assertLessEqual(sum(len(item["content"]) for item in compacted), 24_000)
+        self.assertLessEqual(len(compacted[0]["content"]), 6_002)
+        self.assertLessEqual(len(compacted[1]["content"]), 2_502)
+
     def test_transient_network_error_is_retried_before_success(self) -> None:
         generator = OpenAICompatibleContentGenerator("test-key", "https://example.test/v1", "gpt-test", provider="openai")
         response = MagicMock()
