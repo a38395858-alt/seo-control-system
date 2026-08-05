@@ -1164,10 +1164,11 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                     candidates.append(item)
                 return candidates
 
-            # Save and collect every eligible editorial URL from this search
-            # run.  The AI is still given a deliberate five-source evidence
-            # pack later, while the complete permitted corpus remains in the
-            # project-local memory for long-term learning.
+            # Keep the complete SERP catalog for later collection, but fetch
+            # only the best five editorial pages for this single-title run.
+            # One usable article unlocks evidence-bounded planning; three to
+            # five are preferred.  Fetching 15 pages before relevance review
+            # can turn a normal interactive task into a multi-minute timeout.
             # Write the discovery batch first, then read the queued rows back
             # from the project-local catalog.  This makes the catalog the
             # single source of truth for later collection/retry work rather
@@ -1176,7 +1177,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             eligible_results = sorted(
                 editorial_candidates(results),
                 key=lambda item: (0 if any(marker in urlsplit(str(item.get("url") or "")).path.casefold() for marker in enterprise_path_markers) else 1, int(item.get("rank") or 0)),
-            )[:15]
+            )[:5]
             # A research retry must reuse a previously collected article when
             # it appears in the same title's SERP.  Previously this method
             # fetched only catalog rows still marked ``queued``; a successful

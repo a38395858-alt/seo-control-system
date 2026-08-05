@@ -205,19 +205,19 @@ class CompetitorContentLearningApiTests(unittest.TestCase):
         self.assertEqual([], client.bing_queries)
         self.assertEqual(5, body["competitor_research"]["usable_count"])  # type: ignore[index]
 
-    def test_all_readable_article_pages_are_saved_and_the_analysis_pack_is_top_five(self) -> None:
+    def test_single_title_run_collects_at_most_five_articles_while_cataloging_all_results(self) -> None:
         self.server.competitor_content_client = FakeCompetitorClient(count=7); self.server.competitor_search_client = self.server.competitor_content_client
         project_id, asset_id = self.asset()
 
-        status, body = self.request("POST", f"/api/content-assets/{asset_id}/generate", {"project_id": project_id, "provider": "openai", "competitor_research": True})
+        status, body = self.request("POST", f"/api/content-assets/{asset_id}/research-competitors", {"project_id": project_id})
 
         self.assertEqual(201, status, body)
-        self.assertEqual(5, body["competitor_research"]["usable_count"])  # type: ignore[index]
+        self.assertEqual(5, body["usable_count"])  # type: ignore[index]
         _, memory = self.request("GET", f"/api/content-memory?project_id={project_id}")
-        self.assertEqual(7, len(memory))  # type: ignore[arg-type]
+        self.assertEqual(5, len(memory))  # type: ignore[arg-type]
         _, catalog = self.request("GET", f"/api/competitor-url-catalog?project_id={project_id}")
         self.assertEqual(7, len(catalog))  # type: ignore[arg-type]
-        self.assertTrue(all(item["collection_status"] == "collected" for item in catalog))  # type: ignore[index]
+        self.assertEqual(5, sum(item["collection_status"] == "collected" for item in catalog))  # type: ignore[index]
         analysis_input = self.generator.stage_inputs["competitor_analysis"][-1]
         self.assertEqual(5, len(analysis_input["competitors_content"]))
 
