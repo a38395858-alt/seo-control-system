@@ -79,16 +79,34 @@ class ContentPromptQualityTests(unittest.TestCase):
     def test_full_article_prompt_enforces_h2_depth_without_word_count_padding(self) -> None:
         from seo_control.application.content_generator import PROMPT_VERSION, _schema_for  # noqa: E402
 
-        self.assertEqual("people_first_full_article_v21", PROMPT_VERSION)
+        self.assertEqual("people_first_full_article_v26", PROMPT_VERSION)
         for stage in ("outline", "full_article", "qa", "targeted_rewrite"):
             instruction = _stage_instruction(stage)
-            for text in ("new reader value", "unique information gain", "three to five non-overlapping", "never pad", "one concise statement"):
+            for text in ("new reader value", "unique information gain", "four to six non-overlapping", "never pad", "one concise statement"):
                 self.assertIn(text, instruction)
         outline_schema = _schema_for("outline")
         for field in ("keyword_requirements", "minimum_supporting_terms", "depth_requirements", "minimum_subtopics", "reader_outcome", "practical_detail"):
             self.assertIn(field, outline_schema)
         self.assertIn("h2_reviews", _schema_for("qa"))
         self.assertIn("repetition_control", _schema_for("qa"))
+
+    def test_full_article_prompt_does_not_require_a_reference_footer(self) -> None:
+        instruction = _stage_instruction("full_article")
+        self.assertNotIn("Authority-reference policy", instruction)
+        self.assertNotIn("权威参考与验证链接", instruction)
+        self.assertNotIn("authority-reference footer", instruction)
+        self.assertIn("Use only supplied evidence for material factual claims", instruction)
+
+    def test_full_article_requires_a_3000_word_article_without_an_appendix(self) -> None:
+        instruction = _stage_instruction("full_article")
+        for text in ("must exceed 3,000 English words", "not with repetitive recaps"):
+            self.assertIn(text, instruction)
+        self.assertNotIn("separately appended", instruction)
+
+    def test_editorial_voice_policy_rejects_canned_ai_prose(self) -> None:
+        instruction = _stage_instruction("full_article")
+        for text in ("Natural editorial-voice policy", "not like an AI assistant", "In today's fast-paced world", "Aim for clarity and credible reader value"):
+            self.assertIn(text, instruction)
 
     def test_full_article_prompt_keeps_a_closed_outline_and_safe_source_free_mode(self) -> None:
         instruction = _stage_instruction("full_article")

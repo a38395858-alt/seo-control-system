@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import socket
+import ssl
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -93,14 +94,31 @@ class OpenAICompatibleTitleGenerator:
 
     def _post_chat_json(self, payload: dict[str, Any], *, operation: str) -> dict[str, Any]:
         """POST once normally, but recover from bounded transient upstream failures."""
-        http_request = Request(
-            f"{self._base_url}/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json", "Authorization": f"Bearer {self._api_key}"},
-            method="POST",
-        )
-        max_attempts = 3
+        # DeepSeek can occasionally close a reused TLS connection before its
+        # response headers arrive. Rebuild a short-lived request for every
+        # retry, mirroring the durable full-article writer path.
+        uses_deepseek = "deepseek" in self._base_url.casefold()
+        request_payload = dict(payload)
+        if uses_deepseek:
+            # DeepSeek thinking mode ignores sampling controls such as
+            # temperature, so use its documented explicit reasoning fields.
+            request_payload.pop("temperature", None)
+            request_payload["thinking"] = {"type": "enabled"}
+            request_payload["reasoning_effort"] = "high"
+        max_attempts = 6 if uses_deepseek else 3
         for attempt in range(max_attempts):
+            http_request = Request(
+                f"{self._base_url}/chat/completions",
+                data=json.dumps(request_payload).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Accept": "application/json",
+                    "Connection": "close",
+                    "User-Agent": "SEO-Control-Title-Agent/1.0",
+                },
+                method="POST",
+            )
             try:
                 with urlopen(http_request, timeout=self._timeout) as response:
                     body = json.loads(response.read().decode("utf-8"))
@@ -118,7 +136,7 @@ class OpenAICompatibleTitleGenerator:
                     time.sleep(1.25 * (2**attempt))
                     continue
                 raise TitleGenerationProtocolError(f"{operation} timed out after {int(self._timeout)} seconds.") from error
-            except URLError as error:
+            except (URLError, ssl.SSLError, ConnectionResetError, ConnectionAbortedError, BrokenPipeError) as error:
                 if attempt + 1 < max_attempts:
                     time.sleep(1.25 * (2**attempt))
                     continue

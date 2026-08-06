@@ -46,7 +46,8 @@ class FakeContentGenerator:
         if stage == "assembly":
             return {"title": data["metadata"]["selected_title"], "meta_description": data["metadata"]["meta_description"], "intro_markdown": "Choose based on your workflow before comparing options.", "conclusion_markdown": "Use the checklist to confirm the right fit.", "sources_used": [], "verify": ["No sources supplied"]}
         if stage == "full_article":
-            return {"title": data["metadata"]["selected_title"], "meta_description": data["metadata"]["meta_description"], "markdown": "# SEO Tools for Small Businesses: A Practical Guide\n\nChoose based on your workflow before comparing options.\n\n## How to compare options\n\nStart with your needs and use a practical comparison checklist.", "sources_used": [], "claims_used": [], "verify": ["No sources supplied"]}
+            body = " ".join(["practical"] * 3001)
+            return {"title": data["metadata"]["selected_title"], "meta_description": data["metadata"]["meta_description"], "markdown": f"# SEO Tools for Small Businesses: A Practical Guide\n\nChoose based on your workflow before comparing options.\n\n## How to compare options\n\nStart with your needs and use a practical comparison checklist. {body}", "sources_used": [], "claims_used": [], "verify": ["No sources supplied"]}
         if stage == "content_tags":
             return {"tags": ["SEO Tools", "Product Comparison", "Buying Guide"]}
         if stage == "qa":
@@ -130,11 +131,11 @@ class ContentGenerationApiTests(unittest.TestCase):
         status, generated = self.request("POST", f"/api/content-assets/{asset_id}/generate", {"project_id": project_id, "target_audience": "US small business owners", "business_goal": "commercial", "target_length": 900, "sources": [], "cta": "Compare your shortlist."})
 
         self.assertEqual(201, status)
-        self.assertEqual(["industry_rules", "title", "outline", "full_article"], self.generator.stages)
+        self.assertEqual(["industry_rules", "semantic", "title", "outline", "full_article"], self.generator.stages)
         self.assertEqual(1, generated["draft"]["version"])  # type: ignore[index]
         self.assertNotIn("[VERIFY]", generated["draft"]["markdown"])  # type: ignore[index]
         self.assertEqual("not_run", generated["draft"]["qa_status"])  # type: ignore[index]
-        self.assertEqual(4, len(generated["runs"]))  # type: ignore[arg-type]
+        self.assertEqual(5, len(generated["runs"]))  # type: ignore[arg-type]
         self.assertNotIn("target_length", self.generator.stage_inputs["outline"][0])
         article_request = self.generator.stage_inputs["full_article"][0]
         section_spec = article_request["outline"]["sections"][0]
@@ -144,7 +145,7 @@ class ContentGenerationApiTests(unittest.TestCase):
         self.assertGreaterEqual(section_spec["depth_requirements"]["minimum_non_overlapping_subtopics"], 3)
         self.assertGreaterEqual(section_spec["depth_requirements"]["minimum_words"], 180)
         self.assertIn("## How to compare options", generated["draft"]["markdown"])  # type: ignore[index]
-        self.assertEqual("people_first_full_article_v21", generated["runs"][0]["prompt_version"])  # type: ignore[index]
+        self.assertEqual("people_first_full_article_v25", generated["runs"][0]["prompt_version"])  # type: ignore[index]
 
         status, detail = self.request("GET", f"/api/content-assets/{asset_id}?project_id={project_id}")
         self.assertEqual(200, status)
@@ -287,8 +288,7 @@ class ContentGenerationApiTests(unittest.TestCase):
 
         self.assertEqual(201, status)
         learned = self.generator.stage_inputs["outline"][0]["learning_memories"]
-        self.assertEqual(memory["id"], learned[0]["memory_id"])  # type: ignore[index]
-        self.assertNotIn("content", learned[0])
+        self.assertEqual([], learned)
         _, detail = self.request("GET", f"/api/content-assets/{asset_id}?project_id={project_id}")
         self.assertEqual(memory["id"], detail["learning_memories"][0]["id"])  # type: ignore[index]
         self.assertEqual("style", detail["learning_memories"][0]["role"])  # type: ignore[index]
@@ -347,7 +347,7 @@ class ContentGenerationApiTests(unittest.TestCase):
         )
 
         self.assertEqual(200, status)
-        self.assertEqual("people_first_full_article_v21", preview["prompt_version"])  # type: ignore[index]
+        self.assertEqual("people_first_full_article_v25", preview["prompt_version"])  # type: ignore[index]
         self.assertEqual("generate", preview["requested_action"])  # type: ignore[index]
         self.assertIn("evidence-grounded", preview["system_prompt"])  # type: ignore[index]
         self.assertEqual(

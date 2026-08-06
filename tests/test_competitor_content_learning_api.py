@@ -34,6 +34,8 @@ class FakeLearningGenerator:
     def run_stage(self, *, stage: str, data: dict) -> dict:
         self.stages.append(stage)
         self.stage_inputs.setdefault(stage, []).append(data)
+        if stage == "industry_rules":
+            return {"industry": "industrial lighting", "industry_confidence": 0.9, "industry_basis": "inferred", "audience_language": "clear American English", "tone_rules": ["practical"], "structure_rules": [], "terminology_rules": [], "evidence_policy": {"risk_level": "elevated", "preferred_sources": [], "high_risk_claims": [], "required_disclosures": []}, "content_patterns": [], "prohibited_claims": [], "conversion_rules": [], "localization_rules": []}
         if stage == "competitor_relevance":
             return {"items": [{"url": page["url"], "decision": "reject" if page["url"] in self.reject_urls else "accept", "reason": "Different search intent." if page["url"] in self.reject_urls else "Same buyer decision.", "learning_focus": ["heading hierarchy"]} for page in data["pages"]]}
         if stage == "competitor_analysis":
@@ -43,6 +45,16 @@ class FakeLearningGenerator:
                 {"heading": "Maintenance and lifecycle planning", "reader_question": "What happens after purchase?", "purpose": "Cover the competitor gap", "key_points": ["Plan maintenance"], "source_ids": [source_ids[min(1, len(source_ids) - 1)]], "format": "list"},
                 {"heading": "Frequently asked questions", "reader_question": "What else do buyers ask?", "purpose": "Answer FAQs", "key_points": ["Answer common questions"], "source_ids": [source_ids[min(2, len(source_ids) - 1)]], "format": "paragraphs"},
             ], "faq_heading": "Frequently asked questions"}
+        if stage == "title":
+            return {"candidates": [], "selected_title": data["title_snapshot"], "slug": "fixture", "meta_description": "Fixture metadata.", "selection_reason": "The approved title remains canonical."}
+        if stage == "outline":
+            suggestions = data.get("competitor_learning", {}).get("dynamic_outline", [])
+            return {"intro_brief": "Answer directly.", "sections": suggestions, "conclusion_brief": "Summarize the decision.", "cta_placement": "after conclusion"}
+        if stage == "full_article":
+            headings = [section["heading"] for section in data["outline"]["sections"]]
+            markdown = "# " + data["metadata"]["selected_title"] + "\n\n**industrial led flood lights** help buyers compare the relevant decision factors.\n\n"
+            markdown += "\n\n".join(f"## {heading}\n\nOriginal, source-bounded guidance." for heading in headings)
+            return {"title": data["metadata"]["selected_title"], "meta_description": "Original competitor-informed guide.", "markdown": markdown, "sources_used": ["competitor-1"], "claims_used": [], "verify": []}
         if stage == "chapter_plan":
             return {"section_id": data["current_section"]["id"], "writing_goal": "Deepen this buyer decision.", "subtopics": [{"reader_question": data["current_section"].get("reader_question", ""), "points": data["current_section"].get("key_points", []), "source_ids": data["current_section"].get("source_ids", [])}], "must_include": data["current_section"].get("key_points", []), "must_avoid_repeating": ["other chapters"], "format": data["current_section"].get("format", "paragraphs")}
         if stage == "section":
@@ -138,13 +150,9 @@ class CompetitorContentLearningApiTests(unittest.TestCase):
         self.assertEqual("openai", body["generation_job"]["provider"])  # type: ignore[index]
         self.assertIn("competitor_analysis", self.generator.stages)
         self.assertIn("competitor_relevance", self.generator.stages)
-        self.assertEqual(3, self.generator.stages.count("chapter_plan"))
-        self.assertEqual(3, self.generator.stages.count("section"))
+        self.assertEqual(1, self.generator.stages.count("full_article"))
         self.assertNotIn("[competitor-", body["draft"]["markdown"])  # type: ignore[index]
-        self.assertEqual(
-            [["competitor-1"], ["competitor-2"], ["competitor-3"]],
-            [[source["source_id"] for source in item["sources"]] for item in self.generator.stage_inputs["section"]],
-        )
+        self.assertEqual(["competitor-1", "competitor-2", "competitor-3"], [source["source_id"] for source in self.generator.stage_inputs["full_article"][-1]["sources"]])
         _, memory = self.request("GET", f"/api/content-memory?project_id={project_id}")
         self.assertEqual(5, len(memory))  # type: ignore[arg-type]
 

@@ -295,4 +295,9 @@ button,.actions a { min-height:38px; border-color:var(--line-strong); border-rad
 .markdown-preview .task-list-item{display:grid;grid-template-columns:18px minmax(0,1fr);gap:9px;align-items:start;padding-left:0}
 .markdown-preview .task-list-item input{width:16px;height:16px;margin:.34em 0 0;accent-color:#087d73;opacity:1}
 .markdown-preview .task-list-item span{min-width:0}
+.markdown-preview a{color:#087d73;font-weight:700;text-decoration:underline;text-decoration-thickness:1.5px;text-underline-offset:2px}.markdown-preview a:hover{color:#045f57}
 @media(max-width:700px){.markdown-preview .markdown-table-scroll table{min-width:560px}.markdown-preview .markdown-table-scroll{margin-right:calc(var(--pad, 0px) * -1)}}
+
+/* Competitor-learning is retired: preserve legacy data in the backend, but
+   do not expose old research, collection, or recovery controls in content. */
+.competitor-research-card,.competitor-preview,.design-content-grid,.research-title-recovery,.content-editor-card[aria-label*="学习记忆"]{display:none!important}

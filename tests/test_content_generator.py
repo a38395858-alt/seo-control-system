@@ -15,7 +15,7 @@ SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
 if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
-from seo_control.application.content_generator import ContentGenerationProtocolError, OpenAICompatibleContentGenerator, PROMPT_VERSION  # noqa: E402
+from seo_control.application.content_generator import ContentGenerationProtocolError, OpenAICompatibleContentGenerator, PROMPT_VERSION, _stage_instruction  # noqa: E402
 from seo_control.web import KeywordDiscoveryRequestHandler  # noqa: E402
 
 
@@ -41,6 +41,25 @@ class ContentGeneratorTests(unittest.TestCase):
         self.assertEqual(10, KeywordDiscoveryRequestHandler._numbered_listicle_count(title))
         self.assertEqual(10, KeywordDiscoveryRequestHandler._numbered_listicle_count("10 个户外 LED 楼梯灯的创意"))
 
+    def test_yes_no_outline_uses_ai_selected_h2_count_and_no_answer_chapter(self) -> None:
+        title = "Can LED Strip Lights Be Used Outdoors? A Complete Guide"
+        constraints = KeywordDiscoveryRequestHandler._outline_editorial_constraints(title)
+        self.assertIn("Choose the H2 count", constraints["h2_count_rule"])
+        excessive = [{"heading": f"Decision {index}"} for index in range(6)]
+        self.assertIsNone(KeywordDiscoveryRequestHandler._outline_editorial_violation(title, excessive))
+        answer_heading = [{"heading": "The Quick Answer"}, {"heading": "Select the right product"}, {"heading": "Install it"}, {"heading": "Maintain it"}]
+        self.assertIn("separate answer H2", KeywordDiscoveryRequestHandler._outline_editorial_violation(title, answer_heading) or "")
+        unsupported_precision = [
+            {"heading": "Use it outdoors", "purpose": "Assess exposure.", "source_ids": ["competitor-1"], "key_points": ["Use IP65 for rain."]},
+            {"heading": "Choose it", "purpose": "Read the product information.", "source_ids": ["competitor-2"], "key_points": ["Compare the documented rating."]},
+            {"heading": "Install it", "purpose": "Follow the manual.", "source_ids": ["competitor-3"], "key_points": ["Use the supplied instructions."]},
+            {"heading": "Maintain it", "purpose": "Inspect it.", "source_ids": ["competitor-4"], "key_points": ["Check for visible damage."]},
+        ]
+        self.assertIn("unsupported precise claim", KeywordDiscoveryRequestHandler._outline_editorial_violation(title, unsupported_precision) or "")
+        cleaned = KeywordDiscoveryRequestHandler._remove_unverified_outline_precision(unsupported_precision)
+        self.assertEqual(["Compare the documented rating."], cleaned[1]["key_points"])
+        self.assertIsNone(KeywordDiscoveryRequestHandler._outline_editorial_violation(title, cleaned))
+
     def test_company_knowledge_is_assigned_to_only_relevant_h2s(self) -> None:
         assignments = KeywordDiscoveryRequestHandler._company_context_for_sections(
             article_text="Industrial LED flood light selection guide",
@@ -57,6 +76,53 @@ class ContentGeneratorTests(unittest.TestCase):
         assigned_ids = [source["source_id"] for values in assignments.values() for source in values]
         self.assertEqual(["company-knowledge-7"], assigned_ids)
         self.assertEqual([1], list(assignments))
+
+    def test_fallback_internal_link_plan_uses_only_a_supplied_unique_destination(self) -> None:
+        plan = KeywordDiscoveryRequestHandler._fallback_internal_link_plan(
+            [
+                {"source_id": "gsc-anchor-2", "source_type": "gsc_anchor", "title": "GSC internal-link anchor: solar step lights", "target_url": "https://example.test/solar-step-lights"},
+                {"source_id": "gsc-anchor-3", "source_type": "gsc_anchor", "title": "GSC internal-link anchor: concrete step lights", "target_url": "https://example.test/concrete-step-lights"},
+            ],
+            {"https://example.test/solar-step-lights"},
+        )
+        self.assertTrue(plan["use"])
+        self.assertEqual("concrete step lights", plan["anchor_text"])
+        self.assertEqual("https://example.test/concrete-step-lights", plan["target_url"])
+
+    def test_authority_reference_footer_requires_used_permitted_authority_sources(self) -> None:
+        markdown = KeywordDiscoveryRequestHandler._append_authority_reference_block(
+            "# Article\n\nA supported technical point.",
+            sources=[
+                {"source_id": "authority-doe", "source_type": "authority_source", "authority_level": "authoritative", "publisher": "U.S. Department of Energy", "title": "PV Maintenance Guide", "url": "https://energy.gov/pv-maintenance"},
+                {"source_id": "authority-wiki", "source_type": "authority_source", "authority_level": "supporting", "publisher": "Wikipedia", "title": "Unreviewed background", "url": "https://en.wikipedia.org/wiki/Test"},
+            ],
+            source_ids=["authority-doe", "authority-wiki"],
+        )
+        self.assertIn("## 权威参考与验证链接", markdown)
+        self.assertIn("**U.S. Department of Energy** – PV Maintenance Guide [链接](https://energy.gov/pv-maintenance)", markdown)
+        self.assertIn("备用验证方式：搜索完整标题", markdown)
+        self.assertNotIn("Wikipedia", markdown)
+
+    def test_authority_search_routes_maintenance_claims_to_relevant_institutions(self) -> None:
+        tasks = KeywordDiscoveryRequestHandler._authority_google_tasks(
+            "## How to Clean Solar Panels and Fixtures\n\n## Battery Checks\n\n## Inspect the Housing and IP Rating",
+            "Maintaining Solar Garden Lights",
+            "led garden lights outdoor solar",
+        )
+        queries = [task["query"] for task in tasks]
+        self.assertTrue(any("site:nrel.gov" in query for query in queries))
+        self.assertTrue(any("site:batteryuniversity.com" in query for query in queries))
+        self.assertTrue(any("site:iec.ch" in query for query in queries))
+
+    def test_authority_relevance_recognizes_supported_technical_equivalents(self) -> None:
+        relevant, _reason = KeywordDiscoveryRequestHandler._authority_source_relevance(
+            keyword="led garden lights outdoor solar",
+            article_title="Maintaining Solar Garden Lights",
+            section_heading="How to Clean Solar Panels and Fixtures",
+            source_title="Photovoltaic Soiling Research",
+            source_content="Photovoltaic soiling affects maintenance decisions for solar panels.",
+        )
+        self.assertTrue(relevant)
 
     def test_primary_keyword_emphasis_is_normalised_to_one_body_occurrence(self) -> None:
         markdown = "# How Does an Automatic LED Stair Light Controller Work?\n\nAn **automatic LED stair light controller** coordinates the system.\n\n## Components\n\nAn **automatic LED stair light controller** evaluates inputs."
@@ -108,6 +174,14 @@ class ContentGeneratorTests(unittest.TestCase):
         self.assertLessEqual(sum(len(item["content"]) for item in compacted), 24_000)
         self.assertLessEqual(len(compacted[0]["content"]), 6_002)
         self.assertLessEqual(len(compacted[1]["content"]), 2_502)
+
+    def test_full_article_prompt_requires_focus_and_us_reader_conventions(self) -> None:
+        instruction = _stage_instruction("full_article")
+
+        self.assertIn("not an encyclopedia", instruction)
+        self.assertIn("country_code is US", instruction)
+        self.assertIn("American English", instruction)
+        self.assertIn("U.S. customary units first", instruction)
 
     def test_transient_network_error_is_retried_before_success(self) -> None:
         generator = OpenAICompatibleContentGenerator("test-key", "https://example.test/v1", "gpt-test", provider="openai")
@@ -162,10 +236,24 @@ class ContentGeneratorTests(unittest.TestCase):
         self.assertIn("source IDs", contract["instruction"])
         self.assertIn("reader-facing Source or Verification column", contract["instruction"])
         self.assertIn("sections", contract["output_schema"])
-        self.assertEqual("people_first_full_article_v21", PROMPT_VERSION)
+        self.assertEqual("people_first_full_article_v26", PROMPT_VERSION)
         self.assertIn("company_knowledge", contract["instruction"])
         self.assertIn("exact public product/company URL", contract["instruction"])
         self.assertIn("company_context_plan", contract["output_schema"])
+
+    def test_deepseek_request_enables_high_effort_thinking_without_temperature(self) -> None:
+        generator = OpenAICompatibleContentGenerator("test-key", "https://api.deepseek.com", "deepseek-v4-flash", provider="deepseek")
+        response = MagicMock()
+        response.read.return_value = json.dumps({"choices": [{"message": {"content": '{"tags":["Stair Lighting"]}'}}]}).encode("utf-8")
+        context = MagicMock(); context.__enter__.return_value = response; context.__exit__.return_value = False
+        with patch("seo_control.application.content_generator.urlopen", return_value=context) as request_mock:
+            generator.run_stage(stage="content_tags", data={})
+
+        request = request_mock.call_args.args[0]
+        payload = json.loads(request.data.decode("utf-8"))
+        self.assertEqual({"type": "enabled"}, payload["thinking"])
+        self.assertEqual("high", payload["reasoning_effort"])
+        self.assertNotIn("temperature", payload)
 
     def test_stage_request_accepts_a_json_object_wrapped_in_a_markdown_fence(self) -> None:
         generator = OpenAICompatibleContentGenerator("test-key", "https://example.test/v1", "gemini-test", provider="gemini")

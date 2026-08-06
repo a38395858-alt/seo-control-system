@@ -89,11 +89,10 @@ class ContentSystemWebTests(unittest.TestCase):
             self.assertIn(value, self.app)
         self.assertIn(".content-reader-actions", self.styles)
 
-    def test_content_reader_has_an_article_scoped_authority_reference_footer(self) -> None:
-        self.assertIn("ArticleAuthorityReferences", self.app)
-        self.assertIn("authority_sources", self.app)
-        self.assertIn("权威来源与验证依据", self.app)
-        self.assertIn(".article-authority-references", self.styles)
+    def test_content_reader_omits_the_authority_reference_footer(self) -> None:
+        self.assertNotIn("ArticleAuthorityReferences", self.app)
+        self.assertNotIn("AuthoritySearchCandidates", self.app)
+        self.assertNotIn("寻找参考资料", self.app)
 
     def test_content_library_supports_selective_and_bulk_asset_deletion(self) -> None:
         source = self.app + (ROOT / "frontend" / "src" / "api.ts").read_text(encoding="utf-8")

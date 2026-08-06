@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState, type FormEvent } from "react";
 import { BrowserRouter, NavLink, Navigate, Route, Routes, useLocation, useNavigate, useParams } from "react-router-dom";
 import { AgentPlatformConsole } from "./AgentPlatformConsole";
 import { api } from "./api";
-import type { AgentJob, ArticleAuthoritySource, AuthoritySearchResult, AuthoritySource, CollectedCompetitorContentLearningRun, CollectionPlan, CompetitorCatalogCollectionRun, CompetitorLearningDashboard, CompetitorOutlinePreview, CompetitorResearchPreview, CompetitorUrlArchiveItem, CompetitorUrlCatalogItem, ContentAsset, ContentAssetDetail, ContentBrief, ContentDraft, ContentEffectiveness, ContentGenerationResult, ContentLearningMemory, ContentLearningMemoryDetail, ContentMemoryItem, ContentOutline, ContentPromptPreview, ExpansionResult, LibraryKeyword, Review, Score, SerpTitle, SystemTask, TitleCandidate, WordPressPublication } from "./types";
+import type { AgentJob, AuthoritySource, CollectedCompetitorContentLearningRun, CollectionPlan, CompetitorCatalogCollectionRun, CompetitorLearningDashboard, CompetitorOutlinePreview, CompetitorResearchPreview, CompetitorUrlArchiveItem, CompetitorUrlCatalogItem, ContentAsset, ContentAssetDetail, ContentBrief, ContentDraft, ContentEffectiveness, ContentGenerationResult, ContentLearningMemory, ContentLearningMemoryDetail, ContentMemoryItem, ContentOutline, ContentPromptPreview, ExpansionResult, LibraryKeyword, Review, Score, SerpTitle, SystemTask, TitleCandidate, WordPressPublication } from "./types";
 
 type RunState = { seeds: string[]; language: string; country: string; result: ExpansionResult } | null;
 type ScoreInputs = Record<"keyword" | "volume" | "authority" | "domains" | "titleMatch" | "authoritySites" | "intent" | "relevance" | "businessValue", string>;
@@ -25,19 +25,7 @@ async function requestApprovedWordPressPublish(assetId: number, projectId: numbe
   }
   if (prepared.status !== "ready") throw new Error(prepared.report.issues.map((issue) => issue.message).join("；") || "发布门禁未通过。");
   if (typeof prepared.approval_id !== "number") throw new Error("发布审批请求未创建。");
-  const passedChecks = prepared.report.checks.filter((check) => check.passed).length;
-  const confirmation = status === "publish"
-    ? `发布门禁 ${passedChecks}/${prepared.report.checks.length} 项通过。\n\n确认公开发布到网站吗？文章会立即对外可见。`
-    : `发布门禁 ${passedChecks}/${prepared.report.checks.length} 项通过。\n\n确认创建 WordPress 草稿吗？草稿不会对外公开。`;
-  if (!window.confirm(confirmation)) {
-    try {
-      await api.decideAgentApproval(prepared.approval_id, { project_id: projectId, decision: "rejected", decided_by: "user" });
-    } catch {
-      // The durable request may already have been handled from another page.
-    }
-    throw new Error("已取消发布确认。");
-  }
-  await api.decideAgentApproval(prepared.approval_id, { project_id: projectId, decision: "approved", decided_by: "user" });
+  await api.decideAgentApproval(prepared.approval_id, { project_id: projectId, decision: "approved", decided_by: "direct_publish" });
   return api.publishWordPress(assetId, { project_id: projectId, status, approval_id: prepared.approval_id });
 }
 function RecentTitleLibrary({ titles }: { titles: TitleCandidate[] }) { return <section className="recent-title-library"><div><strong>最近入库标题</strong><p>每次生成完成后会自动写入标题库，不会因为刷新或切换页面而丢失。</p></div><NavLink className="primary" to="/title-library">打开标题库（{titles.length} 条）</NavLink>{titles.length ? <div className="recent-title-list">{titles.slice(0, 5).map((title) => <article key={title.id}><ProviderBadge reason={title.reason} /><strong>{title.title}</strong><span>{title.keyword || "—"}</span></article>)}</div> : <p className="empty">暂时还没有标题。生成后会自动写入标题库。</p>}</section>; }
@@ -131,11 +119,10 @@ function readerMarkdown(markdown: string) {
   // moved to the internal publication gate.
   return markdown.replace(/\s*\[(?:verify|verification)(?:\s*:\s*[^\]]*)?\]/gi, "").replace(/\n{3,}/g, "\n\n").trim();
 }
-function downloadArticleHtml(draft: ContentDraft, authoritySources: ArticleAuthoritySource[] = [], sectionImages: import("./types").SectionImage[] = []) {
+function downloadArticleHtml(draft: ContentDraft, sectionImages: import("./types").SectionImage[] = []) {
   const title = draft.title || "SEO Article";
   const markdown = readerMarkdown(draft.markdown);
-  const references = authoritySources.length ? `<section class="references"><h2>References</h2><ol>${authoritySources.map((source) => `<li>${source.url ? `<a href="${escapeHtml(source.url)}" rel="nofollow noopener noreferrer" target="_blank">${escapeHtml(source.title)}</a>` : escapeHtml(source.title)}${source.publisher ? ` — ${escapeHtml(source.publisher)}` : ""}${source.claim_topic ? `<br><small>Related topic: ${escapeHtml(source.claim_topic)}</small>` : ""}</li>`).join("")}</ol></section>` : "";
-  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="${escapeHtml(draft.meta_description || "")}"><title>${escapeHtml(title)}</title><style>body{margin:0;background:#f4f7fb;color:#33435e;font-family:"Segoe UI Variable","PingFang SC",Arial,sans-serif;line-height:1.82}.article{max-width:790px;margin:40px auto;padding:42px;background:#fff;border:1px solid #e2e8f1;border-radius:18px}.eyebrow{color:#7089c6;font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase}.article h1,.article h2,.article h3{color:#243e6b;line-height:1.25}.article h1{font-size:2.5rem;letter-spacing:-.04em}.article h2{margin-top:2.1em;font-size:1.55rem}.article h3{margin-top:1.7em}.article figure{margin:1.5em 0}.article figure img{width:100%;border-radius:12px}.article figcaption{display:flex;align-items:flex-start;gap:7px;padding-top:8px;font-size:.85rem;color:#647591;line-height:1.45}.article-image-caption-label{display:inline-block;flex:0 0 auto;padding:2px 6px;border-radius:999px;background:#e2f2ee;color:#176b5a;font-size:10px;font-weight:750;line-height:1.35;white-space:nowrap}.markdown-table-scroll{width:100%;margin:1.6em 0;overflow-x:auto;border:1px solid #dce4ef;border-radius:10px}.article table{width:100%;min-width:640px;border-collapse:collapse;margin:0}.article th,.article td{padding:10px 12px;border:1px solid #dce4ef;text-align:left;vertical-align:top}.article th{background:#eff3ff}.article li{margin:.35em 0}.task-list{display:grid;gap:.58em;padding-left:0;list-style:none}.task-list-item{display:grid;grid-template-columns:18px minmax(0,1fr);gap:9px;align-items:start}.task-list-item input{width:16px;height:16px;margin:.34em 0 0;accent-color:#087d73;opacity:1}.references{margin-top:3em;padding-top:1.5em;border-top:2px solid #dce4ef}.references small{color:#647591}@media(max-width:700px){.article{margin:0;border:0;border-radius:0;padding:24px}.article h1{font-size:2rem}.article table{min-width:560px}}</style></head><body><main class="article"><p class="eyebrow">${escapeHtml(draft.provider || "AI")} · v${draft.version}</p><h1>${escapeHtml(title)}</h1>${draft.meta_description ? `<p>${escapeHtml(draft.meta_description)}</p>` : ""}<hr>${renderMarkdownPreview(markdown, sectionImages, title)}${references}</main></body></html>`;
+  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="description" content="${escapeHtml(draft.meta_description || "")}"><title>${escapeHtml(title)}</title><style>body{margin:0;background:#f4f7fb;color:#33435e;font-family:"Segoe UI Variable","PingFang SC",Arial,sans-serif;line-height:1.82}.article{max-width:790px;margin:40px auto;padding:42px;background:#fff;border:1px solid #e2e8f1;border-radius:18px}.eyebrow{color:#7089c6;font-size:12px;font-weight:800;letter-spacing:.08em;text-transform:uppercase}.article h1,.article h2,.article h3{color:#243e6b;line-height:1.25}.article h1{font-size:2.5rem;letter-spacing:-.04em}.article h2{margin-top:2.1em;font-size:1.55rem}.article h3{margin-top:1.7em}.article figure{margin:1.5em 0}.article figure img{width:100%;border-radius:12px}.article figcaption{display:flex;align-items:flex-start;gap:7px;padding-top:8px;font-size:.85rem;color:#647591;line-height:1.45}.article-image-caption-label{display:inline-block;flex:0 0 auto;padding:2px 6px;border-radius:999px;background:#e2f2ee;color:#176b5a;font-size:10px;font-weight:750;line-height:1.35;white-space:nowrap}.markdown-table-scroll{width:100%;margin:1.6em 0;overflow-x:auto;border:1px solid #dce4ef;border-radius:10px}.article table{width:100%;min-width:640px;border-collapse:collapse;margin:0}.article th,.article td{padding:10px 12px;border:1px solid #dce4ef;text-align:left;vertical-align:top}.article th{background:#eff3ff}.article li{margin:.35em 0}@media(max-width:700px){.article{margin:0;border:0;border-radius:0;padding:24px}.article h1{font-size:2rem}.article table{min-width:560px}}</style></head><body><main class="article"><p class="eyebrow">${escapeHtml(draft.provider || "AI")} · v${draft.version}</p><h1>${escapeHtml(title)}</h1>${draft.meta_description ? `<p>${escapeHtml(draft.meta_description)}</p>` : ""}<hr>${renderMarkdownPreview(markdown, sectionImages, title)}</main></body></html>`;
   const blob = new Blob([html], { type: "text/html;charset=utf-8" }); const url = URL.createObjectURL(blob); const link = document.createElement("a");
   link.href = url; link.download = `${title.replace(/[<>:"/\\|?*\x00-\x1F]/g, "-").slice(0, 100) || "article"}.html`; document.body.appendChild(link); link.click(); link.remove(); URL.revokeObjectURL(url);
 }
@@ -156,13 +143,6 @@ function AuthoritySourceLibrary({ projectId }: { projectId: number | null }) {
   };
   if (!projectId) return <p className="empty">请先选择网站项目。</p>;
   return <section className="authority-library"><PanelTitle eyebrow="Authority Source Library" title="权威来源库" tag={`${items.length} 条长期记忆`} /><p className="hint">保存官网规格书、标准、认证、政府资料或行业研究。AI 会分析可信度、标签和可支持的主题；后续一键生成内容会优先读取当前网站的这些资料。</p><div className="authority-source-form"><Input label="来源标题" value={title} onChange={setTitle} /><Select label="来源类型" value={sourceType} onChange={(value) => setSourceType(value as AuthoritySource["source_type"])} options={[["first_party", "第一方规格书 / 报告"], ["standard", "标准 / 规范"], ["certification", "认证 / 检测"], ["government", "政府 / 监管"], ["industry_research", "行业研究"]]} /><Input label="权威 URL（可选）" value={url} onChange={setUrl} /><Input label="发布者（可选）" value={publisher} onChange={setPublisher} /><label>来源正文 / 摘录<textarea value={content} onChange={(event) => setContent(event.target.value)} placeholder="粘贴规格书、证书内容、官方说明或权威研究正文。AI 将分类入库，不会伪造来源。" /></label><button className="primary" disabled={saving || !title.trim() || !content.trim()} onClick={() => void save()}>{saving ? "AI 归类中…" : "AI 归类并长期入库"}</button></div><p className="tag">{notice}</p><div className="authority-source-grid">{items.map((item) => <article key={item.id}><div><span className={`authority-level ${item.authority_level}`}>{item.authority_level}</span><span>{item.source_type}</span></div><h3>{item.title}</h3><p>{item.summary || "尚未生成摘要。"}</p><small>{item.publisher || "未标注发布者"}{item.url ? ` · ${item.url}` : ""}</small>{item.tags.length ? <div className="authority-tags">{item.tags.map((tag) => <i key={tag}>{tag}</i>)}</div> : null}<button className="link danger" onClick={() => void remove(item.id)}>删除</button></article>)}</div>{items.length ? null : <p className="empty">还没有来源。先把产品规格书、认证或权威标准资料粘贴进来。</p>}</section>;
-}
-function ArticleAuthorityReferences({ sources }: { sources: ArticleAuthoritySource[] }) {
-  return <section className="article-authority-references"><p className="eyebrow">References</p><h2>参考资料</h2>{sources.length ? <ol>{sources.map((source) => <li key={source.id}><div><span className={`authority-level ${source.authority_level}`}>{source.authority_level}</span>{source.url ? <a href={source.url} target="_blank" rel="nofollow noopener noreferrer">{source.title}</a> : <strong>{source.title}</strong>}</div><p>{source.publisher || "公开来源"}{source.claim_topic ? ` · 相关主题：${source.claim_topic}` : ""}</p>{source.summary ? <small>{source.summary}</small> : null}</li>)}</ol> : <p className="empty">暂无可展示的参考资料。</p>}</section>;
-}
-function AuthoritySearchCandidates({ results }: { results: AuthoritySearchResult[] }) {
-  if (!results.length) return null;
-  return <section className="authority-search-candidates"><p className="eyebrow">Authority Search Audit</p><h2>本次权威来源候选页面</h2><p>Google 优先；可用 HTML 候选不足时自动补充 Bing。每条候选和跳过原因都会保留，PDF、表格与其他下载文件不会引用。</p><ol>{results.map((result) => { const searchUrl = `https://www.google.com/search?q=${encodeURIComponent(result.search_query)}`; return <li key={result.id} className={result.status}><span>{result.status === "accepted" ? "已引用" : result.status === "skipped" ? "已跳过" : result.status === "search_error" ? "搜索失败" : "待验证"}</span><div>{result.url ? <a href={result.url} target="_blank" rel="nofollow noopener noreferrer">{result.title || result.url}</a> : <a className="authority-search-query" href={searchUrl} target="_blank" rel="nofollow noopener noreferrer">{result.section_heading || "打开 Google 搜索"}</a>}<small>{result.url ? result.domain : "点击标题可打开本次 Google 搜索"}</small>{result.error_summary ? <p>原因：{result.error_summary}</p> : null}</div></li>; })}</ol></section>;
 }
 function GscIntegrationCard({ projectId }: { projectId: number | null }) {
   const [anchors, setAnchors] = useState<Array<{ query: string; page_url: string; clicks: number; impressions: number; position: number }>>([]);
@@ -216,7 +196,6 @@ function ContentReader({ projectId }: { projectId: number | null }) {
   const { assetId } = useParams();
   const [detail, setDetail] = useState<ContentAssetDetail | null>(null);
   const [readerError, setReaderError] = useState("");
-  const [researchingSources, setResearchingSources] = useState(false);
   const [generatingImages, setGeneratingImages] = useState(false);
   const [publishing, setPublishing] = useState(false);
   const [publishMode, setPublishMode] = useState<"draft" | "publish">("draft");
@@ -226,19 +205,7 @@ function ContentReader({ projectId }: { projectId: number | null }) {
   if (readerError) return <p className="empty">{readerError}</p>;
   if (!detail?.current_draft) return <p className="empty">正在加载文章，或该内容尚未生成正文。</p>;
   const draft = detail.current_draft;
-  const wordCount = articleWordCount(draft.markdown); const characterCount = draft.markdown.replace(/\s/g, "").length; const authoritySources = detail.authority_sources || []; const authoritySearchResults = detail.authority_search_results || []; const sectionImages = detail.section_images || [];
-  const researchSources = async () => {
-    if (!projectId || !assetId || researchingSources) return;
-    setResearchingSources(true);
-    setSourceResearchNotice("正在整理可公开引用的参考资料。");
-    try {
-      const result = await api.researchAuthoritySources({ project_id: projectId, asset_id: Number(assetId), provider: "gemini" });
-      setSourceResearchNotice(`已整理 ${result.saved.length} 条可引用参考资料；跳过 ${result.skipped.length} 条不适合引用的页面。`);
-      setDetail(await api.getContentAsset(Number(assetId), projectId));
-    } catch (error) {
-      setSourceResearchNotice(`权威来源研究失败：${error instanceof Error ? error.message : "请稍后重试。"}`);
-    } finally { setResearchingSources(false); }
-  };
+  const wordCount = articleWordCount(draft.markdown); const characterCount = draft.markdown.replace(/\s/g, "").length; const sectionImages = detail.section_images || [];
   const generateAllImages = async () => { if (!projectId || !assetId || generatingImages) return; setGeneratingImages(true); setSourceResearchNotice("正在为全部 H2 生成配图、SEO 文件名和 alt 标签…"); try { const result = await api.generateAllSectionImages(Number(assetId), projectId); setDetail(await api.getContentAsset(Number(assetId), projectId)); window.dispatchEvent(new Event("section-images-updated")); setSourceResearchNotice(`已生成 ${result.generated.length} 张 H2 配图并自动插入正文；${result.failed.length ? `${result.failed.length} 张失败，可在下方配图区单独重试。` : ""}`); } catch (error) { setSourceResearchNotice(`配图生成失败：${error instanceof Error ? error.message : "请稍后重试。"}`); } finally { setGeneratingImages(false); } };
   const publishToWordPress = async () => {
     if (!projectId || !assetId || publishing) return;
@@ -256,10 +223,18 @@ function ContentReader({ projectId }: { projectId: number | null }) {
     }
   };
   const latestPublication = publication || detail.wordpress_publications?.[0] || null;
-  return <article className="content-reader"><header className="content-reader-header"><NavLink to="/content-library">← 返回所有内容</NavLink><div className="content-reader-actions"><span title="按英文单词规则统计正文">{wordCount.toLocaleString()} words · {characterCount.toLocaleString()} chars</span><select aria-label="选择发布方式" value={publishMode} onChange={(event) => setPublishMode(event.target.value as "draft" | "publish")}><option value="draft">创建 WordPress 草稿</option><option value="publish">公开发布（需人工确认）</option></select><button type="button" className="primary" disabled={publishing} onClick={() => void publishToWordPress()}>{publishing ? "正在执行…" : "检查并申请发布"}</button><button type="button" disabled={researchingSources} onClick={() => void researchSources()}>{researchingSources ? "正在整理参考资料…" : "寻找参考资料"}</button><button type="button" className="primary" disabled={generatingImages} onClick={() => void generateAllImages()}>{generatingImages ? "正在一键配图…" : "一键生成全文配图"}</button><button type="button" onClick={() => downloadArticleHtml(draft, authoritySources, sectionImages)}>下载 HTML</button></div>{sourceResearchNotice ? <p className="source-research-notice" role="status">{sourceResearchNotice}</p> : null}{latestPublication ? <div className={`wordpress-publication-banner ${latestPublication.status}`} role="status"><strong>{latestPublication.status === "publish" ? "发布成功" : "草稿已创建"}</strong><span>WordPress 文章 #{latestPublication.wordpress_post_id}</span>{latestPublication.wordpress_url ? <a href={latestPublication.wordpress_url} target="_blank" rel="noreferrer">{latestPublication.status === "publish" ? "打开已发布页面 ↗" : "打开草稿编辑页 ↗"}</a> : null}</div> : null}<AuthoritySearchCandidates results={authoritySearchResults} /><p className="eyebrow">{draft.provider || "AI"} · v{draft.version} · {draft.qa_status}</p><h1>{draft.title}</h1>{detail.tags?.length ? <div className="content-asset-tags content-reader-tags" aria-label="内容标签">{detail.tags.map((tag) => <span key={tag}>{tag}</span>)}</div> : null}<p className="content-reader-description">{draft.meta_description}</p></header><article className="markdown-preview" dangerouslySetInnerHTML={{ __html: renderMarkdownPreview(draft.markdown, sectionImages, draft.title) }} /><ArticleAuthorityReferences sources={authoritySources} /></article>;
+  return <article className="content-reader"><header className="content-reader-header"><NavLink to="/content-library">← 返回所有内容</NavLink><div className="content-reader-actions"><span title="按英文单词规则统计正文">{wordCount.toLocaleString()} words · {characterCount.toLocaleString()} chars</span><select aria-label="选择发布方式" value={publishMode} onChange={(event) => setPublishMode(event.target.value as "draft" | "publish")}><option value="draft">创建 WordPress 草稿</option><option value="publish">公开发布</option></select><button type="button" className="primary" disabled={publishing} onClick={() => void publishToWordPress()}>{publishing ? "正在发布…" : publishMode === "publish" ? "直接发布" : "直接创建草稿"}</button><button type="button" className="primary" disabled={generatingImages} onClick={() => void generateAllImages()}>{generatingImages ? "正在一键配图…" : "一键生成全文配图"}</button><button type="button" onClick={() => downloadArticleHtml(draft, sectionImages)}>下载 HTML</button></div>{sourceResearchNotice ? <p className="source-research-notice" role="status">{sourceResearchNotice}</p> : null}{latestPublication ? <div className={`wordpress-publication-banner ${latestPublication.status}`} role="status"><strong>{latestPublication.status === "publish" ? "发布成功" : "草稿已创建"}</strong><span>WordPress 文章 #{latestPublication.wordpress_post_id}</span>{latestPublication.wordpress_url ? <a href={latestPublication.wordpress_url} target="_blank" rel="noreferrer">{latestPublication.status === "publish" ? "打开已发布页面 ↗" : "打开草稿编辑页 ↗"}</a> : null}</div> : null}<p className="eyebrow">{draft.provider || "AI"} · v{draft.version} · {draft.qa_status}</p><h1>{draft.title}</h1>{detail.tags?.length ? <div className="content-asset-tags content-reader-tags" aria-label="内容标签">{detail.tags.map((tag) => <span key={tag}>{tag}</span>)}</div> : null}<p className="content-reader-description">{draft.meta_description}</p></header><article className="markdown-preview" dangerouslySetInnerHTML={{ __html: renderMarkdownPreview(draft.markdown, sectionImages, draft.title) }} /></article>;
 }
 function escapeHtml(value: string) { return value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\"/g, "&quot;").replace(/'/g, "&#39;"); }
-function renderInlineMarkdown(value: string) { return escapeHtml(value).replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>").replace(/__(.+?)__/g, "<strong>$1</strong>"); }
+function renderInlineMarkdown(value: string) {
+  // Escape first, then selectively restore only standard http(s) Markdown
+  // links. This keeps article HTML safe while turning planned internal links
+  // into visible, clickable natural-language anchors.
+  return escapeHtml(value)
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/gi, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+    .replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>")
+    .replace(/__(.+?)__/g, "<strong>$1</strong>");
+}
 function tableCells(line: string) {
   const value = line.trim().replace(/^\|/, "").replace(/\|$/, ""); const cells: string[] = []; let cell = "";
   for (let index = 0; index < value.length; index += 1) {
@@ -299,8 +274,7 @@ function renderSafeHtmlTableBlock(block: string) {
 function renderChecklistItem(value: string) {
   const task = value.match(/^\[([ xX])\]\s+(.+)$/);
   if (!task) return `<li>${renderInlineMarkdown(value)}</li>`;
-  const checked = task[1].toLowerCase() === "x";
-  return `<li class="task-list-item"><input type="checkbox" disabled${checked ? " checked" : ""} aria-label="${checked ? "Completed" : "Pending"} checklist item"><span>${renderInlineMarkdown(task[2])}</span></li>`;
+  return `<li>${renderInlineMarkdown(task[2])}</li>`;
 }
 function renderMarkdownPreview(markdown: string, sectionImages: import("./types").SectionImage[] = [], articleTitle = "") {
   const lines = readerMarkdown(markdown).replace(/\r\n?/g, "\n").split("\n");
@@ -327,6 +301,7 @@ function renderMarkdownPreview(markdown: string, sectionImages: import("./types"
     }
     if (isList(line)) {
       const ordered = /^\d+[.)]\s+/.test(line); const pattern = ordered ? /^\d+[.)]\s+/ : /^[-*+]\s+/; const items: string[] = [];
+      const checklist = !ordered && /^[-*+]\s+\[[ xX]\]\s+/.test(line);
       const firstNumber = ordered ? Number(line.match(/^(\d+)/)?.[1] || "1") : 1;
       while (index < lines.length) {
         const item = lines[index].trim();
@@ -338,8 +313,8 @@ function renderMarkdownPreview(markdown: string, sectionImages: import("./types"
         if (next < lines.length && pattern.test(lines[next].trim())) { index = next; continue; }
         index = next; break;
       }
-      const listClass = !ordered && items.some((item) => item.includes("task-list-item")) ? ' class="task-list"' : "";
-      output.push(ordered ? `<ol${firstNumber !== 1 ? ` start="${firstNumber}"` : ""}>${items.join("")}</ol>` : `<ul${listClass}>${items.join("")}</ul>`); continue;
+      const tag = ordered || checklist ? "ol" : "ul";
+      output.push(`<${tag}${tag === "ol" && firstNumber !== 1 ? ` start="${firstNumber}"` : ""}>${items.join("")}</${tag}>`); continue;
     }
     const paragraph: string[] = [line]; index += 1;
     while (index < lines.length && lines[index].trim() && !isBlockStart(index)) { paragraph.push(lines[index].trim()); index += 1; }
@@ -875,10 +850,6 @@ function ContentWorkspace({ titles, assets, projectId, onCreate, onRefresh, onDe
 
   const saveOutline = async () => {
     if (!detail || !projectId) return;
-    if (!detail.production_readiness?.can_generate_outline) {
-      setNotice(detail.production_readiness?.blocked_reason || "请先采集并学习同行文章，再生成文章大纲。");
-      return;
-    }
     const sections = outlineRows.filter((row) => row.heading.trim()).map((row) => ({ heading: row.heading, purpose: row.purpose }));
     if (!sections.length) { setNotice("至少保留一个大纲章节。"); return; }
     setSaving(true);
@@ -955,10 +926,6 @@ function ContentWorkspace({ titles, assets, projectId, onCreate, onRefresh, onDe
     // It is therefore safe to test while the durable Agent writes the real
     // article in the background.
     if (!detail || !projectId || saving || agentStarting) return;
-    if (!detail.production_readiness?.can_generate_outline) {
-      setNotice(detail.production_readiness?.blocked_reason || "请先完成同行采集与学习，再测试内容。");
-      return;
-    }
     setSaving(true);
     setNotice("正在生成测试内容：仅输出一个 H2 示例，不会保存、覆盖正文或写入内容库。");
     try {
@@ -1015,6 +982,9 @@ function ContentWorkspace({ titles, assets, projectId, onCreate, onRefresh, onDe
 
   const generationPayload = () => ({
     project_id: projectId,
+    // Content production is keyword-first. Competitor research remains an
+    // optional, separate research tool and never blocks article generation.
+    use_competitor_learning: false,
     ...(contentProvider === "auto_collaborate" ? { routing_mode: "auto_collaborate" } : { provider: contentProvider }),
     model: contentModel.trim() || undefined,
     reviewer_provider: reviewerProvider === "follow_writer" ? undefined : reviewerProvider,
@@ -1026,8 +996,8 @@ function ContentWorkspace({ titles, assets, projectId, onCreate, onRefresh, onDe
   const createAgentJob = async (asset: ContentAssetDetail | null = detail) => {
     if (!asset || !projectId || agentStarting) return;
     setAgentStarting(true);
-    setNotice("正在启动自主内容 Agent：先学习同行内容并生成大纲，随后自动批量写完全部 H2 和正文。");
-    addProductionLog({ status: "running", label: "内容 Agent", message: "同行学习完成，正在创建可恢复的内容生产任务。" });
+    setNotice("正在启动自主内容 Agent：先读取关键词、本站 GSC 与产品资料，再生成大纲和整篇正文。");
+    addProductionLog({ status: "running", label: "内容 Agent", message: "正在创建可恢复的关键词优先内容生产任务。" });
     const writerProvider: AiProvider = contentProvider === "auto_collaborate" ? "openai" : contentProvider;
     const activeReviewer: AiProvider = reviewerProvider === "follow_writer" ? writerProvider : reviewerProvider;
     try {
@@ -1035,6 +1005,7 @@ function ContentWorkspace({ titles, assets, projectId, onCreate, onRefresh, onDe
         project_id: projectId,
         content_asset_id: asset.id,
         requested_action: "full_content_agent",
+        use_competitor_learning: false,
         writer_provider: writerProvider,
         writer_model: contentModel.trim() || undefined,
         reviewer_provider: activeReviewer,
@@ -1055,12 +1026,6 @@ function ContentWorkspace({ titles, assets, projectId, onCreate, onRefresh, onDe
   };
   const runContentAgent = async () => {
     if (!detail || !projectId || agentStarting) return;
-    if (!detail.production_readiness?.can_generate_outline) {
-      setNotice("内容 Agent 将先执行同行采集和学习，完成后自动批量生成大纲与正文。");
-      addProductionLog({ status: "running", label: "内容 Agent", message: "已开始执行前置步骤：同行采集与学习。" });
-      await researchCompetitors(true);
-      return;
-    }
     await createAgentJob(detail);
   };
   const restartContentAgent = async () => {
@@ -1078,15 +1043,10 @@ function ContentWorkspace({ titles, assets, projectId, onCreate, onRefresh, onDe
       setOutlineRows([]);
       setProductionLog([]);
       await onRefresh();
-      setNotice("已清空当前生成状态，正在重新采集同行文章并学习写法。");
-      addProductionLog({ status: "running", label: "同行采集", message: "重新开始后，正在使用当前标题检索并采集同行文章。" });
-      await api.researchCompetitors(restarted.id, { project_id: projectId });
-      const refreshed = await api.getContentAsset(restarted.id, projectId);
-      setDetail(refreshed);
-      await onRefresh();
-      addProductionLog({ status: "completed", label: "同行学习", message: `已重新采集 ${refreshed.production_readiness?.collected_count || 0} 篇同行文章，开始创建新的内容 Agent。` });
+      setNotice("已清空当前生成状态，正在按关键词、本站 GSC 和产品资料重新建立内容任务。");
+      addProductionLog({ status: "running", label: "内容准备", message: "正在加载关键词、本站 GSC 信号与公司产品资料。" });
       setSaving(false);
-      await createAgentJob(refreshed);
+      await createAgentJob(restarted);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "清空当前生成状态失败，未启动新的 Agent。");
     } finally {
@@ -1135,10 +1095,6 @@ function ContentWorkspace({ titles, assets, projectId, onCreate, onRefresh, onDe
   const executionLabel = contentProvider === "auto_collaborate" ? "自动协作：DeepSeek 分析 / ChatGPT 写作" : `${contentProviderLabel(contentProvider)}（${contentModel || "默认模型"}）`;
   const runGenerationStage = async (stageName: Exclude<ContentPreviewAction, "agent">) => {
     if (!detail || !projectId) return;
-    if (["all", "outline", "draft"].includes(stageName) && !detail.production_readiness?.can_generate_outline) {
-      setNotice(detail.production_readiness?.blocked_reason || "请先采集并学习同行文章，再继续内容生成。");
-      return;
-    }
     if (agentGenerationLocked) {
       setNotice(agentJob?.status === "waiting_approval" ? "当前 Agent 已生成候选蓝图，请先批准或拒绝蓝图，再进行其他生成操作。" : "当前文章正由自主内容 Agent 处理，请等待任务完成或先在任务中心取消它。" );
       return;
@@ -1154,10 +1110,6 @@ function ContentWorkspace({ titles, assets, projectId, onCreate, onRefresh, onDe
   };
   const openPromptPreview = async (action: ContentPreviewAction) => {
     if (!detail || !projectId || promptPreviewLoading) return;
-  if (["all", "outline", "draft"].includes(action) && !detail.production_readiness?.can_generate_outline) {
-      setNotice(detail.production_readiness?.blocked_reason || "请先采集并学习同行文章，再继续内容生成。");
-      return;
-    }
     if (agentGenerationLocked) {
       setNotice("当前内容 Agent 仍在执行或等待蓝图审批；请完成、取消或处理当前任务后再发起新生成。");
       return;
@@ -1210,8 +1162,9 @@ function ContentWorkspace({ titles, assets, projectId, onCreate, onRefresh, onDe
   const displayedDraft = detail?.drafts?.find((draft) => draft.version === selectedDraftVersion) || detail?.current_draft;
   const stage = detail?.current_draft ? 3 : detail?.outline ? 2 : detail?.brief ? 1 : 1;
   const stages = ["内容 Brief", "文章大纲", "正文版本"];
+  // This only unlocks the optional competitor-based preview. It is not a
+  // prerequisite for normal article generation.
   const competitorLearningReady = Boolean(detail?.production_readiness?.can_generate_outline);
-  const competitorGateMessage = detail?.production_readiness?.blocked_reason || "请先采集并学习同行文章，再生成文章大纲。";
   const agentGenerationRuns = (detail?.generation_runs || []).filter((run) => run.generation_job_id && (detail?.generation_jobs || []).some((job) => job.id === run.generation_job_id && job.requested_action === "full_content_agent"));
   const completedAgentSections = agentGenerationRuns.filter((run) => run.stage === "section" && run.status === "completed").length;
   const runningAgentStage = agentGenerationRuns.find((run) => run.status === "running")?.stage;
@@ -1238,31 +1191,31 @@ function ContentWorkspace({ titles, assets, projectId, onCreate, onRefresh, onDe
         <header className="content-prompt-preview-header"><div><p>生成前确认 · {promptPreview.prompt_version}</p><h2 id="content-prompt-preview-title">本次内容提示词与资料边界</h2><span>确认后才会调用模型；取消不会生成内容或产生模型费用。</span></div><button type="button" className="link" onClick={() => { setPromptPreview(null); setPromptPreviewAction(null); }} aria-label="关闭提示词预览">关闭</button></header>
         <div className="content-prompt-preview-body">
           <section className="content-prompt-article-context" aria-label="本次写作任务"><div><small>标题</small><strong>{promptPreview.article.title}</strong></div><div><small>核心关键词</small><strong>{promptPreview.article.primary_keyword || "未设置"}</strong></div><div><small>受众 / 目标</small><strong>{promptPreview.article.target_audience} · {promptPreview.article.business_goal}</strong></div></section>
-          <section className="content-prompt-source-summary"><div><h3>本次资料如何参与写作</h3><p>资料按职责分开处理，不会把竞品、GSC 或网站资料混作同一种事实证据。</p></div><ul>{promptPreview.source_summary.map((group) => <li key={group.key}><div><strong>{group.label}</strong><span>{group.count} 项</span></div><p>{group.rule}</p>{group.examples.length ? <small>{group.examples.join(" · ")}</small> : <small>本次没有可用资料</small>}</li>)}</ul></section>
+          <section className="content-prompt-source-summary"><div><h3>本次资料如何参与写作</h3><p>资料按职责分开处理，GSC 信号、网站资料和手工补充资料不会混作同一种事实证据。</p></div><ul>{promptPreview.source_summary.map((group) => <li key={group.key}><div><strong>{group.label}</strong><span>{group.count} 项</span></div><p>{group.rule}</p>{group.examples.length ? <small>{group.examples.join(" · ")}</small> : <small>本次没有可用资料</small>}</li>)}</ul></section>
           {promptPreview.full_article_requirements?.sections.length ? <section className="content-prompt-requirements"><div><h3>本次全文生成规格</h3><p>下面的规格会连同资料和规则进入同一次正文提示词。相关词是自然覆盖下限，不是关键词堆砌要求。</p></div><dl className="content-prompt-overall"><div><dt>最低全文深度</dt><dd>约 {promptPreview.full_article_requirements.overall?.minimum_total_words || 0} 词 · {promptPreview.full_article_requirements.overall?.required_h2_count || 0} 个 H2</dd></div><div><dt>主关键词</dt><dd>仅在开头自然重点出现一次</dd></div></dl><ol>{promptPreview.full_article_requirements.sections.map((section, index) => <li key={`${section.heading}-${index}`}><div><span>{index + 1}</span><strong>{section.heading}</strong></div><p><b>相关词：</b>{section.keyword_requirements.supporting_terms.slice(0, section.keyword_requirements.minimum_supporting_terms).join(" · ") || "按章节主题自然覆盖"}</p><p><b>最低深度：</b>{section.depth_requirements.minimum_non_overlapping_subtopics} 个不重复要点，约 {section.depth_requirements.minimum_words} 词</p><small>{section.depth_requirements.required_practical_detail}</small></li>)}</ol></section> : null}
           <details className="content-prompt-full" open><summary>查看完整系统提示词与阶段规则 <span>{promptPreview.stages.length} 个阶段</span></summary><div><h3>系统写作规则</h3><pre>{promptPreview.system_prompt}</pre>{promptPreview.stages.map((stage) => <section key={stage.stage}><h4>{stage.stage}</h4><pre>{stage.instruction}</pre></section>)}</div></details>
         </div>
-        <footer className="content-prompt-preview-footer"><p>重点：GSC 仅用于搜索意图、内容缺口与内链；竞品仅用于学习结构和写法；产品与技术事实必须有对应资料支持。</p><div className="actions"><button type="button" onClick={() => { setPromptPreview(null); setPromptPreviewAction(null); }}>取消并返回修改</button><button type="button" className="primary" onClick={() => void confirmPromptPreview()}>确认并开始生成</button></div></footer>
+        <footer className="content-prompt-preview-footer"><p>重点：GSC 仅用于搜索意图、内容缺口与内链；产品与技术事实必须有对应资料支持。</p><div className="actions"><button type="button" onClick={() => { setPromptPreview(null); setPromptPreviewAction(null); }}>取消并返回修改</button><button type="button" className="primary" onClick={() => void confirmPromptPreview()}>确认并开始生成</button></div></footer>
       </section>
     </div> : null}
-    <div className="design-content-tabs" role="tablist" aria-label="内容生产页面导航"><button className="is-active" role="tab" aria-selected="true">内容任务</button><NavLink role="tab" to="/content-history">历史记录</NavLink><NavLink role="tab" to="/content-library">内容库</NavLink><NavLink role="tab" to="/content-memory">竞品学习记忆</NavLink><NavLink role="tab" to="/learning-memories">学习记忆与反馈</NavLink></div>
-    {detail ? <section className={`content-production-gate ${competitorLearningReady ? "is-ready" : ""}`} aria-live="polite">
-      <div><strong>{competitorLearningReady ? "同行学习已完成，可继续内容生产" : "内容 Agent 会先采集并学习同行文章"}</strong><p>{competitorLearningReady ? `已采集 ${detail.production_readiness?.collected_count || 0} 篇可读同行文章，并完成结构与写法分析；点击下方 Agent 按钮后将生成待你确认的文章蓝图。` : "点击下方“启动自主内容 Agent”后，系统会先完成同行采集、结构与写法学习，再自动进入文章蓝图审批。"}</p></div>
+    <div className="design-content-tabs" role="tablist" aria-label="内容生产页面导航"><button className="is-active" role="tab" aria-selected="true">内容任务</button><NavLink role="tab" to="/content-history">历史记录</NavLink><NavLink role="tab" to="/content-library">内容库</NavLink></div>
+    {detail ? <section className="content-production-gate is-ready" aria-live="polite">
+      <div><strong>关键词优先内容生产已就绪</strong><p>启动后会使用当前标题与关键词、本站 GSC 搜索信号及公司产品资料生成大纲和整篇文章；同行采集仅保留为独立测试工具，不参与默认生成。</p></div>
     </section> : null}
     {detail && <section className="design-content-dashboard" aria-label="当前文章任务">
-      <div className="design-workflow-card"><div className="design-workflow-heading"><div><h2>{detail.title_snapshot}</h2><small>本次路由：{executionLabel}</small></div><span className={saving || agentStarting ? "design-status is-running" : "design-status"}>{agentStarting ? "Agent 处理中" : saving ? "正在生成" : detail.current_draft ? "正文已生成" : detail.outline ? "大纲已生成" : "待生成"}</span></div><div className="design-workflow-steps"><div className={detail.competitor_research?.status === "completed" ? "is-done" : ""}><i>{detail.competitor_research?.status === "completed" ? "✓" : "1"}</i><b>竞品采集</b></div><div className={detail.competitor_research?.analysis ? "is-done" : ""}><i>{detail.competitor_research?.analysis ? "✓" : "2"}</i><b>竞品分析</b></div><div className={detail.outline ? "is-done" : "is-current"}><i>{detail.outline ? "✓" : "3"}</i><b>文章大纲与规格</b></div><div className={detail.current_draft ? "is-done" : ""}><i>{detail.current_draft ? "✓" : "4"}</i><b>整篇文章生成</b></div></div><div className="design-workflow-actions"><button className="primary" disabled={saving || agentStarting || agentGenerationLocked} onClick={() => void startContentAgent()}>{agentStarting ? "Agent 启动中…" : "重新开始自主内容 Agent"}</button><button disabled={saving || agentStarting || agentGenerationLocked} onClick={() => void generateStage("all")}>{saving ? "正在生成…" : "手动一键生成"}</button><button disabled={saving || agentStarting} onClick={() => document.getElementById("content-editor-area")?.scrollIntoView({ behavior: "smooth" })}>编辑大纲与资料</button></div></div>
-      <div className="design-test-actions"><div className="design-workflow-actions"><button disabled={saving || agentStarting} onClick={() => void previewCompetitors()}>{saving ? "测试中…" : "测试采集（不入库）"}</button><button disabled={!competitorPreview?.available_count || saving || agentStarting} onClick={() => void previewOutline()}>{saving ? "测试中…" : "测试大纲（不保存）"}</button><button disabled={saving || agentStarting || !competitorLearningReady} onClick={() => void previewContent()}>{saving ? "测试中…" : "测试内容（不保存）"}</button></div><p>{agentGenerationLocked ? "正文 Agent 正在后台持续写作；三个测试均不入库、不覆盖正文，可独立验证。" : competitorLearningReady ? "同行学习已完成：三个测试按钮都可按需使用。" : competitorPreview?.available_count ? `采集测试已找到 ${competitorPreview.available_count} 篇可读正文：现在可测试大纲；“测试内容”需在正式学习后开放。` : "测试顺序：先测试采集 → 获得可读正文后测试大纲 → 正式采集并学习后测试内容。"}</p></div>
+      <div className="design-workflow-card"><div className="design-workflow-heading"><div><h2>{detail.title_snapshot}</h2><small>本次路由：{executionLabel}</small></div><span className={saving || agentStarting ? "design-status is-running" : "design-status"}>{agentStarting ? "Agent 处理中" : saving ? "正在生成" : detail.current_draft ? "正文已生成" : detail.outline ? "大纲已生成" : "待生成"}</span></div><div className="design-workflow-steps"><div className="is-done"><i>✓</i><b>关键词与标题</b></div><div className="is-done"><i>✓</i><b>GSC 与产品资料</b></div><div className={detail.outline ? "is-done" : "is-current"}><i>{detail.outline ? "✓" : "3"}</i><b>文章大纲与规格</b></div><div className={detail.current_draft ? "is-done" : ""}><i>{detail.current_draft ? "✓" : "4"}</i><b>整篇文章生成</b></div></div><div className="design-workflow-actions"><button className="primary" disabled={saving || agentStarting || agentGenerationLocked} onClick={() => void startContentAgent()}>{agentStarting ? "Agent 启动中…" : "重新开始自主内容 Agent"}</button><button disabled={saving || agentStarting || agentGenerationLocked} onClick={() => void generateStage("all")}>{saving ? "正在生成…" : "手动一键生成"}</button><button disabled={saving || agentStarting} onClick={() => document.getElementById("content-editor-area")?.scrollIntoView({ behavior: "smooth" })}>编辑大纲与资料</button></div></div>
+      <div className="design-test-actions"><div className="design-workflow-actions"><button disabled={saving || agentStarting} onClick={() => void previewContent()}>{saving ? "测试中…" : "测试内容（不保存）"}</button></div><p>测试只生成一个未保存的正文示例，不会覆盖当前文章或写入内容库。</p></div>
       {competitorPreview ? <section className="competitor-preview" aria-live="polite"><header><div><strong>同行采集测试结果</strong><p>Serper 返回 {competitorPreview.discovered_count} 条，正文可读取 {competitorPreview.available_count} 篇；本次未写入内容库。</p></div><span>建议正式学习 {competitorPreview.recommended_learning_count} 篇</span></header><ol>{competitorPreview.items.map((item) => <li key={`${item.rank}-${item.url}`} className={`is-${item.status}`}><b>#{item.rank}</b><a href={item.url} target="_blank" rel="noreferrer">{item.title}</a><small>{item.status === "available" ? `可读取 · ${item.content_chars.toLocaleString()} 字符` : item.reason}</small></li>)}</ol></section> : null}
       {outlinePreview ? <section className="competitor-preview" aria-live="polite"><header><div><strong>测试大纲结果</strong><p>基于 {outlinePreview.source_count} 篇测试文章生成，未保存到任务或内容库。</p></div><span>仅供审核</span></header><ol>{outlinePreview.analysis.dynamic_outline.map((item, index) => <li key={`${item.heading}-${index}`}><b>{index + 1}</b><a>{item.heading}</a><small>{item.reader_question || item.purpose || "待补充说明"}</small></li>)}</ol></section> : null}
-      {contentPreview ? <section className="content-test-preview" aria-live="polite"><header><div><strong>测试内容结果</strong><p>已使用 {contentPreview.source_count} 篇已学习同行文章生成；不会保存、覆盖正文或进入内容库。</p></div><span>{contentPreview.provider}{contentPreview.model ? ` · ${contentPreview.model}` : ""}</span></header><h3>{contentPreview.heading}</h3><article className="markdown-preview" dangerouslySetInnerHTML={{ __html: renderMarkdownPreview(contentPreview.markdown) }} /></section> : null}
+      {contentPreview ? <section className="content-test-preview" aria-live="polite"><header><div><strong>测试内容结果</strong><p>已按当前关键词、GSC 信号和公司资料生成；不会保存、覆盖正文或进入内容库。</p></div><span>{contentPreview.provider}{contentPreview.model ? ` · ${contentPreview.model}` : ""}</span></header><h3>{contentPreview.heading}</h3><article className="markdown-preview" dangerouslySetInnerHTML={{ __html: renderMarkdownPreview(contentPreview.markdown) }} /></section> : null}
       <div className="design-content-grid"><section className="design-content-panel"><div className="design-panel-heading"><h2>已采集同行文章</h2><small>{detail.competitor_research?.usable_count || 0} 篇来源</small></div>{detail.competitor_research?.items?.filter((item) => item.status === "selected").length ? <ol className="design-source-list">{detail.competitor_research.items.filter((item) => item.status === "selected").slice(0, 5).map((item) => <li key={item.id}><span>#{item.rank}</span><a href={item.url} target="_blank" rel="noreferrer">{item.page_title || item.search_title}</a><small>{item.domain}</small></li>)}</ol> : <p className="design-empty">暂无可用同行文章。请先执行“测试采集（不入库）”，确认结果后再正式采集。</p>}</section><section className="design-content-panel"><div className="design-panel-heading"><h2>动态大纲</h2><small>{detail.outline?.sections.length || outlineRows.length} 个 H2</small></div><ol className="design-outline-list">{(detail.outline?.sections || outlineRows).slice(0, 7).map((row, index) => <li key={`${row.heading}-${index}`}><span>{index + 1}</span><b>{row.heading}</b></li>)}</ol></section></div>
       {needsResearchTitleRecovery(detail.competitor_research?.error_summary) ? <section className="research-title-recovery" aria-live="polite"><div><strong>当前标题不适合同行学习</strong><p>本轮搜索主要返回商品、分类或视频页，没有可安全学习的同行文章。请换成“安装、选型、比较、故障排查、维护”等内容型标题，再重新采集。</p></div><div className="research-title-recovery-actions"><button className="primary" disabled={recoveryLoading} onClick={() => void generateResearchRecoveryTitles()}>{recoveryLoading ? "正在生成标题…" : "生成可采集标题"}</button><NavLink className="link" to="/title-library">前往标题库手动选择</NavLink></div>{recoveryError ? <p className="research-title-recovery-error">{recoveryError}</p> : null}{recoveryCandidates.length ? <ol className="research-title-recovery-list">{recoveryCandidates.map((candidate) => <li key={candidate.id}><div><strong>{candidate.title}</strong><small>{candidate.reason || "内容型标题：优先获取文章、指南和可学习的同行资料。"}</small></div><button disabled={recoveryLoading} onClick={() => void replaceTitleAndRestartResearch(candidate)}>使用此标题重新采集</button></li>)}</ol> : null}</section> : null}
       {agentJob ? <section className={`agent-blueprint-review state-${agentJob.status}`} aria-live="polite"><header><div><strong>自主内容 Agent #{agentJob.id}</strong><p>{taskStatusLabels[agentJob.status] || agentJob.status} · {agentJob.current_node}</p></div><NavLink to="/system-tasks">查看完整链路</NavLink></header>{agentJob.approvals?.find((item) => item.approval_type === "blueprint" && item.status === "pending") ? (() => { const approval = agentJob.approvals!.find((item) => item.approval_type === "blueprint" && item.status === "pending")!; const sections = approval.payload?.outline?.sections || []; return <div className="agent-blueprint-body"><div><h3>{approval.payload?.title || detail.title_snapshot}</h3><p>候选蓝图尚未写入正文。确认结构、受众和写作方向后再批准。</p><ol>{sections.slice(0, 8).map((section, index) => <li key={`${section.heading}-${index}`}><span>{index + 1}</span><div><b>{section.heading || "未命名章节"}</b>{section.purpose ? <small>{section.purpose}</small> : null}</div></li>)}</ol></div><aside><strong>本次召回证据</strong><p>{approval.payload?.memories?.length || 0} 条项目记忆参与蓝图生成。</p>{approval.payload?.memories?.slice(0, 3).map((memory) => <small key={memory.memory_id}>{memory.topic} · {memory.selection_reason}</small>)}<div className="actions"><button className="danger" disabled={agentStarting} onClick={() => void decideBlueprint("rejected")}>拒绝并恢复原内容</button><button className="primary" disabled={agentStarting} onClick={() => void decideBlueprint("approved")}>批准蓝图并开始写作</button></div></aside></div>; })() : <div className="agent-blueprint-progress"><p>{agentJob.status === "waiting_input" ? "QA 已完成两次定向重写，仍有问题需要人工处理。" : agentJob.status === "completed" ? "写作与 QA 已完成，生成依据报告已保存。" : agentJob.status === "failed" ? agentJob.error_summary || "执行失败，可在任务中心从检查点重试。" : runningAgentStage ? `正在${contentStageLabel(runningAgentStage)}；已完成 ${completedAgentSections}${totalAgentSections ? ` / ${totalAgentSections}` : ""} 个 H2 章节。` : "正在读取项目记忆、写作或执行 QA；页面可以安全离开。"}</p>{agentJob.basis_report ? <span>已使用 {agentJob.basis_report.memories?.length || 0} 条记忆 · 重写 {agentJob.basis_report.qa?.rewrite_count || 0} 次 · 待验证 {agentJob.basis_report.unresolved_verify?.length || 0} 项</span> : null}</div>}</section> : null}
     </section>}
     <div className="content-workspace-header"><div><p className="eyebrow">Production Workspace</p><h3>内容工作流</h3><p>默认由 DeepSeek 生成整篇文章；缺少可靠资料时会改用通用说明，或直接省略该事实。</p></div><div className="content-workspace-actions"><Select label="执行模式" value={contentProvider} onChange={(value) => setContentProvider(value as AiProvider | "auto_collaborate")} options={[["deepseek", "仅 DeepSeek（默认）"], ["auto_collaborate", "自动协作"], ["openai", "仅 ChatGPT"], ["gemini", "仅 Gemini"]]} /><Input label={contentProvider === "auto_collaborate" ? "ChatGPT 写作模型" : "写作模型"} value={contentModel} onChange={setContentModel} /><Select label="审核 AI" value={reviewerProvider} onChange={(value) => setReviewerProvider(value as "follow_writer" | AiProvider)} options={[["follow_writer", contentProvider === "auto_collaborate" ? "自动使用 DeepSeek 审核" : "跟随写作模型"], ["openai", "ChatGPT"], ["gemini", "Gemini"], ["deepseek", "DeepSeek"]]} /><Input label="审核模型" value={reviewerModel} onChange={setReviewerModel} /><span className="content-provider-lock">本次严格使用：<strong>{contentProviderLabel(contentProvider)}</strong><small>{contentProvider === "auto_collaborate" ? "DeepSeek 分析/审核 · ChatGPT 写作" : contentModel || "未配置模型"}</small></span><button onClick={() => void onRefresh()}>刷新资产</button><NavLink className="link" to="/title-library">管理标题库</NavLink></div></div>
     {detail ? <section className="content-production-log" aria-live="polite" aria-label="内容生产执行日志">
-      <header><div><strong>执行日志</strong><p>采集、学习、大纲规格与整篇文章生成都会按实际执行顺序记录。</p></div><span>{agentJob ? `${taskStatusLabels[agentJob.status] || agentJob.status} · ${agentJob.current_node}` : saving || agentStarting ? "正在处理" : "等待启动"}</span></header>
-      {executionLog.length ? <ol>{executionLog.map((entry) => <li className={`state-${entry.status}`} key={entry.id}><i aria-hidden="true" /><div><strong>{entry.label}</strong><p>{entry.message}</p></div><time>{entry.time}</time></li>)}</ol> : <p className="content-production-log-empty">尚未启动任务。点击“启动内容生产 Agent”后，先从同行采集与学习开始。</p>}
+      <header><div><strong>执行日志</strong><p>项目资料读取、大纲规格与整篇文章生成都会按实际执行顺序记录。</p></div><span>{agentJob ? `${taskStatusLabels[agentJob.status] || agentJob.status} · ${agentJob.current_node}` : saving || agentStarting ? "正在处理" : "等待启动"}</span></header>
+      {executionLog.length ? <ol>{executionLog.map((entry) => <li className={`state-${entry.status}`} key={entry.id}><i aria-hidden="true" /><div><strong>{entry.label}</strong><p>{entry.message}</p></div><time>{entry.time}</time></li>)}</ol> : <p className="content-production-log-empty">尚未启动任务。点击“启动内容生产 Agent”后，将直接从关键词、GSC 与产品资料开始。</p>}
     </section> : null}
     <p className="content-notice">{notice}</p>
     {agentJob?.status === "failed" ? <div className="content-retry-action"><button className="primary" disabled={agentStarting} onClick={() => void retryFailedAgent()}>{agentStarting ? "正在重试…" : "仅重试失败章节"}</button><small>已完成的 H2 会从断点复用，不会再次生成。</small></div> : null}
@@ -1287,7 +1240,7 @@ function ContentWorkspace({ titles, assets, projectId, onCreate, onRefresh, onDe
 const aiProviderPresets: Record<AiProvider, { baseUrl: string; model: string }> = {
   openai: { baseUrl: "https://api.openai.com/v1", model: "gpt-5.6-sol" },
   gemini: { baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", model: "gemini-2.5-flash" },
-  deepseek: { baseUrl: "https://api.deepseek.com", model: "deepseek-v4-pro" },
+  deepseek: { baseUrl: "https://api.deepseek.com", model: "deepseek-v4-flash" },
 };
 
 function initialAiProfiles(): Record<AiProvider, AiProfile> {
@@ -1567,7 +1520,7 @@ export function Workspace({ embedded = false, forcedProjectId, legacyPath }: { e
   const [serperConfigured, setSerperConfigured] = useState(false);
   const [serperStatus, setSerperStatus] = useState("正在读取 Serper 搜索配置…");
   const [sidebarGroup, setSidebarGroup] = useState<"project" | "tasks" | "ai">("project");
-  const [projectNavigationSection, setProjectNavigationSection] = useState<"knowledge" | "keywords" | "titles" | "content" | "learning" | "site" | null>("keywords");
+  const [projectNavigationSection, setProjectNavigationSection] = useState<"knowledge" | "keywords" | "titles" | "content" | "site" | null>("keywords");
   const reviewedCount = useMemo(() => Object.keys(reviews).length, [reviews]);
   const isIntegrationPage = activePath === "/integrations";
   const isProjectHome = activePath === "/projects" || /^\/projects\/\d+$/.test(activePath) || activePath === "/agent-platform" || /^\/agent-platform\/site\/\d+$/.test(activePath);
@@ -1583,7 +1536,6 @@ export function Workspace({ embedded = false, forcedProjectId, legacyPath }: { e
       else if (["/research", "/keywords", "/scoring"].includes(activePath)) setProjectNavigationSection("keywords");
       else if (["/titles", "/title-library"].includes(activePath)) setProjectNavigationSection("titles");
       else if (["/content", "/content-library"].includes(activePath) || activePath.startsWith("/content-library/")) setProjectNavigationSection("content");
-      else if (["/content-memory", "/collected-content-library", "/competitor-learning", "/learning-memories"].includes(activePath)) setProjectNavigationSection("learning");
       else if (["/authority-sources", "/knowledge", "/website-crawl", "/gsc", "/content-publish"].includes(activePath)) setProjectNavigationSection("site");
     }
   }, [activePath]);
@@ -1592,14 +1544,10 @@ export function Workspace({ embedded = false, forcedProjectId, legacyPath }: { e
     if (activePath === "/research") return { eyebrow: "关键词研究", title: "关键词挖掘", description: "从种子词发现、审核并沉淀当前网站的内容机会。" };
     if (activePath === "/keywords") return { eyebrow: "Keyword library", title: "关键词库", description: "管理当前网站已审核的关键词、意图和内容机会。" };
     if (activePath === "/titles" || activePath === "/title-library") return { eyebrow: "内容策划", title: "标题与选题", description: "从当前网站关键词选择、生成和锁定可进入内容生产的 SEO 标题。" };
-    if (activePath === "/content" || activePath.startsWith("/content-library")) return { eyebrow: "内容生产", title: "内容生产", description: "让标题、公司知识库、竞品研究和模型运行记录在一个可追溯的工作区协同。" };
+    if (activePath === "/content" || activePath.startsWith("/content-library")) return { eyebrow: "内容生产", title: "内容生产", description: "让标题、公司知识库、GSC 信号和模型运行记录在一个可追溯的工作区协同。" };
     if (activePath === "/authority-sources") return { eyebrow: "证据资料库", title: "权威来源库", description: "沉淀当前网站可复用的可信来源与可支持的内容主题。" };
     if (activePath === "/knowledge") return { eyebrow: "网站资料", title: "公司知识库", description: "采集和上传当前网站的产品、品牌与公司资料，为内容生成提供可追溯的一方事实。" };
     if (activePath === "/website-crawl") return { eyebrow: "网站资料", title: "网站采集", description: "从当前网站的 About Us、产品、工厂、认证、案例、FAQ 与公开联系页面提取可用的一方资料。" };
-    if (activePath === "/content-memory") return { eyebrow: "Competitor collection", title: "采集竞品内容", description: "一键采集当前项目发现的竞品文章，并清楚保留成功、失败与 robots 限制状态。" };
-    if (activePath === "/collected-content-library") return { eyebrow: "Collected competitor content", title: "采集内容库", description: "集中查看当前网站所有采集成功、已提取可读正文的竞品内容。" };
-    if (activePath === "/competitor-learning") return { eyebrow: "Periodic Competitor Learning", title: "定期竞品学习与写法卡片", description: "按项目主题定期重新研究可读竞品文章，并沉淀仅供结构与写法学习的策略卡。" };
-    if (activePath === "/learning-memories") return { eyebrow: "Learning Memory & Feedback", title: "学习记忆与人工反馈", description: "用人工优先级、置顶和反馈校准 AI 后续写作；来源与 GSC 原始证据始终保留只读。" };
     if (activePath === "/gsc") return { eyebrow: "Google Search Console", title: "GSC 网站绑定与锚文本", description: "读取当前网站的真实排名查询和页面数据，为内容内链提供可追溯的锚文本建议。" };
     if (activePath === "/content-publish") return { eyebrow: "Website publishing", title: "内容发布", description: "只配置当前网站的 WordPress 后台，并默认将文章创建为草稿。" };
     if (activePath === "/settings") return { eyebrow: "AI configuration", title: "AI 模型配置", description: "保存提供商、模型和功能分配；内容任务将严格使用创建时锁定的模型。" };
@@ -2063,9 +2011,6 @@ export function Workspace({ embedded = false, forcedProjectId, legacyPath }: { e
               <button type="button" className={projectNavigationSection === "content" ? "project-nav-section is-active" : "project-nav-section"} aria-expanded={projectNavigationSection === "content"} aria-controls="project-nav-content" onClick={() => setProjectNavigationSection((current) => current === "content" ? null : "content")}>内容生产 <i>{projectNavigationSection === "content" ? "⌃" : "⌄"}</i></button>
               {projectNavigationSection === "content" && <div className="project-nav-pages" id="project-nav-content"><NavLink to={`/content${projectQuery}`}>内容任务</NavLink><NavLink to={`/content-history${projectQuery}`}>历史记录</NavLink><NavLink to={`/content-library${projectQuery}`}>内容库</NavLink></div>}
 
-              <button type="button" className={projectNavigationSection === "learning" ? "project-nav-section is-active" : "project-nav-section"} aria-expanded={projectNavigationSection === "learning"} aria-controls="project-nav-learning" onClick={() => setProjectNavigationSection((current) => current === "learning" ? null : "learning")}>定期竞品学习 <i>{projectNavigationSection === "learning" ? "⌃" : "⌄"}</i></button>
-              {projectNavigationSection === "learning" && <div className="project-nav-pages" id="project-nav-learning"><NavLink to={`/competitor-learning${projectQuery}`}>学习计划与写法卡</NavLink><NavLink to={`/content-memory${projectQuery}`}>采集竞品内容</NavLink><NavLink to={`/collected-content-library${projectQuery}`}>采集内容库</NavLink><NavLink to={`/learning-memories${projectQuery}`}>学习记忆与反馈</NavLink></div>}
-
               <button type="button" className={projectNavigationSection === "site" ? "project-nav-section is-active" : "project-nav-section"} aria-expanded={projectNavigationSection === "site"} aria-controls="project-nav-site" onClick={() => setProjectNavigationSection((current) => current === "site" ? null : "site")}>网站资料与发布 <i>{projectNavigationSection === "site" ? "⌃" : "⌄"}</i></button>
               {projectNavigationSection === "site" && <div className="project-nav-pages" id="project-nav-site"><NavLink to={`/authority-sources${projectQuery}`}>权威来源库</NavLink><NavLink to={`/gsc${projectQuery}`}>GSC 绑定与锚文本</NavLink><NavLink to={`/content-publish${projectQuery}`}>内容发布</NavLink></div>}
             </div>
@@ -2119,10 +2064,10 @@ export function Workspace({ embedded = false, forcedProjectId, legacyPath }: { e
       <Route path="/website-crawl" element={<section className="panel"><ProjectKnowledgeLibrary projectId={projectId} crawlOnly /></section>} />
       <Route path="/gsc" element={<section className="panel"><GscIntegrationCard projectId={projectId} /></section>} />
       <Route path="/content-publish" element={<section className="panel"><PanelTitle eyebrow="Website Publishing" title="内容发布" /><p className="hint">仅配置当前网站的 WordPress 后台登录信息。Python 会模拟后台登录并保存文章草稿，不使用 REST API。</p><WordPressIntegrationCard projectId={projectId} /></section>} />
-      <Route path="/content-memory" element={<ContentMemoryPage projectId={projectId} />} />
-      <Route path="/collected-content-library" element={<CollectedCompetitorContentLibrary projectId={projectId} />} />
-      <Route path="/competitor-learning" element={<section className="panel"><CompetitorLearningPlanner projectId={projectId} /></section>} />
-      <Route path="/learning-memories" element={<LearningMemoryManager projectId={projectId} />} />
+      <Route path="/content-memory" element={<Navigate to={`/content${projectQuery}`} replace />} />
+      <Route path="/collected-content-library" element={<Navigate to={`/content${projectQuery}`} replace />} />
+      <Route path="/competitor-learning" element={<Navigate to={`/content${projectQuery}`} replace />} />
+      <Route path="/learning-memories" element={<Navigate to={`/content${projectQuery}`} replace />} />
       <Route path="/content-library" element={<section className="panel" id="content-library"><PanelTitle eyebrow="Content Library" title="所有内容" tag={`${contentLibraryAssets.length} 篇已完成`} /><p className="hint">这里只显示后端确认已生成正文的内容；点击阅读全文查看版本化保存的完整文章。</p><ContentLibrary assets={contentLibraryAssets} onDelete={deleteContentAssets} /></section>} />
       <Route path="/content-history" element={<ContentGenerationHistory assets={contentAssets} projectId={projectId} onDelete={deleteContentAssets} onRefresh={refreshContentData} />} />
 

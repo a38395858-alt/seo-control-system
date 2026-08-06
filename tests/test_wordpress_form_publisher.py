@@ -58,7 +58,16 @@ Use **led stair lights outdoor** where suitable.
         self.assertIn("<th>Factor</th>", html)
         self.assertIn("<td>Weather</td>", html)
         self.assertIn('href="https://www.ul.com/"', html)
+        self.assertIn('rel="nofollow noopener noreferrer"', html)
         self.assertIn("<strong>led stair lights outdoor</strong>", html)
+
+    def test_markdown_publisher_keeps_internal_links_followable_and_marks_external_links_nofollow(self) -> None:
+        html = KeywordDiscoveryRequestHandler._markdown_to_wordpress_html(
+            "[Product page](https://ledsteplight.com/product) and [External reference](https://www.ul.com/guide)",
+            internal_site_url="https://ledsteplight.com",
+        )
+        self.assertIn('href="https://ledsteplight.com/product" target="_blank" rel="noopener noreferrer"', html)
+        self.assertIn('href="https://www.ul.com/guide" target="_blank" rel="nofollow noopener noreferrer"', html)
 
     def test_raw_html_table_is_rebuilt_as_safe_wordpress_table(self) -> None:
         markdown = """<table onclick="steal()"><thead><tr><th scope="col">Item<script>alert(1)</script></th></tr></thead><tbody><tr><th scope="row">Driver</th><td style="color:red" onclick="steal()">Verify model</td></tr></tbody></table>"""
@@ -78,11 +87,11 @@ Use **led stair lights outdoor** where suitable.
 - [ ] Pending inspection
 - [x] Documentation complete"""
         html = KeywordDiscoveryRequestHandler._markdown_to_wordpress_html(markdown)
-        self.assertEqual(1, html.count("<ol>"))
+        self.assertEqual(2, html.count("<ol>"))
         self.assertIn("<ol><li>First check</li><li>Second check</li></ol>", html)
-        self.assertIn('class="task-list"', html)
-        self.assertIn('type="checkbox" disabled aria-label="Pending checklist item"', html)
-        self.assertIn('type="checkbox" disabled checked aria-label="Completed checklist item"', html)
+        self.assertEqual(2, html.count("<ol>"))
+        self.assertIn("<ol><li>Pending inspection</li><li>Documentation complete</li></ol>", html)
+        self.assertNotIn('type="checkbox"', html)
 
     def test_reader_markdown_normalizes_legacy_tables_and_ordered_markers(self) -> None:
         legacy = """<table><tr><th>Factor</th><th>Check</th></tr><tr><td>Rain</td><td>Verify | document</td></tr></table>

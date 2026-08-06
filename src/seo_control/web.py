@@ -42,6 +42,7 @@ from seo_control.application.ai_title_generator import OpenAICompatibleTitleGene
 from seo_control.application.content_generator import (
     ContentGenerationProtocolError,
     FIXED_CONTENT_SAFETY_RULES,
+    MINIMUM_ARTICLE_BODY_WORDS,
     OpenAICompatibleContentGenerator,
     PROMPT_VERSION,
     SYSTEM_PROMPT,
@@ -780,7 +781,6 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 asset = self._content_asset(connection, project_id, asset_id)
                 brief_id = asset["current_brief_id"]
                 if brief_id is None: raise ValueError("a content brief is required before creating an outline")
-                self._require_content_competitor_learning(connection, asset)
                 with connection:
                     cursor = connection.execute("INSERT INTO content_outlines(content_asset_id,brief_id) VALUES(?,?)", (asset_id, brief_id))
                     for position, section in enumerate(sections, 1):
@@ -2293,10 +2293,10 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
     def _research_authority_sources(self, payload: Mapping[str, Any]) -> None:
         """Find citations from allowlisted search results, never AI-invented URLs."""
         # Authority-link research deliberately has its own locked model.  The
-        # UI sends Gemini here: it proposes candidate URLs, then receives the
-        # fetched page back as an independent accept/reject verification step.
+        # selected writer proposes candidate URLs, then receives the fetched
+        # page back as an independent accept/reject verification step.
         # It must never silently fall back to a different model or to Serper.
-        if self._optional_text(payload, "provider") == "gemini":
+        if self._optional_text(payload, "provider") in {"gemini", "deepseek"}:
             self._research_authority_sources_ai_legacy(payload)
             return
         project_id = self._integer(payload, "project_id")
@@ -2494,29 +2494,58 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
     @staticmethod
     def _authority_domain_allowed(domain: str) -> bool:
         host = domain.casefold().removeprefix("www.").rstrip(".")
-        return host.endswith(".gov") or host.endswith(".edu") or host in {"iso.org", "astm.org", "wikipedia.org"} or host.endswith(".iso.org") or host.endswith(".astm.org") or host.endswith(".wikipedia.org")
+        approved_domains = ("iso.org", "astm.org", "iec.ch", "ies.org", "batteryuniversity.com")
+        return host.endswith(".gov") or host.endswith(".edu") or any(host == value or host.endswith(f".{value}") for value in approved_domains)
 
     @staticmethod
     def _authority_source_profile(domain: str) -> tuple[str, str]:
         host = domain.casefold().removeprefix("www.")
         if host.endswith(".gov"): return "government", "authoritative"
-        if host.endswith(".iso.org") or host.endswith(".astm.org") or host in {"iso.org", "astm.org"}: return "standard", "authoritative"
-        if host.endswith(".wikipedia.org") or host == "wikipedia.org": return "industry_research", "supporting"
+        if host.endswith(".iso.org") or host.endswith(".astm.org") or host.endswith(".iec.ch") or host.endswith(".ies.org") or host in {"iso.org", "astm.org", "iec.ch", "ies.org"}: return "standard", "authoritative"
+        if host.endswith(".batteryuniversity.com") or host == "batteryuniversity.com": return "industry_research", "authoritative"
         return "industry_research", "authoritative"
 
     @staticmethod
     def _authority_google_tasks(markdown: str, title: str, keyword: str) -> list[dict[str, str]]:
         headings = [" ".join(value.split()) for value in re.findall(r"(?m)^##\s+([^\n#]+)", markdown) if value.strip()]
         topics = headings[:4] or [title]
-        scope = "(site:.gov OR site:.edu OR site:iso.org OR site:astm.org OR site:wikipedia.org)"
-        return [{"section_heading": heading, "claim_topic": heading, "query": f"{KeywordDiscoveryRequestHandler._authority_core_terms(keyword, heading)} {scope} {AUTHORITY_SEARCH_FILE_EXCLUSIONS}"[:1_500]} for heading in topics]
+        tasks: list[dict[str, str]] = []
+        # A broad query mixing seven authority domains returns prestigious but
+        # irrelevant university/government pages.  Search the institution most
+        # likely to own the claim made in each H2 instead.  These are only
+        # domain filters; every returned page is still opened and checked for
+        # a direct topic match before it becomes a reader-facing citation.
+        for heading in topics:
+            normalized = heading.casefold()
+            if any(term in normalized for term in ("solar", "panel")) and any(term in normalized for term in ("clean", "soil", "mainten")):
+                domains = ("nrel.gov", "energy.gov")
+            elif "battery" in normalized:
+                domains = ("batteryuniversity.com", "energy.gov")
+            elif any(term in normalized for term in ("ip", "water", "housing", "enclosure", "rain", "seal")):
+                domains = ("iec.ch", "ies.org")
+            elif any(term in normalized for term in ("light", "lighting", "fixture")):
+                domains = ("ies.org", "energy.gov")
+            else:
+                domains = ("gov", "edu")
+            core_terms = KeywordDiscoveryRequestHandler._authority_core_terms(keyword, heading)
+            for domain in domains:
+                tasks.append({
+                    "section_heading": heading,
+                    "claim_topic": heading,
+                    "query": f"{core_terms} site:{domain} {AUTHORITY_SEARCH_FILE_EXCLUSIONS}"[:1_500],
+                })
+        return tasks
 
     @staticmethod
     def _authority_bing_tasks(markdown: str, title: str, keyword: str) -> list[dict[str, str]]:
         headings = [" ".join(value.split()) for value in re.findall(r"(?m)^##\s+([^\n#]+)", markdown) if value.strip()]
-        heading = (headings[:1] or [title])[0]
+        evidence_terms = {"battery", "clean", "panel", "housing", "wire", "connection", "ip", "water", "rain", "placement"}
+        heading = next(
+            (item for item in headings if evidence_terms & {term.casefold() for term in re.findall(r"[A-Za-z0-9]+", item)}),
+            (headings[:1] or [title])[0],
+        )
         core_terms = KeywordDiscoveryRequestHandler._authority_core_terms(keyword, heading)
-        return [{"section_heading": heading, "claim_topic": heading, "query": f"{core_terms} site:{domain} {AUTHORITY_SEARCH_FILE_EXCLUSIONS}"[:1_500]} for domain in ("gov", "edu", "iso.org", "astm.org", "wikipedia.org")]
+        return [{"section_heading": heading, "claim_topic": heading, "query": f"{core_terms} site:{domain} {AUTHORITY_SEARCH_FILE_EXCLUSIONS}"[:1_500]} for domain in ("nrel.gov", "energy.gov", "iec.ch", "ies.org", "iso.org", "astm.org", "batteryuniversity.com", "edu")]
 
     @staticmethod
     def _authority_core_terms(keyword: str, heading: str) -> str:
@@ -2567,14 +2596,31 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 if len(item) >= 2 and item.casefold() not in stop_words
             }
 
-        subject_terms = terms(f"{keyword} {article_title} {section_heading}")
-        title_terms = terms(source_title)
+        aliases = {
+            "solar": {"solar", "photovoltaic", "pv"},
+            "cleaning": {"clean", "cleaning", "maintenance", "maintain", "soiling"},
+            "housing": {"housing", "enclosure", "enclosures"},
+            "water": {"water", "waterproof", "rain", "ingress", "ip"},
+            "outdoor": {"outdoor", "exterior"},
+            "lighting": {"light", "lights", "lighting", "illumination"},
+        }
+
+        def evidence_terms(value: str) -> set[str]:
+            raw = terms(value)
+            expanded = set(raw)
+            for label, equivalents in aliases.items():
+                if raw & equivalents:
+                    expanded.add(label)
+            return expanded
+
+        subject_terms = evidence_terms(f"{keyword} {article_title} {section_heading}")
+        title_terms = evidence_terms(source_title)
         title_matches = subject_terms & title_terms
         if len(title_matches) < 2:
             return False, f"The result title only matches {len(title_matches)} subject term(s): {', '.join(sorted(title_matches)) or 'none'}."
         if not source_content:
             return True, f"The result title has {len(title_matches)} matching subject terms: {', '.join(sorted(title_matches))}."
-        content_terms = terms(source_content[:30_000])
+        content_terms = evidence_terms(source_content[:30_000])
         content_matches = subject_terms & content_terms
         score = len(title_matches) * 2 + len(content_matches)
         if score < 5:
@@ -2591,21 +2637,22 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 if connection.execute("SELECT 1 FROM projects WHERE id=?", (project_id,)).fetchone() is None: raise ValueError("project does not exist")
                 generator, provider, model = self._content_generator(payload)
                 if generator is None: raise ValueError("Selected content provider is not configured.")
+                provider_label = CONTENT_PROVIDER_LABELS.get(provider, "AI")
                 asset = self._content_asset(connection, project_id, asset_id)
                 draft = connection.execute("SELECT markdown FROM content_drafts WHERE id=?", (asset["current_draft_id"],)).fetchone() if asset["current_draft_id"] else None
                 if draft is None: raise ValueError("a completed article is required before researching authority sources")
                 article_topic = asset["title_snapshot"]
                 evidence_context = self._authority_evidence_context(str(draft["markdown"]))
                 search_run_id = uuid.uuid4().hex
-                # A new Gemini recommendation run replaces only this
+                # A new AI recommendation run replaces only this
                 # article's old citation links.  Source-library records stay
-                # as project memory, but must pass Gemini verification again
+                # as project memory, but must pass the selected model's verification again
                 # before they can be cited by this article.
                 with connection:
                     connection.execute("DELETE FROM authority_search_results WHERE project_id=? AND content_asset_id=?", (project_id, asset_id))
                     connection.execute("DELETE FROM content_authority_source_links WHERE project_id=? AND content_asset_id=?", (project_id, asset_id))
                 def request_plan(context: str) -> Any:
-                    data = {"title": asset["title_snapshot"], "keyword": asset["keyword"], "evidence_context": context, "authority_domain_policy": "Only .gov, .edu, iso.org, astm.org, or wikipedia.org. Recommend only exact public HTML pages, never downloads, document viewers, forums, generic homepages, or merely topic-adjacent pages."}
+                    data = {"title": asset["title_snapshot"], "keyword": asset["keyword"], "evidence_context": context, "authority_domain_policy": "Only .gov, .edu, iec.ch, ies.org, iso.org, astm.org, or batteryuniversity.com. Recommend only exact public HTML pages, never downloads, document viewers, forums, generic homepages, or merely topic-adjacent pages."}
                     return generator.run_stage(stage="authority_research_plan", data=data) if callable(getattr(generator, "run_stage", None)) else generator.generate(stage="authority_research_plan", **data)
                 retry_contexts = (evidence_context, evidence_context[:1_800], evidence_context[:1_000])
                 raw_plan: Any | None = None
@@ -2641,14 +2688,14 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                     claim_topic = str(candidate.get("claim_topic", "")).strip()
                     section_heading = str(candidate.get("section_heading", "")).strip()
                     if not self._authority_domain_allowed(domain):
-                        reason = "Rejected before opening: Gemini proposed a domain outside the authority whitelist."
+                        reason = f"Rejected before opening: {provider_label} proposed a domain outside the authority whitelist."
                         skipped.append({"url": url, "title": title, "reason": reason})
-                        audit_rows.append({"section_heading": section_heading, "claim_topic": claim_topic, "query": "Gemini authority recommendation", "url": url, "title": title, "domain": domain, "rank": "0", "status": "skipped", "reason": reason})
+                        audit_rows.append({"section_heading": section_heading, "claim_topic": claim_topic, "query": f"{provider_label} authority recommendation", "url": url, "title": title, "domain": domain, "rank": "0", "status": "skipped", "reason": reason})
                         continue
                     if self._authority_download_url(url) or self._authority_non_article_url(url):
-                        reason = "Rejected before opening: Gemini proposed a download, document viewer, or non-article URL."
+                        reason = f"Rejected before opening: {provider_label} proposed a download, document viewer, or non-article URL."
                         skipped.append({"url": url, "title": title, "reason": reason})
-                        audit_rows.append({"section_heading": section_heading, "claim_topic": claim_topic, "query": "Gemini authority recommendation", "url": url, "title": title, "domain": domain, "rank": "0", "status": "skipped", "reason": reason})
+                        audit_rows.append({"section_heading": section_heading, "claim_topic": claim_topic, "query": f"{provider_label} authority recommendation", "url": url, "title": title, "domain": domain, "rank": "0", "status": "skipped", "reason": reason})
                         continue
                     candidates.append({"url": url, "title": title, "domain": domain, "claim_topic": claim_topic, "section_heading": section_heading, "preferred_source_type": str(candidate.get("preferred_source_type", "")).strip()})
                     if len(candidates) >= 8: break
@@ -2656,7 +2703,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 with connection:
                     self._save_authority_search_audit(connection, search_run_id, project_id, asset_id, audit_rows)
                     for rank, candidate in enumerate(candidates, 1):
-                        connection.execute("INSERT INTO authority_search_results(search_run_id,project_id,content_asset_id,section_heading,claim_topic,search_query,rank,title,url,domain,status) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (search_run_id, project_id, asset_id, candidate["section_heading"], candidate["claim_topic"], "Gemini authority recommendation", rank, candidate["title"], candidate["url"], candidate["domain"], "pending"))
+                        connection.execute("INSERT INTO authority_search_results(search_run_id,project_id,content_asset_id,section_heading,claim_topic,search_query,rank,title,url,domain,status) VALUES(?,?,?,?,?,?,?,?,?,?,?)", (search_run_id, project_id, asset_id, candidate["section_heading"], candidate["claim_topic"], f"{provider_label} authority recommendation", rank, candidate["title"], candidate["url"], candidate["domain"], "pending"))
                 # References follow the same robots policy as competitor
                 # learning. A blocked page may be saved as a URL, never read.
                 batch = self.server.competitor_content_client.extract_many([item["url"] for item in candidates], max_workers=5, respect_robots=True)
@@ -2665,7 +2712,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                     url = candidate["url"]
                     fetched = batch.get(url)
                     if not isinstance(fetched, Mapping):
-                        reason = str(fetched) if isinstance(fetched, Exception) else "The Gemini-proposed URL could not be opened as a usable HTML content page."
+                        reason = str(fetched) if isinstance(fetched, Exception) else f"The {provider_label}-proposed URL could not be opened as a usable HTML content page."
                         skipped.append({"url": url, "title": candidate["title"], "reason": reason})
                         with connection:
                             connection.execute("UPDATE authority_search_results SET status='skipped',error_summary=? WHERE search_run_id=? AND url=?", (reason, search_run_id, url))
@@ -2677,13 +2724,13 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                         raw = generator.run_stage(stage="source_classification", data=data) if callable(getattr(generator, "run_stage", None)) else generator.generate(stage="source_classification", **data)
                         classification = json.loads(raw) if isinstance(raw, str) else raw
                     except ContentGenerationProtocolError as error:
-                        reason = f"Gemini verification failed: {error}"
+                        reason = f"{provider_label} verification failed: {error}"
                         skipped.append({"url": url, "title": str(fetched.get("title", "")), "reason": reason})
                         with connection:
                             connection.execute("UPDATE authority_search_results SET title=?,status='skipped',error_summary=? WHERE search_run_id=? AND url=?", (str(fetched.get("title", "")), reason, search_run_id, url))
                         continue
                     if not isinstance(classification, Mapping) or classification.get("relevance") != "accept" or classification.get("authority_level") == "needs_review":
-                        reason = str(classification.get("reason", "Gemini rejected this page because it did not support the article claim with sufficient authority.")) if isinstance(classification, Mapping) else "Gemini returned an invalid verification decision."
+                        reason = str(classification.get("reason", f"{provider_label} rejected this page because it did not support the article claim with sufficient authority.")) if isinstance(classification, Mapping) else f"{provider_label} returned an invalid verification decision."
                         skipped.append({"url": url, "title": str(fetched.get("title", "")), "reason": reason})
                         with connection:
                             connection.execute("UPDATE authority_search_results SET title=?,status='skipped',error_summary=? WHERE search_run_id=? AND url=?", (str(fetched.get("title", "")), reason, search_run_id, url))
@@ -3528,7 +3575,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         check("current_draft", draft is not None, "当前内容没有可发布的正文版本。")
         if draft is None:
             return {"status": "blocked", "draft_id": None, "requested_status": requested_status, "checks": checks, "issues": issues}
-        check("qa", str(draft["qa_status"]) == "approved", "请先在内容页完成 AI 质量审核，并确保审核结果为“通过”。")
+        check("qa", str(draft["qa_status"]) == "approved", "AI 质量审核尚未通过；将作为提示保留，但不阻止直接发布。", blocking=False)
         try:
             unresolved = json.loads(draft["unresolved_verify_json"] or "[]")
         except (TypeError, json.JSONDecodeError):
@@ -3540,7 +3587,8 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         check(
             "meta_description",
             50 <= len(meta_description) <= 180,
-            "Meta Description 必须为 50–180 个字符，避免搜索摘要缺失或被截断。",
+            "Meta Description 建议为 50–180 个字符；当前长度不会阻止直接发布。",
+            blocking=False,
         )
         try:
             tags = json.loads(asset["tags_json"] or "[]")
@@ -3548,8 +3596,12 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             tags = []
         check("tags", isinstance(tags, list) and 2 <= len(tags) <= 3 and all(isinstance(tag, str) and tag.strip() for tag in tags), "内容必须保留 2–3 个有效英文标签。")
         with self._credential_database() as credential_connection:
-            configuration = credential_connection.execute("SELECT last_tested_at FROM wordpress_credentials WHERE project_id=?", (project_id,)).fetchone()
-        check("wordpress_connection", configuration is not None and configuration["last_tested_at"] is not None, "请先在“内容发布”中保存并测试当前网站的 WordPress 后台连接。")
+            configuration = credential_connection.execute("SELECT site_url,username,application_password FROM wordpress_credentials WHERE project_id=?", (project_id,)).fetchone()
+        check(
+            "wordpress_connection",
+            configuration is not None and bool(configuration["site_url"]) and bool(configuration["username"]) and bool(configuration["application_password"]),
+            "请先在“内容发布”中保存当前网站的 WordPress 后台连接。",
+        )
         images = connection.execute("SELECT seo_filename,status FROM content_section_images WHERE project_id=? AND content_asset_id=? AND draft_id=? ORDER BY position", (project_id, asset["id"], draft["id"])).fetchall()
         if not images:
             check("images", allow_without_images, "当前正文没有 H2 配图；请生成配图，或明确确认无图发布。")
@@ -3702,7 +3754,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 # WordPress post.  Create a real draft first, then attach the
                 # locally generated H2 images to that post, and finally update
                 # the draft to the selected status.
-                initial_html = self._markdown_to_wordpress_html(str(draft["markdown"]))
+                initial_html = self._markdown_to_wordpress_html(str(draft["markdown"]), internal_site_url=configuration["site_url"])
                 wordpress_stage["value"] = "create_draft"
                 create_form = self._wordpress_post_form(
                     nonce, post_id=0, original_status="auto-draft", status="draft",
@@ -3786,7 +3838,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         if api is None:
             raise ValueError("WordPress uses the block editor but did not provide an authenticated editor API token")
         headers = {"X-WP-Nonce": api["nonce"], "Referer": f"{configuration['site_url']}/wp-admin/post-new.php", "Origin": configuration["site_url"]}
-        initial_html = self._markdown_to_wordpress_html(str(draft["markdown"]))
+        initial_html = self._markdown_to_wordpress_html(str(draft["markdown"]), internal_site_url=configuration["site_url"])
         existing_publication = connection.execute(
             "SELECT wordpress_post_id FROM content_wordpress_publications WHERE project_id=? AND content_asset_id=? AND status='publish' AND wordpress_post_id IS NOT NULL ORDER BY id DESC LIMIT 1",
             (project_id, asset_id),
@@ -3875,7 +3927,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
 
     def _wordpress_article_html(self, connection: sqlite3.Connection, project_id: int, asset_id: int, draft: sqlite3.Row, session: requests.Session, configuration: Mapping[str, str], post_id: int) -> str:
         """Upload generated local H2 images to WordPress and embed their media URLs."""
-        article_html = self._markdown_to_wordpress_html(str(draft["markdown"]))
+        article_html = self._markdown_to_wordpress_html(str(draft["markdown"]), internal_site_url=configuration["site_url"])
         images = connection.execute(
             "SELECT section_heading,alt_text,seo_filename,status FROM content_section_images WHERE project_id=? AND content_asset_id=? AND draft_id=? ORDER BY position",
             (project_id, asset_id, draft["id"]),
@@ -3891,13 +3943,6 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             alt_text = html.escape(str(image["alt_text"] or image["section_heading"]), quote=True)
             figure = f'<figure class="wp-block-image size-large seo-control-section-image" style="width:100%;max-width:800px;margin:24px auto;"><img src="{html.escape(media_url, quote=True)}" alt="{alt_text}" width="800" height="600" loading="lazy" style="display:block;width:100%;max-width:800px;height:auto;object-fit:contain;" /><figcaption style="display:flex;align-items:flex-start;gap:8px;margin-top:9px;color:#64748b;font-size:12px;line-height:1.5;"><span style="display:inline-block;flex:0 0 auto;padding:2px 6px;border-radius:999px;background:#e8f4f1;color:#176b5a;font-size:10px;font-weight:700;letter-spacing:.06em;line-height:1.35;">IMAGE</span><span>{alt_text}</span></figcaption></figure>'
             article_html = article_html.replace(f"<h2>{heading}</h2>", f"<h2>{heading}</h2>{figure}", 1)
-        references = self._wordpress_authority_references(connection, project_id, asset_id)
-        if references:
-            items = "".join(
-                f'<li><a href="{html.escape(reference["url"], quote=True)}" target="_blank" rel="nofollow noopener noreferrer">{html.escape(reference["title"])}</a><span> — {html.escape(reference["publisher"])}</span></li>'
-                for reference in references
-            )
-            article_html += f'\n<section class="seo-control-authority-references"><h2>Authoritative References</h2><ul>{items}</ul></section>'
         return article_html
 
     @staticmethod
@@ -4059,7 +4104,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         return win32crypt.CryptUnprotectData(base64.b64decode(value.removeprefix("dpapi:")), None, None, None, 0)[1].decode("utf-8")
 
     @staticmethod
-    def _markdown_to_wordpress_html(markdown: str) -> str:
+    def _markdown_to_wordpress_html(markdown: str, *, internal_site_url: str = "") -> str:
         """Render the supported writer Markdown as safe, semantic WordPress HTML.
 
         The writer deliberately uses Markdown tables, links and emphasis for SEO
@@ -4069,15 +4114,26 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         # The verification record belongs to the internal quality gate.  Even
         # legacy drafts that contained an old marker must never expose it on a
         # public WordPress page.
-        markdown = KeywordDiscoveryRequestHandler._sanitize_reader_markdown(markdown)
+        raw_markdown = str(markdown or "")
+        markdown = KeywordDiscoveryRequestHandler._sanitize_reader_markdown(raw_markdown)
+        # A legacy raw table can carry semantic header scope. Parse that narrow
+        # block with SafeTableParser below instead of flattening it to Markdown
+        # first; all other raw HTML remains escaped by the reader sanitizer.
+        if re.search(r"(?im)^\s*<table(?:\s|>)", raw_markdown):
+            markdown = raw_markdown
         lines = markdown.replace("\r\n", "\n").replace("\r", "\n").split("\n")
         output: list[str] = []
+
+        internal_host = KeywordDiscoveryRequestHandler._internal_host_key(internal_site_url)
 
         def inline(value: str) -> str:
             escaped = html.escape(value, quote=False)
             escaped = re.sub(
                 r"\[([^\]]+)\]\((https?://[^\s)]+)\)",
-                lambda match: f'<a href="{html.escape(html.unescape(match.group(2)), quote=True)}" target="_blank" rel="noopener noreferrer">{match.group(1)}</a>',
+                lambda match: (
+                    f'<a href="{html.escape(html.unescape(match.group(2)), quote=True)}" target="_blank" '
+                    f'rel="{"noopener noreferrer" if internal_host and KeywordDiscoveryRequestHandler._internal_host_key(html.unescape(match.group(2))) == internal_host else "nofollow noopener noreferrer"}">{match.group(1)}</a>'
+                ),
                 escaped,
             )
             escaped = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escaped)
@@ -4168,9 +4224,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         def list_item(value: str) -> str:
             task = re.match(r"^\[([ xX])\]\s+(.+)$", value)
             if task is None: return f"<li>{inline(value)}</li>"
-            checked = " checked" if task.group(1).casefold() == "x" else ""
-            state = "Completed" if checked else "Pending"
-            return f'<li class="task-list-item"><input type="checkbox" disabled{checked} aria-label="{state} checklist item"><span>{inline(task.group(2))}</span></li>'
+            return f"<li>{inline(task.group(2))}</li>"
 
         index = 0
         while index < len(lines):
@@ -4205,6 +4259,9 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             ordered = re.match(r"^\d+[.)]\s+(.+)$", value)
             if unordered or ordered:
                 tag = "ul" if unordered else "ol"; items: list[str] = []
+                checklist = unordered is not None and re.match(r"^\[[ xX]\]\s+", unordered.group(1)) is not None
+                if checklist:
+                    tag = "ol"
                 pattern = r"^(?:[-*])\s+(.+)$" if unordered else r"^\d+[.)]\s+(.+)$"
                 first_number = int(re.match(r"^(\d+)", value).group(1)) if ordered else 1
                 while index < len(lines):
@@ -4220,7 +4277,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                     while next_index < len(lines) and not lines[next_index].strip(): next_index += 1
                     if next_index < len(lines) and re.match(pattern, lines[next_index].strip()): index = next_index; continue
                     index = next_index; break
-                list_class = ' class="task-list"' if tag == "ul" and any('class="task-list-item"' in item for item in items) else ""
+                list_class = ""
                 start = f' start="{first_number}"' if tag == "ol" and first_number != 1 else ""
                 output.append(f"<{tag}{list_class}{start}>" + "".join(items) + f"</{tag}>")
                 continue
@@ -4267,12 +4324,26 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         research_model: str | None = None
         routing_mode = "manual"
         routing_summary = "Manual route: the selected writer is used for every writing node."
+        competitor_research_result: dict[str, Any] | None = None
         try:
             with self._database() as connection:
                 asset = self._content_asset(connection, project_id, asset_id)
-                if action in {"generate", "generate-outline", "generate-draft"}:
-                    self._require_content_competitor_learning(connection, asset)
                 generator, provider, model, research_generator, research_provider, research_model, reviewer_provider, reviewer_model, routing_mode, routing_summary = self._content_execution_route(payload)
+                # One-click generation may explicitly request a fresh learning
+                # pass.  It must happen before the learning gate; otherwise a
+                # brand-new title is incorrectly rejected before it can collect
+                # the competitor evidence that the gate requires.
+                if action == "generate" and payload.get("competitor_research") is True:
+                    active_research_generator = research_generator or generator
+                    if active_research_generator is None:
+                        raise ValueError("Selected competitor learning model is not configured.")
+                    competitor_research_result = self._run_competitor_research(
+                        connection, asset, active_research_generator,
+                        research_provider or provider, research_model or model,
+                    )
+                    asset = self._content_asset(connection, project_id, asset_id)
+                if action in {"generate", "generate-outline", "generate-draft"} and payload.get("use_competitor_learning") is True:
+                    self._require_content_competitor_learning(connection, asset)
                 job_id = self._start_content_generation_job(
                     connection, asset, action, provider, model,
                     reviewer_provider=reviewer_provider, reviewer_model=reviewer_model,
@@ -4288,6 +4359,8 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                     self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": f"{self._content_provider_label(provider)} configuration 未配置，未切换到其他模型。", "generation_job": job})
                     return
                 result: dict[str, Any] = {}
+                if competitor_research_result is not None:
+                    result["competitor_research"] = competitor_research_result
                 # The project console sends the current website's first-party
                 # knowledge on every generation request.  Refresh only that
                 # source family inside an existing Brief, so an old Brief can
@@ -4782,10 +4855,18 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         ).fetchone()
         if project is None:
             raise ValueError("project does not exist")
+        # Some early projects used the website URL as their display name and
+        # left site_url empty. Content generation still needs that canonical
+        # host to distinguish safe internal GSC/product destinations from
+        # outbound references; fall back only when the name is itself a valid
+        # public http(s) URL.
+        site_url = self._canonical_internal_url(project["site_url"])
+        if not site_url:
+            site_url = self._canonical_internal_url(project["name"])
         project_context = {
             "project_id": int(project["id"]),
             "name": str(project["name"] or ""),
-            "site_url": str(project["site_url"] or ""),
+            "site_url": site_url,
             "industry": str(project["industry"] or "").strip(),
             "country": str(project["default_country"] or ""),
             "language": str(project["default_language"] or ""),
@@ -4873,16 +4954,18 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         audience = self._optional_text(payload, "target_audience") or "US searchers evaluating this topic"
         goal = self._optional_text(payload, "business_goal") or "informational"
         manual_sources = self._content_sources(payload.get("sources", []))
-        competitor_sources, analysis = self._research_sources(connection, asset["id"])
+        direct_keyword_mode = payload.get("use_competitor_learning") is not True
+        competitor_sources, analysis = ([], None) if direct_keyword_mode else self._research_sources(connection, asset["id"])
         authority_sources = self._authority_sources_for_asset(connection, asset)
         gsc_performance_sources = self._gsc_performance_sources_for_asset(connection, asset)
+        company_knowledge_sources = self._company_knowledge_sources_for_asset(connection, asset)
         self._link_authority_sources_for_asset(connection, asset, authority_sources)
         # Search Console data is deliberately a separate source family.  It
         # guides terminology, intent and internal-link choices, but is never
         # evidence for reader-facing product, safety, performance or ranking
         # claims.  Keeping the type explicit makes that boundary enforceable
         # in every model stage and auditable after generation.
-        sources = authority_sources + gsc_performance_sources + competitor_sources + manual_sources
+        sources = authority_sources + gsc_performance_sources + competitor_sources + company_knowledge_sources + manual_sources
         project_context, industry_rules = self._generate_project_industry_rules(
             connection, asset, generator, provider, model, generation_job_id,
             audience=audience, business_goal=goal,
@@ -4893,14 +4976,16 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             "priority": "Fixed safety and evidence rules override dynamic industry preferences.",
         }
         if analysis is None:
-            data = {"topic": asset["title_snapshot"], "primary_keyword": asset["keyword"], "language_market": asset["locale"], "audience": audience, "business_goal": goal, "brand": self._optional_text(payload, "brand") or "", "project_context": project_context, "writing_policy": writing_policy, "sources": sources, "learning_memories": payload.get("learning_memories", []), "constraints": payload.get("constraints", [])}
+            data = {"topic": asset["title_snapshot"], "primary_keyword": asset["keyword"], "language_market": asset["locale"], "country_code": asset["country_code"], "audience": audience, "business_goal": goal, "brand": self._optional_text(payload, "brand") or "", "project_context": project_context, "writing_policy": writing_policy, "sources": sources, "learning_memories": payload.get("learning_memories", []), "constraints": payload.get("constraints", [])}
             semantic, _run = self._run_content_stage(connection, asset, "semantic", data, generator, provider, model, generation_job_id)
         else:
             semantic = {"intent": {"dominant": analysis.get("search_intent", ""), "secondary": [], "reader_job": ""}, "entities": analysis.get("entities", []), "gaps_or_conflicts": [{"item": item, "action": "cover"} for item in analysis.get("missing_gaps", []) if isinstance(item, str)], "angle": "Competitor-informed original synthesis.", "must_cover": analysis.get("missing_gaps", [])}
-        brief_json = {"project_context": project_context, "industry_rules": industry_rules, "fixed_safety_rules": list(FIXED_CONTENT_SAFETY_RULES), "semantic": semantic, "competitor_analysis": analysis or {}, "learning_memories": payload.get("learning_memories", []), "source_policy": "Material facts without a usable source must be recorded in unresolved_verify and omitted from reader-facing text, unless a genuinely general non-factual explanation is useful."}
+        brief_json = {"project_context": project_context, "industry_rules": industry_rules, "fixed_safety_rules": list(FIXED_CONTENT_SAFETY_RULES), "semantic": semantic, "competitor_analysis": analysis or {}, "learning_memories": [] if direct_keyword_mode else payload.get("learning_memories", []), "source_policy": "Material facts without a usable source must be recorded in unresolved_verify and omitted from reader-facing text, unless a genuinely general non-factual explanation is useful.", "direct_keyword_mode": direct_keyword_mode}
+        requested_target_length = self._integer(payload, "target_length") if "target_length" in payload else 0
+        target_length = max(MINIMUM_ARTICLE_BODY_WORDS, requested_target_length) if requested_target_length <= 4_000 else MINIMUM_ARTICLE_BODY_WORDS
         with connection:
             connection.execute("UPDATE content_briefs SET status='superseded' WHERE content_asset_id=? AND status='current'", (asset["id"],))
-            cursor = connection.execute("INSERT INTO content_briefs(content_asset_id,target_audience,business_goal,target_length,sources_json,brief_json,agent_job_id) VALUES(?,?,?,?,?,?,?)", (asset["id"], audience, goal, 0, json.dumps(sources, ensure_ascii=False), json.dumps(brief_json, ensure_ascii=False), agent_job_id))
+            cursor = connection.execute("INSERT INTO content_briefs(content_asset_id,target_audience,business_goal,target_length,sources_json,brief_json,agent_job_id) VALUES(?,?,?,?,?,?,?)", (asset["id"], audience, goal, target_length, json.dumps(sources, ensure_ascii=False), json.dumps(brief_json, ensure_ascii=False), agent_job_id))
             connection.execute("UPDATE content_assets SET status='briefing',current_brief_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (cursor.lastrowid, asset["id"]))
             row = connection.execute("SELECT * FROM content_briefs WHERE id=?", (cursor.lastrowid,)).fetchone()
         return self._content_brief_payload(row)
@@ -4919,6 +5004,8 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             return
         incoming = self._content_sources(raw_sources)
         company_sources = [source for source in incoming if source.get("source_type") == "company_knowledge"]
+        if not company_sources:
+            company_sources = self._company_knowledge_sources_for_asset(connection, asset)
         brief = self._current_content_brief(connection, asset)
         existing = self._content_brief_payload(brief)["sources"]
         preserved = [
@@ -5000,11 +5087,49 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             })
         return sources
 
+    def _company_knowledge_sources_for_asset(self, connection: sqlite3.Connection, asset: sqlite3.Row) -> list[dict[str, Any]]:
+        """Make ready website-crawl knowledge available without a UI re-post."""
+        rows = connection.execute(
+            """SELECT id,title,url,content,knowledge_type,summary,updated_at
+               FROM project_knowledge_documents
+               WHERE project_id=? AND status='ready'
+               ORDER BY updated_at DESC,id DESC""",
+            (asset["project_id"],),
+        ).fetchall()
+        topic_terms = self._gsc_context_terms(asset["keyword"], asset["title_snapshot"])
+        ranked: list[tuple[int, sqlite3.Row]] = []
+        for row in rows:
+            text = f"{row['title'] or ''} {row['summary'] or ''} {row['content'] or ''}"
+            overlap = len(topic_terms & self._gsc_context_terms(text))
+            product_bonus = 2 if str(row["knowledge_type"] or "") in {"product", "company"} else 0
+            ranked.append((overlap * 10 + product_bonus, row))
+        ranked.sort(key=lambda item: item[0], reverse=True)
+        sources: list[dict[str, Any]] = []
+        for _score, row in ranked[:8]:
+            content = str(row["content"] or "").strip()
+            if not content:
+                continue
+            sources.append({
+                "source_id": f"company-knowledge-{row['id']}",
+                "source_type": "company_knowledge",
+                "availability": "available",
+                "title": str(row["title"] or "")[:300],
+                "url": str(row["url"] or "")[:2000],
+                "publisher": "Current website first-party knowledge",
+                "updated_at": str(row["updated_at"] or ""),
+                "knowledge_type": str(row["knowledge_type"] or ""),
+                "content": content[:12_000],
+            })
+        return sources
+
     def _authority_sources_for_asset(self, connection: sqlite3.Connection, asset: sqlite3.Row) -> list[dict[str, Any]]:
-        rows = connection.execute("SELECT * FROM authority_source_library WHERE project_id=? ORDER BY CASE authority_level WHEN 'primary' THEN 0 WHEN 'authoritative' THEN 1 WHEN 'supporting' THEN 2 ELSE 3 END,updated_at DESC", (asset["project_id"],)).fetchall()
+        rows = connection.execute(
+            "SELECT * FROM authority_source_library WHERE project_id=? AND authority_level IN ('primary','authoritative') AND url IS NOT NULL ORDER BY CASE authority_level WHEN 'primary' THEN 0 WHEN 'authoritative' THEN 1 ELSE 2 END,updated_at DESC",
+            (asset["project_id"],),
+        ).fetchall()
         terms = {term.casefold() for term in re.findall(r"[A-Za-z0-9]+", f"{asset['keyword']} {asset['title_snapshot']}") if len(term) > 2}
         ranked = sorted(rows, key=lambda row: sum(term in f"{row['title']} {row['content']}".casefold() for term in terms), reverse=True)[:5]
-        return [{"source_id": f"authority-{row['id']}", "source_type": "authority_source", "availability": "available", "url": row["url"], "publisher": row["publisher"], "published_at": row["published_at"], "title": row["title"], "authority_level": row["authority_level"], "content": row["content"][:12000]} for row in ranked]
+        return [{"source_id": f"authority-{row['id']}", "source_type": "authority_source", "availability": "available", "url": row["url"], "publisher": row["publisher"], "published_at": row["published_at"], "title": row["title"], "authority_level": row["authority_level"], "content": row["content"][:12000]} for row in ranked if self._authority_domain_allowed(self._internal_host_key(str(row["url"] or "")))]
 
     @staticmethod
     def _link_authority_sources_for_asset(connection: sqlite3.Connection, asset: sqlite3.Row, sources: list[dict[str, Any]]) -> None:
@@ -5020,48 +5145,78 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             connection, asset, brief, self._content_brief_payload(brief), generator, provider, model, generation_job_id
         )
         semantic = brief_payload["brief"].get("semantic", {})
-        competitor_analysis = brief_payload["brief"].get("competitor_analysis", {})
+        # A brief may have been created before the user ran a newer competitor
+        # collection.  The final outline must learn from the newest completed
+        # collection, not from stale competitor headings stored in that brief.
+        # Keep the non-competitor evidence durable while replacing only this
+        # research-derived planning signal.
+        direct_keyword_mode = payload.get("use_competitor_learning") is not True or bool(brief_payload["brief"].get("direct_keyword_mode"))
+        current_competitor_sources, current_competitor_analysis = ([], None) if direct_keyword_mode else self._research_sources(connection, int(asset["id"]))
+        competitor_analysis = {} if direct_keyword_mode else (current_competitor_analysis or brief_payload["brief"].get("competitor_analysis", {}))
+        if current_competitor_analysis is not None and not direct_keyword_mode:
+            refreshed_sources = [
+                source for source in brief_payload["sources"]
+                if not (isinstance(source, Mapping) and source.get("source_type") == "competitor_page")
+            ] + current_competitor_sources
+            brief_payload["sources"] = refreshed_sources
+            refreshed_brief = dict(brief_payload["brief"])
+            refreshed_brief["competitor_analysis"] = competitor_analysis
+            with connection:
+                connection.execute(
+                    "UPDATE content_briefs SET sources_json=?,brief_json=? WHERE id=?",
+                    (json.dumps(refreshed_sources, ensure_ascii=False), json.dumps(refreshed_brief, ensure_ascii=False), brief["id"]),
+                )
+            brief_payload["brief"] = refreshed_brief
         writing_policy = self._writing_policy(brief_payload["brief"])
         project_context = brief_payload["brief"].get("project_context", {})
-        if isinstance(competitor_analysis, Mapping) and isinstance(competitor_analysis.get("dynamic_outline"), list) and competitor_analysis["dynamic_outline"]:
-            sections = competitor_analysis["dynamic_outline"]
-            outline_json = {"intro_brief": "Answer the reader need directly.", "sections": sections, "conclusion_brief": "Summarize the decision and invite a B2B enquiry.", "cta_placement": "after conclusion"}
-            metadata = {"selected_title": asset["title_snapshot"], "meta_description": ""}
-            prepared_sections = sections
-        else:
-            prepared_sections = None
-        learning_memories = brief_payload["brief"].get("learning_memories", [])
-        title_data = {"semantic": semantic, "project_context": project_context, "writing_policy": writing_policy, "primary_keyword": asset["keyword"], "title_snapshot": asset["title_snapshot"], "voice": self._optional_text(payload, "voice") or "clear, helpful American English", "learning_memories": learning_memories, "year_rule": "none"}
-        if prepared_sections is None:
-            metadata, _run = self._run_content_stage(connection, asset, "title", title_data, generator, provider, model, generation_job_id)
-            if not isinstance(metadata.get("selected_title"), str) or not metadata["selected_title"].strip():
-                metadata["selected_title"] = asset["title_snapshot"]
-            metadata["selected_title"] = asset["title_snapshot"]  # The user-approved title is canonical.
+        learning_memories = [] if direct_keyword_mode else brief_payload["brief"].get("learning_memories", [])
+        title_data = {"semantic": semantic, "project_context": project_context, "writing_policy": writing_policy, "primary_keyword": asset["keyword"], "title_snapshot": asset["title_snapshot"], "country_code": asset["country_code"], "voice": self._optional_text(payload, "voice") or "clear, helpful American English", "learning_memories": learning_memories, "year_rule": "none"}
+        metadata, _run = self._run_content_stage(connection, asset, "title", title_data, generator, provider, model, generation_job_id)
+        if not isinstance(metadata.get("selected_title"), str) or not metadata["selected_title"].strip():
+            metadata["selected_title"] = asset["title_snapshot"]
+        metadata["selected_title"] = asset["title_snapshot"]  # The user-approved title is canonical.
         updated_brief = self._content_brief_payload(brief)["brief"]
         updated_brief["metadata"] = metadata
         with connection:
             connection.execute("UPDATE content_briefs SET brief_json=? WHERE id=?", (json.dumps(updated_brief, ensure_ascii=False), brief["id"]))
-        outline_data = {"semantic": semantic, "project_context": project_context, "writing_policy": writing_policy, "metadata": metadata, "cta": self._optional_text(payload, "cta") or "", "sources": brief_payload["sources"], "learning_memories": learning_memories}
-        if prepared_sections is None:
-            outline_json, _run = self._run_content_stage(connection, asset, "outline", outline_data, generator, provider, model, generation_job_id)
-        else:
-            company_sources = [source for source in brief_payload["sources"] if isinstance(source, Mapping) and source.get("source_type") == "company_knowledge"]
-            if company_sources:
-                plan_data = {
-                    "topic": asset["title_snapshot"],
-                    "primary_keyword": asset["keyword"],
-                    "project_context": project_context,
-                    "writing_policy": writing_policy,
-                    "approved_outline": prepared_sections,
-                    "sources": company_sources,
-                    "instruction": "Plan company knowledge placement before H2 drafting; keep the approved competitor outline unchanged.",
-                }
-                company_plan, _run = self._run_content_stage(connection, asset, "company_context_plan", plan_data, generator, provider, model, generation_job_id)
-                outline_json = {**outline_json, "company_context_plan": company_plan}
+        target_length = int(brief["target_length"] or 0)
+        outline_data = {"semantic": semantic, "project_context": project_context, "writing_policy": writing_policy, "metadata": metadata, "country_code": asset["country_code"], "cta": self._optional_text(payload, "cta") or "", "sources": brief_payload["sources"], "learning_memories": learning_memories, "competitor_learning": competitor_analysis, "editorial_constraints": self._outline_editorial_constraints(asset["title_snapshot"], target_length=target_length, direct_keyword_mode=direct_keyword_mode), "direct_keyword_mode": direct_keyword_mode}
+        # Competitor-derived headings are useful coverage suggestions, never a
+        # frozen final outline. The current writing policy and title intent
+        # must get one focused editorial pass before the outline is persisted.
+        outline_json, _run = self._run_content_stage(connection, asset, "outline", outline_data, generator, provider, model, generation_job_id)
         sections = outline_json.get("sections")
         if not isinstance(sections, list) or not sections:
             raise ContentGenerationProtocolError("AI content outline returned no usable sections.")
         sections = self._deduplicate_ai_outline_sections(asset["title_snapshot"], sections)
+        violation = self._outline_editorial_violation(asset["title_snapshot"], sections)
+        if violation:
+            # Let the outline model correct its own draft rather than silently
+            # persisting a mechanically trimmed outline.  This keeps the
+            # editorial decisions AI-authored while enforcing the approved
+            # reader-journey contract.
+            correction_data = dict(outline_data)
+            correction_data["previous_outline_candidate"] = outline_json
+            correction_data["required_correction"] = violation
+            outline_json, _run = self._run_content_stage(connection, asset, "outline", correction_data, generator, provider, model, generation_job_id)
+            sections = outline_json.get("sections")
+            if not isinstance(sections, list) or not sections:
+                raise ContentGenerationProtocolError("AI content outline correction returned no usable sections.")
+            sections = self._deduplicate_ai_outline_sections(asset["title_snapshot"], sections)
+            violation = self._outline_editorial_violation(asset["title_snapshot"], sections)
+            if violation:
+                if "unsupported precise claim" not in violation:
+                    raise ContentGenerationProtocolError(f"AI content outline did not satisfy the focused reader-journey rule: {violation}")
+                # The model has already received a correction pass.  If it
+                # still repeats a fact that has no usable evidence, preserve
+                # its AI-authored reader journey but remove only that unsafe
+                # planning detail.  The writer then receives a clear generic
+                # action and an internal evidence gap instead of a fabricated
+                # American-standard or product-performance claim.
+                sections = self._remove_unverified_outline_precision(sections)
+                violation = self._outline_editorial_violation(asset["title_snapshot"], sections)
+                if violation:
+                    raise ContentGenerationProtocolError(f"AI content outline did not satisfy the focused reader-journey rule: {violation}")
         sections = self._apply_ai_company_context_plan(sections, outline_json.get("company_context_plan"), brief_payload["sources"])
         if not sections:
             raise ContentGenerationProtocolError("AI content outline contained only the canonical title or duplicate headings; no usable H2 sections remained.")
@@ -5129,8 +5284,9 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             connection, asset, brief, self._content_brief_payload(brief), generator, provider, model, generation_job_id
         )
         semantic = brief_data["brief"].get("semantic", {})
-        competitor_learning = brief_data["brief"].get("competitor_analysis", {})
-        learning_memories = brief_data["brief"].get("learning_memories", [])
+        direct_keyword_mode = payload.get("use_competitor_learning") is not True or bool(brief_data["brief"].get("direct_keyword_mode"))
+        competitor_learning = {} if direct_keyword_mode else brief_data["brief"].get("competitor_analysis", {})
+        learning_memories = [] if direct_keyword_mode else brief_data["brief"].get("learning_memories", [])
         writing_policy = self._writing_policy(brief_data["brief"])
         project_context = brief_data["brief"].get("project_context", {})
         metadata = brief_data["brief"].get("metadata", {"selected_title": asset["title_snapshot"], "meta_description": ""})
@@ -5147,6 +5303,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         full_article_sections: list[dict[str, Any]] = []
         allowed_link_urls: set[str] = set()
         selected_source_ids: set[str] = set()
+        reserved_internal_urls: set[str] = set()
         for section in blueprint["sections"]:
             assigned_company_sources = company_context.get(int(section["position"]), [])
             assigned_company_ids = {str(source.get("source_id")) for source in assigned_company_sources}
@@ -5162,29 +5319,84 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 sources=brief_data["sources"], assigned_company_source_ids=assigned_company_ids,
             )
             section_context["eligible_internal_links"] = link_candidates
+            section_context["internal_link_plan"] = self._validated_internal_link_plan(
+                section_context.get("internal_link_plan"), link_candidates, reserved_internal_urls
+            )
+            if section_context["internal_link_plan"].get("use"):
+                reserved_internal_urls.add(str(section_context["internal_link_plan"]["target_url"]))
+            section_context["product_recommendation"] = self._validated_product_recommendation(
+                section_context.get("product_recommendation"), assigned_company_sources
+            )
             section_context["keyword_requirements"] = self._section_keyword_requirements(section_context, str(asset["keyword"] or ""))
             section_context["depth_requirements"] = self._section_depth_requirements(section_context)
-            section_context["internal_link_budget"] = {"article_maximum": 3, "h2_maximum": 1}
+            section_context["internal_link_budget"] = {"article_maximum": 10, "h2_maximum": 1}
             allowed_link_urls.update(candidate["target_url"] for candidate in link_candidates if candidate.get("target_url"))
             allowed_link_urls.update(self._canonical_internal_url(source.get("url")) for source in assigned_company_sources if self._canonical_internal_url(source.get("url")))
             selected_source_ids.update(str(source_id) for source_id in section_context.get("source_ids", []) if isinstance(source_id, str))
             selected_source_ids.update(assigned_company_ids)
             selected_source_ids.update(str(candidate["source_id"]) for candidate in link_candidates if candidate.get("source_id"))
-            with connection:
-                connection.execute("UPDATE content_outline_sections SET section_json=? WHERE outline_id=? AND position=?", (json.dumps(section_context, ensure_ascii=False), outline["id"], section["position"]))
+            selected_source_ids.update(
+                str(section_context["internal_link_plan"].get("target_source_id") or "")
+                for _ in [None] if section_context["internal_link_plan"].get("use")
+            )
+            selected_source_ids.update(
+                str(section_context["product_recommendation"].get("source_id") or "")
+                for _ in [None] if section_context["product_recommendation"].get("use")
+            )
             full_article_sections.append(section_context)
+        # A supplied set of related site pages should not disappear merely
+        # because the outline model declined every optional link. Fill only
+        # missing plans, one per H2 and one per URL, until the 3-link floor is
+        # reached when three distinct safe candidates actually exist.
+        available_internal_urls = {
+            str(candidate.get("target_url") or "")
+            for section in full_article_sections
+            for candidate in section.get("eligible_internal_links", [])
+            if isinstance(candidate, Mapping) and candidate.get("target_url")
+        }
+        target_internal_links = min(10, len(available_internal_urls))
+        required_internal_links = min(3, target_internal_links)
+        planned_internal_links = sum(1 for section in full_article_sections if section.get("internal_link_plan", {}).get("use") is True)
+        if planned_internal_links < required_internal_links:
+            for section_context in full_article_sections:
+                if planned_internal_links >= required_internal_links:
+                    break
+                if section_context.get("internal_link_plan", {}).get("use") is True:
+                    continue
+                fallback_plan = self._fallback_internal_link_plan(
+                    section_context.get("eligible_internal_links", []), reserved_internal_urls, section=section_context
+                )
+                if fallback_plan.get("use") is True:
+                    section_context["internal_link_plan"] = fallback_plan
+                    reserved_internal_urls.add(str(fallback_plan["target_url"]))
+                    planned_internal_links += 1
+        with connection:
+            for section_context in full_article_sections:
+                connection.execute(
+                    "UPDATE content_outline_sections SET section_json=? WHERE outline_id=? AND position=?",
+                    (json.dumps(section_context, ensure_ascii=False), outline["id"], section_context["position"]),
+                )
         scoped_sources = [source for source in brief_data["sources"] if isinstance(source, Mapping) and str(source.get("source_id") or "") in selected_source_ids]
         authority_urls = {
             self._canonical_internal_url(source.get("url")) for source in scoped_sources
-            if source.get("source_type") == "authority_source" and self._canonical_internal_url(source.get("url"))
+            if source.get("source_type") == "authority_source"
+            and str(source.get("authority_level") or "").casefold() in {"primary", "authoritative"}
+            and self._canonical_internal_url(source.get("url"))
+            and self._authority_domain_allowed(self._internal_host_key(self._canonical_internal_url(source.get("url"))))
         }
         article_sources = self._compact_full_article_sources(scoped_sources)
+        overall_requirements = self._article_depth_requirements(full_article_sections)
+        overall_requirements["minimum_total_words"] = max(
+            overall_requirements["minimum_total_words"], MINIMUM_ARTICLE_BODY_WORDS, int(brief["target_length"] or 0),
+        )
+        overall_requirements["target_length_note"] = "The article must exceed 3,000 English words. Reach this depth through distinct explanations, decision criteria, examples, and actionable checks—not repetition or unrelated topics."
         article_data = {
             "metadata": dict(metadata), "primary_keyword": str(asset["keyword"] or ""), "audience": brief["target_audience"],
+            "country_code": str(asset["country_code"] or "US"),
             "intent": semantic.get("intent", {}), "project_context": project_context, "writing_policy": writing_policy,
             "angle": semantic.get("angle", ""), "competitor_learning": competitor_learning, "learning_memories": learning_memories,
             "outline": {"intro_brief": outline_payload.get("intro_brief", ""), "sections": full_article_sections, "conclusion_brief": outline_payload.get("conclusion_brief", "")},
-            "overall_requirements": self._article_depth_requirements(full_article_sections),
+            "overall_requirements": overall_requirements,
             "sources": article_sources, "brand": self._optional_text(payload, "brand") or "", "cta": self._optional_text(payload, "cta") or "",
             "voice": self._optional_text(payload, "voice") or "clear, helpful American English", "language": asset["locale"],
             "reader_markdown_policy": "Return one complete Markdown article. Never display internal source IDs or verification labels; use portable Markdown tables and lists only.",
@@ -5193,8 +5405,29 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         if not isinstance(article.get("markdown"), str) or not article["markdown"].strip():
             raise ContentGenerationProtocolError("AI full article returned no Markdown.")
         markdown = self._sanitize_reader_markdown(article["markdown"])
-        markdown = self._enforce_full_article_links(markdown, allowed_link_urls | authority_urls)
+        markdown = self._enforce_full_article_links(markdown, internal_urls=allowed_link_urls, authority_urls=authority_urls)
         markdown = self._normalise_primary_keyword_emphasis(markdown, str(asset["keyword"] or ""))
+        if self._article_body_word_count(markdown) < MINIMUM_ARTICLE_BODY_WORDS:
+            correction_data = dict(article_data)
+            correction_data["previous_article_markdown"] = markdown
+            correction_data["required_correction"] = (
+                f"Replace the complete article with a deeper version whose body exceeds {MINIMUM_ARTICLE_BODY_WORDS - 1:,} English words. "
+                "Keep the approved H2 order, existing valid links, and factual boundaries; expand only with non-overlapping reader value. "
+                "Do not add a reference appendix."
+            )
+            article, article_run = self._run_content_stage(connection, asset, "full_article", correction_data, generator, provider, model, generation_job_id)
+            if not isinstance(article.get("markdown"), str) or not article["markdown"].strip():
+                raise ContentGenerationProtocolError("AI full-article length correction returned no Markdown.")
+            markdown = self._normalise_primary_keyword_emphasis(
+                self._enforce_full_article_links(
+                    self._sanitize_reader_markdown(article["markdown"]), internal_urls=allowed_link_urls, authority_urls=authority_urls,
+                ),
+                str(asset["keyword"] or ""),
+            )
+            if self._article_body_word_count(markdown) < MINIMUM_ARTICLE_BODY_WORDS:
+                raise ContentGenerationProtocolError(
+                    f"AI full article body remained below the required {MINIMUM_ARTICLE_BODY_WORDS - 1:,} words after one complete-article correction."
+                )
         verification = article.get("verify", []) if isinstance(article.get("verify", []), list) else []
         verification = list(dict.fromkeys(verification))
         sources_used = article.get("sources_used", []) if isinstance(article.get("sources_used", []), list) else []
@@ -5204,6 +5437,20 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 for claim in article.get("claims_used", []) if isinstance(claim, Mapping) and isinstance(claim.get("source_ids"), list)
                 for source_id in claim["source_ids"] if isinstance(source_id, str)
             ))
+        # A writer can correctly place an authority link in prose while
+        # omitting sources_used. Recover only the exact supplied authority
+        # source in that narrow case; this never turns an arbitrary URL into a
+        # footer citation.
+        sources_used = list(dict.fromkeys([
+            *[str(source_id) for source_id in sources_used if isinstance(source_id, str) and source_id],
+            *[
+                str(source.get("source_id") or "")
+                for source in scoped_sources
+                if source.get("source_type") == "authority_source"
+                and self._canonical_internal_url(source.get("url"))
+                and self._canonical_internal_url(source.get("url")) in markdown
+            ],
+        ]))
         compatibility_qa = {"status": "not_run", "checks": [], "unresolved_verify": verification}
         content_tags = self._generate_content_tags(
             asset=asset,
@@ -5220,9 +5467,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                    version,title,meta_description,markdown,sources_used_json,unresolved_verify_json,qa_json,
                    qa_status,provider,model
                 ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (asset["project_id"], asset["id"], outline["id"], article_run["id"], generation_job_id, parent_draft_id, version, str(article.get("title") or metadata.get("selected_title") or asset["title_snapshot"]), str(article.get("meta_description") or metadata.get("meta_description") or ""), markdown, json.dumps(sources_used, ensure_ascii=False), json.dumps(verification, ensure_ascii=False), json.dumps(compatibility_qa, ensure_ascii=False), "not_run", provider, model))
-            source_count = int(connection.execute("SELECT COUNT(*) FROM content_authority_source_links WHERE project_id=? AND content_asset_id=?", (asset["project_id"], asset["id"])).fetchone()[0])
-            asset_status = "ready_to_publish" if source_count else "needs_revision"
-            connection.execute("UPDATE content_assets SET status=?,current_draft_id=?,current_generation_run_id=?,tags_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (asset_status, cursor.lastrowid, article_run["id"], json.dumps(content_tags, ensure_ascii=False), asset["id"]))
+            connection.execute("UPDATE content_assets SET status='ready_to_publish',current_draft_id=?,current_generation_run_id=?,tags_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (cursor.lastrowid, article_run["id"], json.dumps(content_tags, ensure_ascii=False), asset["id"]))
             draft = connection.execute("SELECT * FROM content_drafts WHERE id=?", (cursor.lastrowid,)).fetchone()
         return self._content_draft_payload(draft)
 
@@ -5290,16 +5535,16 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         try:
             minimum_subtopics = int(raw.get("minimum_subtopics"))
         except (TypeError, ValueError):
-            minimum_subtopics = max(3, min(5, len(section.get("key_points", [])) or 3))
+            minimum_subtopics = max(4, min(6, len(section.get("key_points", [])) or 4))
         if minimum_subtopics <= 0:
-            minimum_subtopics = max(3, min(5, len(section.get("key_points", [])) or 3))
+            minimum_subtopics = max(4, min(6, len(section.get("key_points", [])) or 4))
         try:
             recommended_words = int(section.get("target_words") or 0)
         except (TypeError, ValueError):
             recommended_words = 0
         return {
-            "minimum_non_overlapping_subtopics": max(2, min(minimum_subtopics, 5)),
-            "minimum_words": max(180, min(420, recommended_words or 280)),
+            "minimum_non_overlapping_subtopics": max(3, min(minimum_subtopics, 6)),
+            "minimum_words": max(220, min(480, recommended_words or 320)),
             "reader_outcome": str(raw.get("reader_outcome") or section.get("purpose") or "Help the reader make the next decision.")[:300],
             "required_practical_detail": str(raw.get("practical_detail") or section.get("reader_question") or "Give a practical check, condition, trade-off, or action.")[:300],
         }
@@ -5308,32 +5553,84 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
     def _article_depth_requirements(sections: list[Mapping[str, Any]]) -> dict[str, Any]:
         section_minimums = [int((section.get("depth_requirements") or {}).get("minimum_words") or 0) for section in sections]
         return {
-            "minimum_total_words": max(900, sum(section_minimums) + 140),
+            "minimum_total_words": max(MINIMUM_ARTICLE_BODY_WORDS, sum(section_minimums) + 180),
             "required_h2_count": len(sections),
             "depth_rule": "Every H2 must answer its distinct reader question and meet its own non-overlapping subtopic requirement; do not meet length by repeating introductions, conclusions, or generic cautions.",
             "keyword_rule": "Use the primary keyword once in the opening and use supporting terms only where they clarify the H2 topic. Natural relevance is more important than repetition.",
         }
 
+    @staticmethod
+    def _article_body_word_count(markdown: str) -> int:
+        """Count reader-facing article words."""
+        return len(re.findall(r"\b[\w][\w'’-]*\b", str(markdown or "")))
+
     @classmethod
-    def _enforce_full_article_links(cls, markdown: str, allowed_urls: set[str]) -> str:
+    def _enforce_full_article_links(
+        cls, markdown: str, *, internal_urls: set[str], authority_urls: set[str],
+    ) -> str:
         """Keep only exact, project-scoped or authority URLs supplied to the one-pass writer."""
         written_internal: set[str] = set()
+        allowed_urls = internal_urls | authority_urls
 
         def keep_only_allowed(match: re.Match[str]) -> str:
             label = match.group(1)
             destination = cls._canonical_internal_url(match.group(2))
             if not destination or destination not in allowed_urls:
                 return label
-            is_internal = destination in allowed_urls
+            is_internal = destination in internal_urls
             if is_internal and destination in written_internal:
                 return label
             if is_internal:
-                if len(written_internal) >= 3:
+                if len(written_internal) >= 10:
                     return label
                 written_internal.add(destination)
             return f"[{label}]({destination})"
 
         return re.sub(r"(?<!!)\[([^\]]+)\]\(([^\s)]+)(?:\s+['\"][^'\"]*['\"])?\)", keep_only_allowed, markdown)
+
+    @classmethod
+    def _append_authority_reference_block(
+        cls, markdown: str, *, sources: list[Mapping[str, Any]], source_ids: list[str],
+    ) -> str:
+        """Append a traceable footer without ever inventing an authority URL."""
+        footer_heading = "## 权威参考与验证链接"
+        # The model is explicitly asked not to render this block. Strip a
+        # duplicate trailing attempt so only validated, structured references
+        # can reach the reader.
+        markdown = re.sub(r"\n*##\s*(?:权威参考与验证链接|Authoritative References\s*&\s*Verification Links)\s*[\s\S]*$", "", str(markdown or ""), flags=re.IGNORECASE).rstrip()
+        selected = {str(source_id) for source_id in source_ids if isinstance(source_id, str) and source_id}
+        seen_urls: set[str] = set()
+        rows: list[tuple[str, str, str]] = []
+        for source in sources:
+            if not isinstance(source, Mapping) or str(source.get("source_id") or "") not in selected:
+                continue
+            if source.get("source_type") != "authority_source":
+                continue
+            url = cls._canonical_internal_url(source.get("url"))
+            host = cls._internal_host_key(url)
+            authority_level = str(source.get("authority_level") or "").casefold()
+            allowed_host = (
+                host.endswith(".gov") or ".gov." in host or host.endswith(".edu") or ".edu." in host
+                or host in {"iec.ch", "ies.org", "iso.org", "astm.org", "batteryuniversity.com"}
+                or host.endswith(".iec.ch") or host.endswith(".ies.org") or host.endswith(".iso.org") or host.endswith(".astm.org")
+            )
+            if not url or url in seen_urls or authority_level not in {"primary", "authoritative"} or not allowed_host:
+                continue
+            publisher = re.sub(r"\s+", " ", str(source.get("publisher") or host)).strip()[:160]
+            title = re.sub(r"\s+", " ", str(source.get("title") or "")).strip()[:300]
+            if not publisher or not title:
+                continue
+            seen_urls.add(url)
+            rows.append((publisher, title, url))
+            if len(rows) == 5:
+                break
+        if not rows:
+            return markdown
+        lines = [markdown, "", footer_heading, ""]
+        for publisher, title, url in rows:
+            lines.append(f"- **{publisher}** – {title} [链接]({url})")
+            lines.append(f"  - 备用验证方式：搜索完整标题“{title}”。")
+        return "\n".join(lines).strip()
 
     @staticmethod
     def _generate_content_tags(*, asset: sqlite3.Row, semantic: Any, headings: list[str], markdown: str, generator: Any) -> list[str]:
@@ -5604,6 +5901,52 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         }
 
     @classmethod
+    def _fallback_internal_link_plan(
+        cls, candidates: Any, reserved_urls: set[str], *, section: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Create one bounded natural link plan from an already-vetted page."""
+        empty = {"use": False, "anchor_text": "", "anchor_type": "", "target_url": "", "target_source_id": "", "placement": "", "reason": ""}
+        if not isinstance(candidates, list):
+            return empty
+        section_text = " ".join(
+            [str(section.get(field) or "") for field in ("heading", "purpose", "reader_question")] +
+            [str(value) for value in section.get("key_points", []) if isinstance(value, str)]
+        ).casefold() if isinstance(section, Mapping) else ""
+        for candidate in candidates:
+            if not isinstance(candidate, Mapping):
+                continue
+            target_url = cls._canonical_internal_url(candidate.get("target_url"))
+            source_id = str(candidate.get("source_id") or "")
+            if not target_url or not source_id or target_url in reserved_urls:
+                continue
+            raw_title = re.sub(r"^(?:Search Console intent signal|GSC internal-link anchor):\s*", "", str(candidate.get("title") or ""), flags=re.IGNORECASE)
+            anchor_text = re.sub(r"\s+", " ", raw_title).strip(" -:;,. ")[:90]
+            if len(anchor_text) < 2:
+                continue
+            if section_text and str(candidate.get("source_type") or "") in {"gsc_performance", "gsc_anchor"}:
+                anchor_terms = set(cls._gsc_context_terms(anchor_text))
+                section_terms = set(cls._gsc_context_terms(section_text))
+                # A shared broad word such as "solar" is not enough. Permit a
+                # buying-guide query only in a selection/replacement decision
+                # and a retaining-wall query only in a placement/sunlight
+                # decision; other GSC pages need a concrete topic-term match.
+                specific_match = len((anchor_terms - {"solar"}) & section_terms)
+                is_selection_match = "best" in anchor_text.casefold() and bool(re.search(r"\b(?:buy|choose|compare|decid|select)\w*\b", section_text))
+                is_placement_match = "retaining" in anchor_text.casefold() and bool(re.search(r"\b(?:place|location|sunlight|shade|relocat|layout)\w*\b", section_text))
+                if not (specific_match or is_selection_match or is_placement_match):
+                    continue
+            return {
+                "use": True,
+                "anchor_text": anchor_text,
+                "anchor_type": "gsc_query" if str(candidate.get("source_type") or "") in {"gsc_performance", "gsc_anchor"} else "descriptive",
+                "target_url": target_url,
+                "target_source_id": source_id,
+                "placement": "Use once in the paragraph where this page is a useful next step; do not turn it into a standalone CTA.",
+                "reason": "A supplied current-site page is materially related to this reader decision.",
+            }
+        return empty
+
+    @classmethod
     def _enforce_section_internal_link_plan(cls, markdown: str, plan: Mapping[str, Any]) -> tuple[str, bool]:
         """Remove model-invented links while preserving their visible wording.
 
@@ -5735,6 +6078,98 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         return usable
 
     @staticmethod
+    def _outline_editorial_constraints(title: str, *, target_length: int = 0, direct_keyword_mode: bool = False) -> dict[str, Any]:
+        """Return explicit AI-facing constraints for a title's reader job."""
+        is_yes_no_suitability = bool(re.match(r"^\s*(?:can|is|are|should)\b", str(title or ""), re.IGNORECASE))
+        depth_target = {}
+        if 1_200 <= target_length <= 4_000:
+            depth_target = {
+                "target_word_range": {"min": target_length, "max": min(4_000, target_length + 400)},
+                "depth_rule": "Meet the target through additional non-overlapping decision detail within the existing reader journey, never by repeating a prerequisite or adding unrelated H2s.",
+            }
+        if not is_yes_no_suitability:
+            return {"reader_journey": "Use only non-overlapping H2 decisions; choose the count from the title promise and evidence.", **depth_target}
+        return {
+            "reader_journey": "This is a yes/no suitability article. The introduction gives the answer, then the H2s move from evaluation to action.",
+            "h2_count_rule": "Choose the H2 count from the approved title promise, reader decisions, and available evidence. Do not add a heading only to reach a count.",
+            "forbidden_h2_roles": ["Direct Answer", "Quick Answer", "introductory answer", "duplicate comparison and exception"],
+            "coverage_rule": "Explain a prerequisite once and apply it later. Merge any comparison and exception that answer the same suitability decision.",
+            **depth_target,
+        }
+
+    @staticmethod
+    def _outline_editorial_violation(title: str, sections: list[Mapping[str, Any]]) -> str | None:
+        """Identify a contract breach that warrants one AI outline correction."""
+        if not re.match(r"^\s*(?:can|is|are|should)\b", str(title or ""), re.IGNORECASE):
+            return None
+        banned = [str(item.get("heading") or "") for item in sections if re.search(r"\b(?:direct|quick)\s+answer\b", str(item.get("heading") or ""), re.IGNORECASE)]
+        if banned:
+            return "The introduction already gives the answer; remove the separate answer H2(s): " + ", ".join(banned)
+        # In suitability guides an IP rating is a prerequisite, not a second
+        # reader journey.  One H2 may teach it; later sections may apply it
+        # without becoming a second rating tutorial.  This catches the common
+        # 'can I use it?' / 'which rating do I need?' duplication before it is
+        # frozen into the one-pass article prompt.
+        ip_tutorials = [
+            str(item.get("heading") or "")
+            for item in sections
+            if re.search(r"\bip\s*(?:rating|ratings)\b", str(item.get("heading") or ""), re.IGNORECASE)
+        ]
+        # The prompt asks the outline model to merge this common overlap.  It
+        # is not a safe deterministic merge, so do not discard an otherwise
+        # valid AI-authored outline merely because the model still names two
+        # related IP decisions; the later full-article prompt removes recap.
+        for section in sections:
+            source_ids = section.get("source_ids") if isinstance(section.get("source_ids"), list) else []
+            has_material_evidence = any(
+                isinstance(source_id, str) and (source_id.startswith("authority-") or source_id.startswith("company-"))
+                for source_id in source_ids
+            )
+            key_points = section.get("key_points") if isinstance(section.get("key_points"), list) else []
+            detail = " ".join(str(point) for point in key_points)
+            unsupported_precision = re.search(
+                r"\b(?:IP\s*\d+|GFCI|NEC|UL|ETL|NEMA|\d+(?:\.\d+)?\s*(?:V|K|ft|feet|%|years?|months?|hours?|watts?))\b",
+                detail,
+                re.IGNORECASE,
+            )
+            if not has_material_evidence and unsupported_precision:
+                return (
+                    f"{section.get('heading') or 'This section'} has only competitor/GSC planning sources but includes an unsupported precise claim "
+                    f"({unsupported_precision.group(0)}). Replace it with general decision guidance and record the missing authority or first-party evidence in evidence_gaps."
+                )
+        return None
+
+    @staticmethod
+    def _remove_unverified_outline_precision(sections: list[Mapping[str, Any]]) -> list[Mapping[str, Any]]:
+        """Remove ungrounded technical specifics after an unsuccessful AI correction."""
+        precise_pattern = re.compile(
+            r"\b(?:IP\s*\d+|GFCI|NEC|UL|ETL|NEMA|\d+(?:\.\d+)?\s*(?:V|K|ft|feet|%|years?|months?|hours?|watts?))\b",
+            re.IGNORECASE,
+        )
+        cleaned: list[Mapping[str, Any]] = []
+        for raw_section in sections:
+            section = dict(raw_section)
+            source_ids = section.get("source_ids") if isinstance(section.get("source_ids"), list) else []
+            has_material_evidence = any(
+                isinstance(source_id, str) and (source_id.startswith("authority-") or source_id.startswith("company-"))
+                for source_id in source_ids
+            )
+            points = section.get("key_points") if isinstance(section.get("key_points"), list) else []
+            if not has_material_evidence:
+                retained = [point for point in points if isinstance(point, str) and not precise_pattern.search(point)]
+                if len(retained) != len(points):
+                    if not retained:
+                        retained = ["Follow the product documentation and use a qualified local professional when the installation requires expertise."]
+                    section["key_points"] = retained
+                    gaps = section.get("evidence_gaps") if isinstance(section.get("evidence_gaps"), list) else []
+                    section["evidence_gaps"] = list(dict.fromkeys([
+                        *[str(gap) for gap in gaps if isinstance(gap, str) and gap.strip()],
+                        "Specific technical, certification, and local electrical details require a directly applicable authority or first-party product source.",
+                    ]))
+            cleaned.append(section)
+        return cleaned
+
+    @staticmethod
     def _numbered_listicle_count(title: str) -> int | None:
         """Return the promised item count for a real numbered ideas/list title."""
         match = re.match(r"^\s*(\d{1,2})\b", title)
@@ -5776,8 +6211,10 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             "company_context_source_ids": strings("company_context_source_ids"),
             "company_context_role": section.get("company_context_role") if isinstance(section.get("company_context_role"), str) else "",
             "company_context_link_url": section.get("company_context_link_url") if isinstance(section.get("company_context_link_url"), str) else "",
+            "internal_link_plan": dict(section.get("internal_link_plan")) if isinstance(section.get("internal_link_plan"), Mapping) else {},
+            "product_recommendation": dict(section.get("product_recommendation")) if isinstance(section.get("product_recommendation"), Mapping) else {},
             "keyword_requirements": {"supporting_terms": strings_from(raw_keywords.get("supporting_terms")), "minimum_supporting_terms": max(0, min(minimum_terms, 4))},
-            "depth_requirements": {"minimum_subtopics": max(0, min(minimum_subtopics, 5)), "reader_outcome": str(raw_depth.get("reader_outcome") or "")[:300], "practical_detail": str(raw_depth.get("practical_detail") or "")[:300]},
+            "depth_requirements": {"minimum_subtopics": max(0, min(minimum_subtopics, 6)), "reader_outcome": str(raw_depth.get("reader_outcome") or "")[:300], "practical_detail": str(raw_depth.get("practical_detail") or "")[:300]},
             "target_words": max(0, int(section.get("target_words") or 0)),
         }
 
@@ -6239,7 +6676,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                     (content_asset_id, project_id),
                 ).fetchone() is None:
                     raise ValueError("content asset does not exist in this project")
-                if is_full_content_agent and content_asset_id is not None:
+                if is_full_content_agent and content_asset_id is not None and payload.get("use_competitor_learning") is True:
                     self._require_content_competitor_learning(
                         connection, self._content_asset(connection, project_id, content_asset_id)
                     )
@@ -6256,6 +6693,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                         "cta": (self._optional_text(payload, "cta") or "")[:1000],
                         "brand": (self._optional_text(payload, "brand") or "")[:1000],
                         "sources": self._content_sources(payload.get("sources", [])),
+                        "use_competitor_learning": payload.get("use_competitor_learning") is True,
                         "constraints": [str(item)[:500] for item in payload.get("constraints", [])[:20] if isinstance(item, str)] if isinstance(payload.get("constraints"), list) else [],
                     }
                 cursor = connection.execute(
@@ -8539,12 +8977,11 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
     def _workflow_status_payload(row: Mapping[str, Any]) -> dict[str, str]:
         outlined = row["current_outline_id"] is not None
         completed = row["current_draft_id"] is not None
-        cited = completed and row["status"] == "ready_to_publish"
         return {
             "outline_status": "completed" if outlined else "pending",
             "outline_status_label": "大纲完成" if outlined else "待大纲",
-            "content_status": "completed" if cited else ("needs_sources" if completed else "pending"),
-            "content_status_label": "内容完成 · 引用已验证" if cited else ("缺少权威引用 · 不可发布" if completed else "待生成内容"),
+            "content_status": "completed" if completed else "pending",
+            "content_status_label": "内容完成" if completed else "待生成内容",
         }
 
     @classmethod
@@ -9305,7 +9742,7 @@ def _provider_configuration(ai_settings_path: Path, provider: str | None) -> tup
         return (api_key, _normalize_ai_base_url(base_url), model) if api_key else None
     api_key = _configured_value("DEEPSEEK_API_KEY")
     base_url = _configured_value("DEEPSEEK_BASE_URL")
-    model = _configured_value("DEEPSEEK_MODEL") or "deepseek-v4-pro"
+    model = _configured_value("DEEPSEEK_MODEL") or "deepseek-v4-flash"
     return (api_key, _normalize_ai_base_url(base_url), model) if api_key and base_url else None
 
 

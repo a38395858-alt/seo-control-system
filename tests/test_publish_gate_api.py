@@ -75,14 +75,16 @@ class PublishGateApiTests(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_gate_blocks_unreviewed_drafts_and_returns_actionable_issues(self) -> None:
+    def test_gate_keeps_qa_as_a_warning_but_blocks_unresolved_verification(self) -> None:
         project_id, asset_id = self.asset()
         self.make_publishable(project_id, asset_id, qa_status="needs_revision", unresolved=["check an IP claim"])
         status, result = self.request("POST", f"/api/content-assets/{asset_id}/prepare-publish", {"project_id": project_id, "status": "draft", "allow_without_images": True})
         self.assertEqual(200, status)
         self.assertEqual("blocked", result["status"])  # type: ignore[index]
         issue_codes = {item["code"] for item in result["report"]["issues"]}  # type: ignore[index]
-        self.assertTrue({"qa", "verification"}.issubset(issue_codes))
+        self.assertEqual({"verification"}, issue_codes)
+        qa_check = next(item for item in result["report"]["checks"] if item["code"] == "qa")  # type: ignore[index]
+        self.assertFalse(qa_check["passed"])
         self.assertNotIn("approval_id", result)  # type: ignore[arg-type]
 
     def test_ready_gate_creates_fixed_approval_and_old_draft_cannot_publish(self) -> None:
@@ -146,7 +148,7 @@ class PublishGateApiTests(unittest.TestCase):
         self.assertNotIn("application_password", serialized)
         self.assertNotIn("not-used-by-gate", serialized)
 
-    def test_gate_blocks_missing_metadata_and_unsafe_markdown_links(self) -> None:
+    def test_gate_keeps_missing_metadata_as_a_warning_but_blocks_unsafe_markdown_links(self) -> None:
         project_id, asset_id = self.asset("unsafe")
         self.make_publishable(
             project_id,
@@ -158,7 +160,9 @@ class PublishGateApiTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual("blocked", result["status"])  # type: ignore[index]
         issue_codes = {item["code"] for item in result["report"]["issues"]}  # type: ignore[index]
-        self.assertTrue({"meta_description", "links"}.issubset(issue_codes))
+        self.assertEqual({"links"}, issue_codes)
+        metadata_check = next(item for item in result["report"]["checks"] if item["code"] == "meta_description")  # type: ignore[index]
+        self.assertFalse(metadata_check["passed"])
         self.assertNotIn("approval_id", result)  # type: ignore[operator]
 
 

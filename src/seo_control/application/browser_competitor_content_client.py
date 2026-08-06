@@ -308,13 +308,25 @@ class BrowserCompetitorContentClient:
             allowed = _robots_allows(url, timeout=self.timeout)
             if allowed is False:
                 raise CompetitorContentProtocolError("Competitor page is blocked by robots.txt.")
+        static_error: Exception | None = None
         try:
             html = self._fetch_static_html(url)
         except CompetitorContentProtocolError:
             raise
         except Exception as error:
-            raise CompetitorContentProtocolError(f"Competitor HTTP fetch failed: {type(error).__name__}.") from error
-        title, content, extractor = self._extract_article(html, parsed.hostname)
+            # Some authoritative sites close Python TLS connections while a
+            # normal local Chromium session can read the same public page.
+            # Robots have already been checked above, so use the existing
+            # browser fallback before recording the link as unreadable.
+            static_error = error
+            html = ""
+        title, content, extractor = self._extract_article(html, parsed.hostname) if html else ("", "", "")
+        if not html:
+            rendered = self._render_with_playwright(url)
+            if rendered:
+                title, content, extractor = self._extract_article(rendered, parsed.hostname)
+            if len(content) < 500:
+                raise CompetitorContentProtocolError(f"Competitor HTTP fetch failed: {type(static_error).__name__}.") from static_error
         if len(content) < 500:
             rendered = self._render_with_playwright(url)
             if rendered:
