@@ -12,7 +12,7 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 
-PROMPT_VERSION = "people_first_full_article_v26"
+PROMPT_VERSION = "people_first_full_article_v27"
 
 
 MINIMUM_ARTICLE_BODY_WORDS = 3001
@@ -80,7 +80,8 @@ HUMAN_EDITORIAL_VOICE_POLICY = (
 
 
 ARTICLE_BODY_LENGTH_POLICY = (
-    " Article body-length policy: the reader-facing article must exceed 3,000 English words. Count the H1, introduction, H2/H3 prose, tables, lists, and conclusion. "
+    " Article body-length policy: the reader-facing article body must exceed 3,000 English words; the minimum accepted body count is 3,001 words. Count only the H1, introduction, H2/H3 prose, reader-facing tables and lists, and conclusion. "
+    "Do not count metadata, structured JSON fields, sources_used, claims_used, verify items, reference or verification appendices, URLs, image filenames, alt text, or image captions toward this minimum. Do not add any appendix or image text merely to reach the threshold. "
     "Reach this length by deepening the approved reader journey with non-overlapping explanation, decision criteria, practical conditions, trade-offs, examples, and checks—not with repetitive recaps, keyword variants, filler, or unrelated chapters. "
     "Treat the 3,000-word threshold as a minimum body requirement even when a smaller target_length was supplied."
 )

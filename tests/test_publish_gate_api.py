@@ -75,17 +75,17 @@ class PublishGateApiTests(unittest.TestCase):
         finally:
             connection.close()
 
-    def test_gate_keeps_qa_as_a_warning_but_blocks_unresolved_verification(self) -> None:
+    def test_gate_does_not_evaluate_qa_or_unresolved_verification(self) -> None:
         project_id, asset_id = self.asset()
         self.make_publishable(project_id, asset_id, qa_status="needs_revision", unresolved=["check an IP claim"])
         status, result = self.request("POST", f"/api/content-assets/{asset_id}/prepare-publish", {"project_id": project_id, "status": "draft", "allow_without_images": True})
         self.assertEqual(200, status)
-        self.assertEqual("blocked", result["status"])  # type: ignore[index]
+        self.assertEqual("ready", result["status"])  # type: ignore[index]
         issue_codes = {item["code"] for item in result["report"]["issues"]}  # type: ignore[index]
-        self.assertEqual({"verification"}, issue_codes)
-        qa_check = next(item for item in result["report"]["checks"] if item["code"] == "qa")  # type: ignore[index]
-        self.assertFalse(qa_check["passed"])
-        self.assertNotIn("approval_id", result)  # type: ignore[arg-type]
+        check_codes = {item["code"] for item in result["report"]["checks"]}  # type: ignore[index]
+        self.assertNotIn("verification", issue_codes | check_codes)
+        self.assertNotIn("qa", issue_codes | check_codes)
+        self.assertIsInstance(result.get("approval_id"), int)  # type: ignore[union-attr]
 
     def test_ready_gate_creates_fixed_approval_and_old_draft_cannot_publish(self) -> None:
         project_id, asset_id = self.asset()

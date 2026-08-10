@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import socket
+import time
 from collections.abc import Callable
 from typing import Any
 from urllib.parse import urlencode
@@ -27,21 +28,51 @@ class GoogleSuggestClient:
     """
 
     _ENDPOINT = "https://suggestqueries.google.com/complete/search"
+    _RETRYABLE_ERROR_CODES = frozenset({"network_timeout", "network_error", "http_rate_limited"})
 
-    def __init__(self, fetch_json: Callable[[str], object] | None = None) -> None:
+    def __init__(
+        self,
+        fetch_json: Callable[[str], object] | None = None,
+        *,
+        max_attempts: int = 3,
+        retry_delay_seconds: float = 0.35,
+        sleep: Callable[[float], None] | None = None,
+    ) -> None:
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be at least 1")
+        if retry_delay_seconds < 0:
+            raise ValueError("retry_delay_seconds must not be negative")
         self._fetch_json = fetch_json or self._default_fetch_json
+        self._max_attempts = max_attempts
+        self._retry_delay_seconds = retry_delay_seconds
+        self._sleep = sleep or time.sleep
 
     def fetch(self, query: str, *, hl: str, gl: str) -> list[str]:
         url = self._build_url(query=query, hl=hl, gl=gl)
 
-        try:
-            response = self._fetch_json(url)
-        except GoogleSuggestProtocolError:
-            raise
-        except TimeoutError as exc:
-            raise GoogleSuggestProtocolError("Google Suggest connection timed out.", error_code="network_timeout") from exc
-        except Exception as exc:
-            raise GoogleSuggestProtocolError("Google Suggest request failed.", error_code="network_error") from exc
+        response: object | None = None
+        for attempt in range(1, self._max_attempts + 1):
+            try:
+                response = self._fetch_json(url)
+                break
+            except GoogleSuggestProtocolError as exc:
+                error = exc
+            except TimeoutError as exc:
+                error = GoogleSuggestProtocolError(
+                    "Google Suggest connection timed out.",
+                    error_code="network_timeout",
+                )
+                error.__cause__ = exc
+            except Exception as exc:
+                error = GoogleSuggestProtocolError(
+                    "Google Suggest request failed.",
+                    error_code="network_error",
+                )
+                error.__cause__ = exc
+
+            if error.error_code not in self._RETRYABLE_ERROR_CODES or attempt >= self._max_attempts:
+                raise error
+            self._sleep(self._retry_delay_seconds * (2 ** (attempt - 1)))
 
         try:
             return self._parse_response(response)

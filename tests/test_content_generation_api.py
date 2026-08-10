@@ -240,7 +240,7 @@ class ContentGenerationApiTests(unittest.TestCase):
         self.assertEqual("deepseek-review-v1", job["reviewer_model"])
         self.assertEqual("openai", generated["draft"]["provider"])  # type: ignore[index]
 
-    def test_auto_collaboration_keeps_auditable_gpt_writer_and_deepseek_reviewer_route(self) -> None:
+    def test_auto_collaboration_generates_without_a_review_pass(self) -> None:
         project_id, asset_id = self.asset()
         status, generated = self.request(
             "POST",
@@ -261,8 +261,8 @@ class ContentGenerationApiTests(unittest.TestCase):
         self.assertEqual("deepseek", job["reviewer_provider"])
         self.assertIn("DeepSeek", job["routing_summary"])
         self.assertIn("ChatGPT", job["routing_summary"])
-        self.assertIn("qa", self.generator.stages)
-        self.assertEqual("needs_revision", generated["draft"]["qa_status"])  # type: ignore[index]
+        self.assertNotIn("qa", self.generator.stages)
+        self.assertEqual("not_run", generated["draft"]["qa_status"])  # type: ignore[index]
 
     def test_generation_uses_only_relevant_project_learning_memory_and_records_the_link(self) -> None:
         project_id, asset_id = self.asset()

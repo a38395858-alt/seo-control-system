@@ -89,6 +89,17 @@ class ContentSystemWebTests(unittest.TestCase):
             self.assertIn(value, self.app)
         self.assertIn(".content-reader-actions", self.styles)
 
+    def test_content_task_and_selected_draft_show_live_word_counts(self) -> None:
+        for value in ("currentDraftWordCount", "displayedDraftWordCount", "design-word-count", "draft-word-count", "正文词数"):
+            self.assertIn(value, self.app + self.styles)
+
+    def test_content_task_uses_one_generate_and_direct_publish_path_without_qa_controls(self) -> None:
+        self.assertIn("一键生成全文与配图", self.app)
+        self.assertIn("直接发布到 WordPress", self.app)
+        self.assertNotIn(">AI 质量审核<", self.app)
+        self.assertNotIn(">按建议生成修订版<", self.app)
+        self.assertNotIn("审核 AI", self.app)
+
     def test_content_reader_omits_the_authority_reference_footer(self) -> None:
         self.assertNotIn("ArticleAuthorityReferences", self.app)
         self.assertNotIn("AuthoritySearchCandidates", self.app)

@@ -2982,46 +2982,68 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             self._json(HTTPStatus.BAD_GATEWAY, {"error": str(error)}); return
         self._json(HTTPStatus.CREATED, image)
 
+    def _generate_all_section_images_result(self, asset_id: int, project_id: int) -> dict[str, Any]:
+        """Generate and bind the current draft's H2 images without writing HTTP.
+
+        Both the explicit image endpoint and article-generation workflows use
+        this method. Keeping image failures inside the returned result protects
+        an already-saved article while still making every failed H2 retryable.
+        """
+        rows = self._ensure_section_image_prompts(asset_id, project_id)
+        image_directory = WEB_ROOT / "generated-images" / str(project_id)
+        # A frontend build used to empty web/, which can leave a ready
+        # database row pointing at a missing PNG. Treat that as unfinished
+        # so automatic generation repairs the physical file as well.
+        image_ids = [
+            int(row["id"])
+            for row in rows
+            if str(row["status"]) != "ready"
+            or not (image_directory / Path(str(row["seo_filename"] or f"section-{row['id']}.webp")).with_suffix(".webp").name).is_file()
+        ]
+        completed: list[dict[str, Any]] = []
+        failures: list[dict[str, str]] = []
+        # The HTTP request already runs in a server worker thread, so a second
+        # executor adds no benefit. An ordered loop avoids provider throttling
+        # and makes a retry continue from only the unfinished H2 images.
+        uses_siliconflow = _image_generation_provider(self.server.ai_settings_path) == "siliconflow"
+        for index, image_id in enumerate(image_ids):
+            if uses_siliconflow and index:
+                time.sleep(SILICONFLOW_IMAGE_REQUEST_INTERVAL_SECONDS)
+            try:
+                completed.append(self._generate_section_image_row(image_id, project_id))
+            except Exception as error:
+                with self._database() as connection, connection:
+                    connection.execute(
+                        "UPDATE content_section_images SET status='failed',error_summary=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND project_id=?",
+                        (str(error)[:500], image_id, project_id),
+                    )
+                failures.append({"id": str(image_id), "error": str(error)})
+        completed.sort(key=lambda row: int(row["position"]))
+        with self._database() as connection:
+            current_rows = connection.execute(
+                """SELECT * FROM content_section_images
+                   WHERE project_id=? AND content_asset_id=? AND draft_id=(
+                       SELECT current_draft_id FROM content_assets WHERE id=? AND project_id=?
+                   ) ORDER BY position""",
+                (project_id, asset_id, asset_id, project_id),
+            ).fetchall()
+        ready_count = sum(1 for row in current_rows if str(row["status"]) == "ready")
+        return {
+            "generated": completed,
+            "failed": failures,
+            "images": [dict(row) for row in current_rows],
+            "total": len(current_rows),
+            "ready": ready_count,
+        }
+
     def _generate_all_section_images(self, asset_id: int, payload: Mapping[str, Any]) -> None:
         project_id = self._integer(payload, "project_id")
         if project_id is None: return
         try:
-            rows = self._ensure_section_image_prompts(asset_id, project_id)
-            image_directory = WEB_ROOT / "generated-images" / str(project_id)
-            # A frontend build used to empty web/, which can leave a ready
-            # database row pointing at a missing PNG. Treat that as unfinished
-            # so one-click generation repairs the physical file as well.
-            image_ids = [
-                int(row["id"])
-                for row in rows
-                if str(row["status"]) != "ready"
-                or not (image_directory / Path(str(row["seo_filename"] or f"section-{row['id']}.webp")).with_suffix(".webp").name).is_file()
-            ]
-            completed: list[dict[str, Any]] = []; failures: list[dict[str, str]] = []
-            # The HTTP request already runs in a server worker thread, so a
-            # second executor adds no benefit. A plain ordered loop keeps one
-            # image request in flight, makes status transitions deterministic,
-            # and lets a retry continue from the first unfinished H2.
-            uses_siliconflow = _image_generation_provider(self.server.ai_settings_path) == "siliconflow"
-            for index, image_id in enumerate(image_ids):
-                # The free SiliconFlow image endpoint throttles bursts. Space
-                # bulk requests so a long H2 article does not fail halfway
-                # through simply because the first few images were accepted.
-                if uses_siliconflow and index:
-                    time.sleep(SILICONFLOW_IMAGE_REQUEST_INTERVAL_SECONDS)
-                try:
-                    completed.append(self._generate_section_image_row(image_id, project_id))
-                except Exception as error:
-                    with self._database() as connection, connection:
-                        connection.execute(
-                            "UPDATE content_section_images SET status='failed',error_summary=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND project_id=?",
-                            (str(error)[:500], image_id, project_id),
-                        )
-                    failures.append({"id": str(image_id), "error": str(error)})
-            completed.sort(key=lambda row: int(row["position"]))
+            result = self._generate_all_section_images_result(asset_id, project_id)
         except (sqlite3.Error, ValueError) as error:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(error)}); return
-        self._json(HTTPStatus.CREATED, {"generated": completed, "failed": failures})
+        self._json(HTTPStatus.CREATED, result)
 
     def _open_gsc_browser(self, project_id: int) -> None:
         with self._database() as connection:
@@ -3575,12 +3597,9 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         check("current_draft", draft is not None, "当前内容没有可发布的正文版本。")
         if draft is None:
             return {"status": "blocked", "draft_id": None, "requested_status": requested_status, "checks": checks, "issues": issues}
-        check("qa", str(draft["qa_status"]) == "approved", "AI 质量审核尚未通过；将作为提示保留，但不阻止直接发布。", blocking=False)
-        try:
-            unresolved = json.loads(draft["unresolved_verify_json"] or "[]")
-        except (TypeError, json.JSONDecodeError):
-            unresolved = ["invalid verification state"]
-        check("verification", not unresolved, "正文仍有待验证事项；请修订或确认后重新进行质量审核。")
+        # QA and unresolved verification remain available as editorial
+        # metadata, but direct WordPress publishing no longer evaluates or
+        # blocks on either state. The operator explicitly controls publishing.
         title = str(draft["title"] or "").strip()
         meta_description = str(draft["meta_description"] or "").strip()
         check("title", bool(title), "正文标题为空，无法创建 WordPress 文章。")
@@ -4378,7 +4397,10 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 if action in {"generate-draft", "generate"}:
                     result["draft"] = self._generate_ai_draft(connection, asset, payload, generator, provider, model, job_id)
                     asset = self._content_asset(connection, project_id, asset_id)
-                if action == "review-quality" or (action == "generate" and routing_mode == "auto_collaborate"):
+                # Writing routes finish after the article and its H2 images are
+                # saved.  QA remains available as a legacy, explicitly called
+                # endpoint, but it is never inserted into one-click generation.
+                if action == "review-quality":
                     reviewer_generator, active_reviewer_provider, active_reviewer_model = self._content_reviewer_generator(
                         writer_generator=generator,
                         writer_provider=provider,
@@ -4395,6 +4417,21 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 if action == "rewrite-targeted":
                     result["draft"] = self._generate_ai_targeted_rewrite(connection, asset, generator, provider, model, job_id)
                 result["generation_job"] = self._finish_content_generation_job(connection, job_id, status="completed")
+                connection.commit()
+                if action in {"generate", "generate-draft", "rewrite-targeted"} and payload.get("auto_generate_images") is not False:
+                    try:
+                        result["image_generation"] = self._generate_all_section_images_result(asset_id, project_id)
+                    except Exception as image_error:
+                        # The article is already safely persisted. Surface an
+                        # image-only failure for retry instead of converting a
+                        # successful writing job into a failed content job.
+                        result["image_generation"] = {
+                            "generated": [],
+                            "failed": [{"id": "", "error": str(image_error)}],
+                            "images": [],
+                            "total": 0,
+                            "ready": 0,
+                        }
                 refreshed = self._content_asset_detail(connection, project_id, asset_id)
                 result["runs"] = refreshed["generation_runs"]
                 result["asset"] = refreshed
@@ -7570,6 +7607,60 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                     connection.commit()
                     return call.output
 
+                def generate_current_draft_images() -> dict[str, Any]:
+                    """Create H2 images once for the Agent's final draft."""
+                    draft_id = checkpoint.get("draft_id")
+                    if checkpoint.get("image_draft_id") == draft_id and isinstance(checkpoint.get("image_generation"), Mapping):
+                        return dict(checkpoint["image_generation"])
+                    persist_checkpoint("generate_images")
+                    cursor = connection.execute(
+                        """INSERT INTO agent_steps(
+                               job_id,node_name,attempt,status,model_provider,model,input_summary,input_json,prompt_version,started_at
+                           ) VALUES(?, 'generate_images', 1, 'running', 'image_generation', ?, ?, ?, ?, CURRENT_TIMESTAMP)""",
+                        (
+                            job_id,
+                            _image_generation_model(self.server.ai_settings_path),
+                            "Generating and binding matching H2 images for the final article draft.",
+                            json.dumps({"project_id": project_id, "content_asset_id": job["content_asset_id"], "draft_id": draft_id}, ensure_ascii=False),
+                            PROMPT_VERSION,
+                        ),
+                    )
+                    connection.commit()
+                    try:
+                        image_result = self._generate_all_section_images_result(int(job["content_asset_id"]), project_id)
+                    except Exception as image_error:
+                        image_result = {
+                            "generated": [],
+                            "failed": [{"id": "", "error": str(image_error)}],
+                            "images": [],
+                            "total": 0,
+                            "ready": 0,
+                        }
+                    step_status = "failed" if image_result.get("failed") and not image_result.get("ready") else "completed"
+                    error_summary = "; ".join(str(item.get("error") or "") for item in image_result.get("failed", [])[:3]) or None
+                    connection.execute(
+                        """UPDATE agent_steps SET status=?,output_json=?,error_summary=?,completed_at=CURRENT_TIMESTAMP
+                           WHERE id=?""",
+                        (
+                            step_status,
+                            json.dumps({
+                                "total": image_result.get("total", 0),
+                                "ready": image_result.get("ready", 0),
+                                "failed": len(image_result.get("failed", [])),
+                            }, ensure_ascii=False),
+                            error_summary,
+                            cursor.lastrowid,
+                        ),
+                    )
+                    checkpoint["image_draft_id"] = draft_id
+                    checkpoint["image_generation"] = {
+                        "total": image_result.get("total", 0),
+                        "ready": image_result.get("ready", 0),
+                        "failed": image_result.get("failed", []),
+                    }
+                    connection.commit()
+                    return image_result
+
                 if not isinstance(checkpoint.get("candidate_outline_id"), int):
                     blueprint = invoke_node(
                         "generate_content_blueprint", "generate_content_blueprint",
@@ -7612,63 +7703,27 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                     )
                     draft_value = article_result.get("draft") if isinstance(article_result.get("draft"), Mapping) else {}
                     checkpoint["draft_id"] = draft_value.get("id")
-                    checkpoint["rewrite_count"] = int(checkpoint.get("rewrite_count") or 0)
-                    persist_checkpoint("review_article")
                     if control_state() in {"cancelled", "waiting_input"}:
                         self._json(HTTPStatus.OK, self._agent_job_payload(self._agent_job_for_project(connection, job_id, project_id)))
                         return
 
-                while True:
-                    review_result = invoke_node(
-                        "review_article", "review_article", {"content_asset_id": job["content_asset_id"], "draft_id": checkpoint.get("draft_id")},
-                        reviewer_provider, reviewer_model,
-                    )
-                    review = review_result.get("review") if isinstance(review_result.get("review"), Mapping) else {}
-                    checkpoint.setdefault("qa_history", []).append({
-                        "draft_id": checkpoint.get("draft_id"),
-                        "status": review.get("status"),
-                        "rewrite_targets": len(review.get("targeted_rewrite", [])) if isinstance(review.get("targeted_rewrite"), list) else 0,
-                    })
-                    if review.get("status") == "approved":
-                        persist_checkpoint("generation_basis_report")
-                        current_job = self._agent_job_for_project(connection, job_id, project_id)
-                        report = self._write_content_generation_basis_report(connection, current_job, checkpoint)
-                        self._finish_content_generation_job(connection, generation_job_id, status="completed")
-                        checkpoint["current_node"] = "completed"
-                        connection.execute(
-                            """UPDATE agent_jobs SET status='completed',current_node='completed',result_json=?,checkpoint_json=?,
-                                   error_summary=NULL,completed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
-                               WHERE id=? AND project_id=? AND status='running'""",
-                            (json.dumps({"draft_id": checkpoint.get("draft_id"), "basis_report": report}, ensure_ascii=False),
-                             json.dumps(checkpoint, ensure_ascii=False), job_id, project_id),
-                        )
-                        connection.commit()
-                        break
-                    rewrite_targets = review.get("targeted_rewrite") if isinstance(review.get("targeted_rewrite"), list) else []
-                    rewrite_count = int(checkpoint.get("rewrite_count") or 0)
-                    if rewrite_targets and rewrite_count < 2:
-                        if control_state() in {"cancelled", "waiting_input"}:
-                            break
-                        rewrite_result = invoke_node(
-                            "generate_article", "targeted_rewrite", {"content_asset_id": job["content_asset_id"], "mode": "targeted_rewrite"},
-                            writer_provider, writer_model,
-                        )
-                        rewritten = rewrite_result.get("draft") if isinstance(rewrite_result.get("draft"), Mapping) else {}
-                        checkpoint["draft_id"] = rewritten.get("id")
-                        checkpoint["rewrite_count"] = rewrite_count + 1
-                        persist_checkpoint("review_article")
-                        continue
-                    persist_checkpoint("human_review_required")
-                    current_job = self._agent_job_for_project(connection, job_id, project_id)
-                    report = self._write_content_generation_basis_report(connection, current_job, checkpoint)
-                    connection.execute(
-                        """UPDATE agent_jobs SET status='waiting_input',current_node='human_review_required',result_json=?,
-                               checkpoint_json=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND project_id=? AND status='running'""",
-                        (json.dumps({"draft_id": checkpoint.get("draft_id"), "basis_report": report}, ensure_ascii=False),
-                         json.dumps(checkpoint, ensure_ascii=False), job_id, project_id),
-                    )
-                    connection.commit()
-                    break
+                # The normal content path is deliberately linear: draft, H2
+                # images, completion.  It does not spend additional calls on
+                # scoring, review or automatic rewrites.
+                generate_current_draft_images()
+                persist_checkpoint("generation_basis_report")
+                current_job = self._agent_job_for_project(connection, job_id, project_id)
+                report = self._write_content_generation_basis_report(connection, current_job, checkpoint)
+                self._finish_content_generation_job(connection, generation_job_id, status="completed")
+                checkpoint["current_node"] = "completed"
+                connection.execute(
+                    """UPDATE agent_jobs SET status='completed',current_node='completed',result_json=?,checkpoint_json=?,
+                           error_summary=NULL,completed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP
+                       WHERE id=? AND project_id=? AND status='running'""",
+                    (json.dumps({"draft_id": checkpoint.get("draft_id"), "basis_report": report}, ensure_ascii=False),
+                     json.dumps(checkpoint, ensure_ascii=False), job_id, project_id),
+                )
+                connection.commit()
                 self._json(HTTPStatus.OK, self._agent_job_payload(self._agent_job_for_project(connection, job_id, project_id)))
         except (sqlite3.Error, ValueError, ContentGenerationProtocolError, CompetitorContentProtocolError) as error:
             try:

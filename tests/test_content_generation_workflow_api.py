@@ -14,8 +14,11 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
+
+from PIL import Image
 
 
 SRC_ROOT = Path(__file__).resolve().parents[1] / "src"
@@ -23,7 +26,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from seo_control.application.content_generator import PROMPT_VERSION  # noqa: E402
-from seo_control.web import create_server  # noqa: E402
+from seo_control.web import KeywordDiscoveryRequestHandler, create_server  # noqa: E402
 
 
 class FakeContentGenerator:
@@ -277,6 +280,56 @@ class ContentGenerationWorkflowApiTests(unittest.TestCase):
                 self.assertTrue(run["input"]["writing_policy"]["fixed_safety_rules"])
         self.assertEqual("not_run", detail["current_draft"]["qa_status"])  # type: ignore[index]
         self.assertNotIn("secret", json.dumps(detail).lower())
+
+    def test_generating_a_draft_automatically_creates_and_binds_h2_images(self) -> None:
+        project_id, asset_id = self.create_asset()
+        self.server.ai_settings_path.write_text(
+            json.dumps({
+                "providers": {
+                    "openai": {"api_key": "test-key", "base_url": "https://images.test/v1", "model": "text-test"},
+                },
+                "integrations": {
+                    "image_generation": {"provider": "openai", "model": "image-test"},
+                },
+            }),
+            encoding="utf-8",
+        )
+        self.request_json(
+            "POST", f"/api/content-assets/{asset_id}/generate-brief",
+            {"project_id": project_id, "provider": "gemini", "target_audience": "US buyers", "business_goal": "commercial", "sources": []},
+        )
+        self.request_json(
+            "POST", f"/api/content-assets/{asset_id}/generate-outline",
+            {"project_id": project_id, "provider": "gemini"},
+        )
+
+        def create_test_image(*, prompt: str, output_path: Path, model: str) -> bool:
+            self.assertTrue(prompt)
+            self.assertEqual("image-test", model)
+            Image.new("RGB", (1024, 1024), "#dbeafe").save(output_path, format="PNG")
+            return True
+
+        test_web_root = Path(self.temp.name) / "web"
+        with (
+            patch("seo_control.web.MINIMUM_ARTICLE_BODY_WORDS", 5),
+            patch("seo_control.web.WEB_ROOT", test_web_root),
+            patch.object(KeywordDiscoveryRequestHandler, "_designer_image_prompt", return_value="A matching section illustration without text."),
+            patch.object(KeywordDiscoveryRequestHandler, "_generate_image_with_local_proxy", side_effect=create_test_image),
+        ):
+            status, generated = self.request_json(
+                "POST", f"/api/content-assets/{asset_id}/generate-draft",
+                {"project_id": project_id, "provider": "gemini"},
+            )
+
+        self.assertEqual(201, status)
+        self.assertEqual(2, generated["image_generation"]["total"])  # type: ignore[index]
+        self.assertEqual(2, generated["image_generation"]["ready"])  # type: ignore[index]
+        self.assertEqual([], generated["image_generation"]["failed"])  # type: ignore[index]
+        _status, detail = self.request_json("GET", f"/api/content-assets/{asset_id}?project_id={project_id}")
+        self.assertEqual(2, len(detail["section_images"]))  # type: ignore[index]
+        self.assertTrue(all(image["status"] == "ready" for image in detail["section_images"]))  # type: ignore[index]
+        for image in detail["section_images"]:  # type: ignore[index]
+            self.assertTrue((test_web_root / image["image_url"].lstrip("/")).is_file())
 
     def test_explicit_ymyl_industry_is_authoritative_and_project_scoped(self) -> None:
         health_project_id, health_asset_id = self.create_asset(industry="Healthcare")

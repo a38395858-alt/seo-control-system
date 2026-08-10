@@ -79,7 +79,7 @@ class ContentPromptQualityTests(unittest.TestCase):
     def test_full_article_prompt_enforces_h2_depth_without_word_count_padding(self) -> None:
         from seo_control.application.content_generator import PROMPT_VERSION, _schema_for  # noqa: E402
 
-        self.assertEqual("people_first_full_article_v26", PROMPT_VERSION)
+        self.assertEqual("people_first_full_article_v27", PROMPT_VERSION)
         for stage in ("outline", "full_article", "qa", "targeted_rewrite"):
             instruction = _stage_instruction(stage)
             for text in ("new reader value", "unique information gain", "four to six non-overlapping", "never pad", "one concise statement"):
@@ -99,7 +99,13 @@ class ContentPromptQualityTests(unittest.TestCase):
 
     def test_full_article_requires_a_3000_word_article_without_an_appendix(self) -> None:
         instruction = _stage_instruction("full_article")
-        for text in ("must exceed 3,000 English words", "not with repetitive recaps"):
+        for text in (
+            "must exceed 3,000 English words",
+            "minimum accepted body count is 3,001 words",
+            "Do not count metadata",
+            "reference or verification appendices",
+            "not with repetitive recaps",
+        ):
             self.assertIn(text, instruction)
         self.assertNotIn("separately appended", instruction)
 

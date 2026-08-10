@@ -51,3 +51,40 @@ class GoogleSuggestClientTests(unittest.TestCase):
                 client = GoogleSuggestClient(fetch_json=lambda _: response)
                 with self.assertRaises(GoogleSuggestProtocolError):
                     client.fetch("seo tools", hl="en", gl="US")
+
+    def test_fetch_retries_transient_network_failures_before_returning_suggestions(self) -> None:
+        attempts = 0
+        delays: list[float] = []
+
+        def fetch_json(_: str) -> object:
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                raise GoogleSuggestProtocolError(
+                    "Google Suggest network connection failed.",
+                    error_code="network_error",
+                )
+            return ["iphone battery capacity", ["iphone battery capacity mah"]]
+
+        client = GoogleSuggestClient(fetch_json=fetch_json, sleep=delays.append)
+
+        self.assertEqual(
+            ["iphone battery capacity mah"],
+            client.fetch("iphone battery capacity", hl="en", gl="GB"),
+        )
+        self.assertEqual(3, attempts)
+        self.assertEqual([0.35, 0.7], delays)
+
+    def test_fetch_does_not_retry_non_transient_protocol_errors(self) -> None:
+        attempts = 0
+
+        def fetch_json(_: str) -> object:
+            nonlocal attempts
+            attempts += 1
+            raise GoogleSuggestProtocolError("Bad response", error_code="decode_error")
+
+        client = GoogleSuggestClient(fetch_json=fetch_json, sleep=lambda _: None)
+
+        with self.assertRaises(GoogleSuggestProtocolError):
+            client.fetch("seo tools", hl="en", gl="US")
+        self.assertEqual(1, attempts)
