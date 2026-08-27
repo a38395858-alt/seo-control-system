@@ -16,6 +16,7 @@ data/*.stderr.log
 
 # Local test artifacts and service output
 tmp/
+.runtime/
 *.response.json
 
 # Python
