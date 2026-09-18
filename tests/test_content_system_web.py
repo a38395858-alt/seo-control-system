@@ -55,6 +55,9 @@ class ContentSystemWebTests(unittest.TestCase):
         self.assertIn('path="/content-library"', self.app)
         self.assertIn("ContentLibrary", self.app)
         self.assertIn("所有内容", self.app)
+        self.assertIn("formatContentGeneratedAt", self.app)
+        self.assertIn("生成于", self.app)
+        self.assertIn(".content-library-card-meta", self.styles)
 
     def test_content_detail_supports_version_and_markdown_html_switching(self) -> None:
         self.assertIn("selectedDraftVersion", self.app)
@@ -128,3 +131,11 @@ class ContentSystemWebTests(unittest.TestCase):
         self.assertIn('to="/projects"', self.app)
         self.assertIn("AgentPlatformConsole", self.app)
         self.assertIn("agent-console", self.styles)
+
+    def test_project_prompts_are_discoverable_from_each_website_context(self) -> None:
+        self.assertIn("项目设置", self.app)
+        self.assertIn("项目提示词", self.app)
+        self.assertIn("当前项目提示词", self.app)
+        self.assertIn('openProject(project.id, "/prompts")', self.app)
+        self.assertIn('activePath === "/prompts"', self.app)
+        self.assertIn("project-directory-card-actions", self.app + self.styles)

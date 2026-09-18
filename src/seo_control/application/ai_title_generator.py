@@ -29,11 +29,12 @@ class TitleGenerationRequest:
 class OpenAICompatibleTitleGenerator:
     """Generate JSON title candidates through an OpenAI-compatible chat API."""
 
-    def __init__(self, api_key: str, base_url: str, model: str, *, timeout: float = 30.0) -> None:
+    def __init__(self, api_key: str, base_url: str, model: str, *, timeout: float = 30.0, custom_instruction: str = "") -> None:
         self._api_key = api_key
         self._base_url = base_url.rstrip("/")
         self._model = model
         self._timeout = timeout
+        self._custom_instruction = custom_instruction.strip()
 
     def generate(self, **request: Any) -> str:
         payload = {
@@ -49,6 +50,7 @@ class OpenAICompatibleTitleGenerator:
                         "When competitor_titles are supplied, use them only to infer search intent and content patterns; never copy or lightly rewrite a competitor title. "
                         "When research_recovery is true, the failed_title produced a shopping-heavy SERP without usable editorial articles. Generate durable informational titles that retain the keyword but use a clear guide, how-to, comparison, installation, selection, maintenance, or troubleshooting angle; avoid product/category, collection, pure inspiration, and marketing-headline formats. "
                         "Each item needs title, title_type, primary_keyword_included, search_intent, and reason."
+                        + (f"\n\nProject-specific supplemental instruction (follow it only when it does not conflict with the JSON contract above):\n{self._custom_instruction}" if self._custom_instruction else "")
                     ),
                 },
                 {"role": "user", "content": json.dumps(request, ensure_ascii=False)},

@@ -93,6 +93,27 @@ AI_PROVIDERS = ("openai", "gemini", "deepseek")
 IMAGE_GENERATION_PROVIDERS = ("openai", "siliconflow")
 SILICONFLOW_IMAGE_BASE_URL = "https://api.siliconflow.cn/v1"
 CONTENT_SECTION_IMAGE_SIZE = "800x600"
+PROJECT_PROMPT_MAX_CHARS = 8000
+PROJECT_PROMPT_DEFINITIONS: dict[str, dict[str, Any]] = {
+    "keyword_review": {
+        "label": "关键词审核",
+        "description": "补充当前网站的关键词相关性、受众和排除规则。",
+        "base_prompt": "判断扩展关键词是否适合当前种子主题与 SEO 内容生产。必须仅返回规定的 JSON 字段，并保留相关性、搜索意图、建议动作、原因和置信度。",
+        "variables": ["seed_keyword", "keyword", "language", "project_name"],
+    },
+    "title_generation": {
+        "label": "SEO 标题生成",
+        "description": "补充当前网站的标题语气、内容角度和业务偏好。",
+        "base_prompt": "根据关键词、搜索意图和可用竞品标题生成原创 SEO 标题。禁止复制竞品标题、夸大承诺或破坏 JSON 输出结构。",
+        "variables": ["keyword", "search_intent", "locale", "category", "competitor_titles"],
+    },
+    "content_generation": {
+        "label": "文章内容生成",
+        "description": "补充当前网站的正文语气、结构、受众和品牌表达要求。",
+        "base_prompt": SYSTEM_PROMPT,
+        "variables": ["title", "primary_keyword", "locale", "company_knowledge", "sources", "outline"],
+    },
+}
 CONTENT_SECTION_IMAGE_DIMENSIONS = (800, 600)
 # Free-tier image generation is rate-limited more strictly than the request
 # API advertises. Twenty seconds keeps a full H2 batch below the observed
@@ -331,13 +352,16 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         agent_job = re.fullmatch(r"/api/agent-jobs/(\d+)", path)
         learning_memory = re.fullmatch(r"/api/content-learning-memories/(\d+)", path)
         competitor_learning = re.fullmatch(r"/api/projects/(\d+)/competitor-learning(?:/(runs))?", path)
+        project_prompts = re.fullmatch(r"/api/projects/(\d+)/prompts", path)
         wordpress_project = re.fullmatch(r"/api/projects/(\d+)/wordpress", path)
         gsc_project = re.fullmatch(r"/api/projects/(\d+)/gsc(?:/(anchors|export\.csv|content-performance|content-effectiveness))?", path)
         gsc_authorize = re.fullmatch(r"/api/projects/(\d+)/gsc/authorize", path)
         gsc_browser_open = re.fullmatch(r"/api/projects/(\d+)/gsc/browser/open", path)
         knowledge_project = re.fullmatch(r"/api/projects/(\d+)/knowledge", path)
         crawl_run = re.fullmatch(r"/api/projects/(\d+)/knowledge/crawl/(\d+)", path)
-        if competitor_learning:
+        if project_prompts:
+            self._list_project_prompts(int(project_prompts.group(1)))
+        elif competitor_learning:
             self._get_competitor_learning(int(competitor_learning.group(1)), include_runs=competitor_learning.group(2) == "runs")
         elif learning_memory:
             self._get_content_learning_memory(int(learning_memory.group(1)))
@@ -411,7 +435,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             self._get_content_asset(self._content_asset_path(path) or 0)
         elif self._keyword_title_candidates_path(path) is not None:
             self._list_title_candidates(self._keyword_title_candidates_path(path) or 0)
-        elif path in {"", "/", "/agent-platform", "/projects", "/system-tasks", "/integrations", "/research", "/keywords", "/titles", "/title-library", "/content", "/content-history", "/content-library", "/content-memory", "/collected-content-library", "/competitor-learning", "/learning-memories", "/knowledge", "/website-crawl", "/gsc", "/content-publish", "/authority-sources", "/scoring", "/settings"} or re.fullmatch(r"/content-library/\d+", path) or re.fullmatch(r"/(agent-platform/site|projects)(/\d+)?(?:/.*)?", path):
+        elif path in {"", "/", "/agent-platform", "/projects", "/system-tasks", "/integrations", "/prompts", "/research", "/keywords", "/titles", "/title-library", "/content", "/content-history", "/content-library", "/content-memory", "/collected-content-library", "/competitor-learning", "/learning-memories", "/knowledge", "/website-crawl", "/gsc", "/content-publish", "/authority-sources", "/scoring", "/settings"} or re.fullmatch(r"/content-library/\d+", path) or re.fullmatch(r"/(agent-platform/site|projects)(/\d+)?(?:/.*)?", path):
             self._serve_index()
         else:
             super().do_GET()
@@ -565,6 +589,10 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
     def do_DELETE(self) -> None:
         path = urlsplit(self.path).path
         project_match = re.fullmatch(r"/api/projects/(\d+)", path)
+        project_prompt = re.fullmatch(r"/api/projects/(\d+)/prompts/([a-z_]+)", path)
+        if project_prompt:
+            self._delete_project_prompt(int(project_prompt.group(1)), project_prompt.group(2))
+            return
         if project_match:
             self._delete_project(int(project_match.group(1)))
             return
@@ -598,12 +626,15 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
     def do_PUT(self) -> None:
         path = urlsplit(self.path).path
         project_match = re.fullmatch(r"/api/projects/(\d+)", path)
+        project_prompt = re.fullmatch(r"/api/projects/(\d+)/prompts/([a-z_]+)", path)
         learning_memory = re.fullmatch(r"/api/content-learning-memories/(\d+)", path)
-        if project_match is None and learning_memory is None:
+        if project_match is None and project_prompt is None and learning_memory is None:
             self._json(HTTPStatus.NOT_FOUND, {"error": "Not found."})
             return
         payload = self._read_json()
-        if payload is not None and project_match is not None:
+        if payload is not None and project_prompt is not None:
+            self._save_project_prompt(int(project_prompt.group(1)), project_prompt.group(2), payload)
+        elif payload is not None and project_match is not None:
             self._update_project(int(project_match.group(1)), payload)
         elif payload is not None and learning_memory is not None:
             self._update_content_learning_memory(int(learning_memory.group(1)), payload)
@@ -619,6 +650,90 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         self.send_header("Content-Length", str(len(content)))
         self.end_headers()
         self.wfile.write(content)
+
+    def _list_project_prompts(self, project_id: int) -> None:
+        try:
+            with self._database() as connection:
+                if connection.execute("SELECT id FROM projects WHERE id=?", (project_id,)).fetchone() is None:
+                    raise ValueError("project not found")
+                rows = connection.execute(
+                    "SELECT prompt_key,custom_instruction,updated_at FROM project_prompt_settings WHERE project_id=?",
+                    (project_id,),
+                ).fetchall()
+        except (sqlite3.Error, ValueError) as error:
+            self._json(HTTPStatus.NOT_FOUND if str(error) == "project not found" else HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        saved = {str(row["prompt_key"]): row for row in rows}
+        prompts = []
+        for key, definition in PROJECT_PROMPT_DEFINITIONS.items():
+            row = saved.get(key)
+            instruction = str(row["custom_instruction"]) if row else ""
+            prompts.append({
+                "key": key,
+                **definition,
+                "custom_instruction": instruction,
+                "customized": bool(instruction.strip()),
+                "updated_at": row["updated_at"] if row else None,
+            })
+        self._json(HTTPStatus.OK, {"project_id": project_id, "prompts": prompts})
+
+    def _save_project_prompt(self, project_id: int, prompt_key: str, payload: Mapping[str, Any]) -> None:
+        if prompt_key not in PROJECT_PROMPT_DEFINITIONS:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "unsupported prompt key"})
+            return
+        instruction = payload.get("custom_instruction")
+        if not isinstance(instruction, str):
+            self._json(HTTPStatus.BAD_REQUEST, {"error": "custom_instruction must be text"})
+            return
+        instruction = instruction.strip()
+        if len(instruction) > PROJECT_PROMPT_MAX_CHARS:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": f"custom_instruction must not exceed {PROJECT_PROMPT_MAX_CHARS} characters"})
+            return
+        try:
+            with self._database() as connection:
+                if connection.execute("SELECT id FROM projects WHERE id=?", (project_id,)).fetchone() is None:
+                    raise ValueError("project not found")
+                with connection:
+                    connection.execute(
+                        """INSERT INTO project_prompt_settings(project_id,prompt_key,custom_instruction)
+                           VALUES(?,?,?)
+                           ON CONFLICT(project_id,prompt_key) DO UPDATE SET
+                             custom_instruction=excluded.custom_instruction,updated_at=CURRENT_TIMESTAMP""",
+                        (project_id, prompt_key, instruction),
+                    )
+                row = connection.execute(
+                    "SELECT updated_at FROM project_prompt_settings WHERE project_id=? AND prompt_key=?",
+                    (project_id, prompt_key),
+                ).fetchone()
+        except (sqlite3.Error, ValueError) as error:
+            self._json(HTTPStatus.NOT_FOUND if str(error) == "project not found" else HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        self._json(HTTPStatus.OK, {"key": prompt_key, "custom_instruction": instruction, "customized": bool(instruction), "updated_at": row["updated_at"]})
+
+    def _delete_project_prompt(self, project_id: int, prompt_key: str) -> None:
+        if prompt_key not in PROJECT_PROMPT_DEFINITIONS:
+            self._json(HTTPStatus.NOT_FOUND, {"error": "unsupported prompt key"})
+            return
+        try:
+            with self._database() as connection:
+                if connection.execute("SELECT id FROM projects WHERE id=?", (project_id,)).fetchone() is None:
+                    raise ValueError("project not found")
+                with connection:
+                    connection.execute("DELETE FROM project_prompt_settings WHERE project_id=? AND prompt_key=?", (project_id, prompt_key))
+        except (sqlite3.Error, ValueError) as error:
+            self._json(HTTPStatus.NOT_FOUND if str(error) == "project not found" else HTTPStatus.BAD_REQUEST, {"error": str(error)})
+            return
+        self._json(HTTPStatus.OK, {"key": prompt_key, "custom_instruction": "", "customized": False, "updated_at": None})
+
+    def _project_prompt_instruction(self, project_id: int | None, prompt_key: str) -> str:
+        if project_id is None or prompt_key not in PROJECT_PROMPT_DEFINITIONS:
+            return ""
+        with self._database() as connection:
+            row = connection.execute(
+                "SELECT custom_instruction FROM project_prompt_settings WHERE project_id=? AND prompt_key=?",
+                (project_id, prompt_key),
+            ).fetchone()
+        return str(row["custom_instruction"]).strip() if row else ""
 
     def _create_content_asset(self, payload: Mapping[str, Any]) -> None:
         project_id, title_id = self._integer(payload, "project_id"), self._integer(payload, "selected_title_candidate_id")
@@ -658,7 +773,8 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         with self._database() as connection:
             rows = connection.execute(
                 """SELECT assets.*, keywords.keyword, drafts.version AS current_draft_version,
-                          drafts.meta_description, drafts.qa_status, drafts.provider, drafts.model
+                          drafts.meta_description, drafts.qa_status, drafts.provider, drafts.model,
+                          drafts.created_at AS generated_at
                    FROM content_assets AS assets
                    JOIN keywords ON keywords.id=assets.keyword_id
                    JOIN content_drafts AS drafts ON drafts.id=assets.current_draft_id
@@ -4397,9 +4513,29 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 if action in {"generate-draft", "generate"}:
                     result["draft"] = self._generate_ai_draft(connection, asset, payload, generator, provider, model, job_id)
                     asset = self._content_asset(connection, project_id, asset_id)
-                # Writing routes finish after the article and its H2 images are
-                # saved.  QA remains available as a legacy, explicitly called
-                # endpoint, but it is never inserted into one-click generation.
+                    reviewer_generator, active_reviewer_provider, active_reviewer_model = self._content_reviewer_generator(
+                        writer_generator=generator,
+                        writer_provider=provider,
+                        writer_model=model,
+                        reviewer_provider=reviewer_provider,
+                        reviewer_model=reviewer_model,
+                        project_id=int(asset["project_id"]),
+                    )
+                    if reviewer_generator is None:
+                        raise ValueError(f"{self._content_provider_label(reviewer_provider or provider)} reviewer configuration is not available")
+                    finalized = self._auto_review_and_refine_article(
+                        connection=connection,
+                        asset=asset,
+                        writer_generator=generator,
+                        writer_provider=provider,
+                        writer_model=model,
+                        reviewer_generator=reviewer_generator,
+                        reviewer_provider=active_reviewer_provider,
+                        reviewer_model=active_reviewer_model,
+                        generation_job_id=job_id,
+                    )
+                    result.update(finalized)
+                    asset = self._content_asset(connection, project_id, asset_id)
                 if action == "review-quality":
                     reviewer_generator, active_reviewer_provider, active_reviewer_model = self._content_reviewer_generator(
                         writer_generator=generator,
@@ -4407,6 +4543,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                         writer_model=model,
                         reviewer_provider=reviewer_provider,
                         reviewer_model=reviewer_model,
+                        project_id=int(asset["project_id"]),
                     )
                     if reviewer_generator is None:
                         raise ValueError(f"{self._content_provider_label(reviewer_provider or provider)} reviewer configuration is not available")
@@ -4522,11 +4659,21 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             return None, provider, None
         api_key, base_url, configured_model = configuration
         model = requested_model or configured_model
+        raw_project_id = payload.get("project_id")
+        project_id = raw_project_id if isinstance(raw_project_id, int) and not isinstance(raw_project_id, bool) else None
+        custom_instruction = self._project_prompt_instruction(project_id, "content_generation")
         # Full-article assembly receives several independently drafted H2
         # chapters.  It is intentionally allowed longer than the small
         # keyword/title calls, without changing the selected provider or
         # falling back to another model.
-        return OpenAICompatibleContentGenerator(api_key, base_url, model, provider=provider, timeout=240.0), provider, model
+        return OpenAICompatibleContentGenerator(
+            api_key,
+            base_url,
+            model,
+            provider=provider,
+            timeout=240.0,
+            custom_instruction=custom_instruction,
+        ), provider, model
 
     def _content_execution_route(
         self, payload: Mapping[str, Any]
@@ -4553,11 +4700,16 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             )
 
         writer_request: dict[str, Any] = {"provider": "openai"}
+        if isinstance(payload.get("project_id"), int) and not isinstance(payload.get("project_id"), bool):
+            writer_request["project_id"] = payload["project_id"]
         requested_writer_model = self._optional_text(payload, "model")
         if requested_writer_model:
             writer_request["model"] = requested_writer_model
         writer, writer_provider, writer_model = self._content_generator(writer_request)
-        researcher, researcher_provider, researcher_model = self._content_generator({"provider": "deepseek"})
+        researcher_request: dict[str, Any] = {"provider": "deepseek"}
+        if "project_id" in writer_request:
+            researcher_request["project_id"] = writer_request["project_id"]
+        researcher, researcher_provider, researcher_model = self._content_generator(researcher_request)
         if writer is None or researcher is None:
             missing = []
             if writer is None:
@@ -4619,6 +4771,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         writer_model: str | None,
         reviewer_provider: str | None,
         reviewer_model: str | None,
+        project_id: int | None = None,
     ) -> tuple[Any | None, str, str | None]:
         provider = reviewer_provider or writer_provider
         model = reviewer_model or writer_model
@@ -4633,7 +4786,14 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             return None, provider, model
         api_key, base_url, configured_model = configuration
         active_model = model or configured_model
-        return OpenAICompatibleContentGenerator(api_key, base_url, active_model, provider=provider, timeout=240.0), provider, active_model
+        return OpenAICompatibleContentGenerator(
+            api_key,
+            base_url,
+            active_model,
+            provider=provider,
+            timeout=240.0,
+            custom_instruction=self._project_prompt_instruction(project_id, "content_generation"),
+        ), provider, active_model
 
     def _generate_ai_quality_review(
         self,
@@ -4658,6 +4818,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             "canonical_title": asset["title_snapshot"], "primary_keyword": asset["keyword"],
             "project_context": brief_payload["brief"].get("project_context", {}),
             "writing_policy": self._writing_policy(brief_payload["brief"]),
+            "semantic": brief_payload["brief"].get("semantic", {}),
             "article": {"title": draft["title"], "markdown": self._sanitize_reader_markdown(str(draft["markdown"])), "meta_description": draft["meta_description"]},
             "outline": self._content_outline_payload(connection, outline)["sections"] if outline else [],
             "sources": brief_payload["sources"], "learning_memories": brief_payload["brief"].get("learning_memories", []),
@@ -4703,7 +4864,11 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                     recommended_range = outline_output.get("recommended_word_range")
                     if isinstance(recommended_range, Mapping):
                         approved_max_words = max(0, int(recommended_range.get("max") or 0))
-        allowed_words = approved_max_words or (int(round(target_words * 1.2)) if target_words else 0)
+        proportional_ceiling = approved_max_words or (int(round(target_words * 1.2)) if target_words else 0)
+        # The current writing contract requires at least 3,001 body words. An
+        # older outline can still carry a smaller editorial estimate, so that
+        # estimate cannot become a contradictory QA ceiling.
+        allowed_words = max(int(round(MINIMUM_ARTICLE_BODY_WORDS * 1.2)), proportional_ceiling)
         blockers = [str(item) for item in review.get("critical_blockers", []) if isinstance(item, str) and item.strip()]
         raw_rewrites = review.get("targeted_rewrite")
         rewrites = [dict(item) for item in raw_rewrites if isinstance(item, Mapping)][:2] if isinstance(raw_rewrites, list) else []
@@ -4829,6 +4994,61 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             connection.execute("UPDATE content_assets SET status='needs_revision',current_draft_id=?,current_generation_run_id=?,updated_at=CURRENT_TIMESTAMP WHERE id=?", (cursor.lastrowid, run["id"], asset["id"]))
             updated = connection.execute("SELECT * FROM content_drafts WHERE id=?", (cursor.lastrowid,)).fetchone()
         return self._content_draft_payload(updated)
+
+    def _auto_review_and_refine_article(
+        self,
+        *,
+        connection: sqlite3.Connection,
+        asset: sqlite3.Row,
+        writer_generator: Any,
+        writer_provider: str,
+        writer_model: str | None,
+        reviewer_generator: Any,
+        reviewer_provider: str,
+        reviewer_model: str | None,
+        generation_job_id: int,
+        max_rewrites: int = 2,
+    ) -> dict[str, Any]:
+        """Run factual/editorial QA and bounded rewrites without a manual gate."""
+
+        rewrite_count = 0
+        review_history: list[dict[str, Any]] = []
+        current_asset = asset
+        final_review: dict[str, Any] | None = None
+        final_draft: dict[str, Any] | None = None
+        while True:
+            final_review = self._generate_ai_quality_review(
+                connection, current_asset, reviewer_generator, reviewer_provider, reviewer_model, generation_job_id,
+            )
+            final_draft = final_review["draft"]
+            review = final_review["review"]
+            review_history.append({
+                "draft_id": final_draft.get("id"),
+                "status": review.get("status"),
+                "overall_score": review.get("overall_score"),
+                "critical_blockers": review.get("critical_blockers", []),
+                "unresolved_verify": review.get("unresolved_verify", []),
+                "targeted_rewrite": review.get("targeted_rewrite", []),
+            })
+            instructions = review.get("targeted_rewrite")
+            if (
+                review.get("status") != "needs_revision"
+                or not isinstance(instructions, list)
+                or not instructions
+                or rewrite_count >= max_rewrites
+            ):
+                break
+            self._generate_ai_targeted_rewrite(
+                connection, current_asset, writer_generator, writer_provider, writer_model, generation_job_id,
+            )
+            rewrite_count += 1
+            current_asset = self._content_asset(connection, int(asset["project_id"]), int(asset["id"]))
+        return {
+            "draft": final_draft,
+            "quality_review": final_review,
+            "automatic_rewrite_count": rewrite_count,
+            "quality_review_history": review_history,
+        }
 
     @staticmethod
     def _normalise_industry_rules(value: Mapping[str, Any], explicit_industry: str) -> dict[str, Any]:
@@ -5016,7 +5236,27 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             data = {"topic": asset["title_snapshot"], "primary_keyword": asset["keyword"], "language_market": asset["locale"], "country_code": asset["country_code"], "audience": audience, "business_goal": goal, "brand": self._optional_text(payload, "brand") or "", "project_context": project_context, "writing_policy": writing_policy, "sources": sources, "learning_memories": payload.get("learning_memories", []), "constraints": payload.get("constraints", [])}
             semantic, _run = self._run_content_stage(connection, asset, "semantic", data, generator, provider, model, generation_job_id)
         else:
-            semantic = {"intent": {"dominant": analysis.get("search_intent", ""), "secondary": [], "reader_job": ""}, "entities": analysis.get("entities", []), "gaps_or_conflicts": [{"item": item, "action": "cover"} for item in analysis.get("missing_gaps", []) if isinstance(item, str)], "angle": "Competitor-informed original synthesis.", "must_cover": analysis.get("missing_gaps", [])}
+            required_topics = [item for item in analysis.get("missing_gaps", []) if isinstance(item, str) and item.strip()]
+            semantic = {
+                "intent": {"dominant": analysis.get("search_intent", ""), "secondary": [], "reader_job": ""},
+                "entities": analysis.get("entities", []),
+                "gaps_or_conflicts": [{"item": item, "action": "cover"} for item in required_topics],
+                "required_topics": required_topics,
+                "bonus_topics": [],
+                "long_tail_keywords": [str(asset["keyword"] or "")],
+                "content_strategy": {
+                    "dominant_intent": analysis.get("search_intent", ""),
+                    "target_reader": audience,
+                    "entry_angle": "Answer the reader's primary decision directly.",
+                    "differentiation": "Cover useful competitor gaps with original, evidence-bounded decision support.",
+                },
+                "evidence_requirements": [
+                    {"topic": item, "needed_evidence": "A directly relevant first-party or authority source when this topic requires a material factual claim.", "preferred_source_type": "first_party_or_authority", "status": "missing", "source_ids": []}
+                    for item in required_topics
+                ],
+                "angle": "Competitor-informed original synthesis.",
+                "must_cover": required_topics,
+            }
         brief_json = {"project_context": project_context, "industry_rules": industry_rules, "fixed_safety_rules": list(FIXED_CONTENT_SAFETY_RULES), "semantic": semantic, "competitor_analysis": analysis or {}, "learning_memories": [] if direct_keyword_mode else payload.get("learning_memories", []), "source_policy": "Material facts without a usable source must be recorded in unresolved_verify and omitted from reader-facing text, unless a genuinely general non-factual explanation is useful.", "direct_keyword_mode": direct_keyword_mode}
         requested_target_length = self._integer(payload, "target_length") if "target_length" in payload else 0
         target_length = max(MINIMUM_ARTICLE_BODY_WORDS, requested_target_length) if requested_target_length <= 4_000 else MINIMUM_ARTICLE_BODY_WORDS
@@ -5431,6 +5671,13 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             "metadata": dict(metadata), "primary_keyword": str(asset["keyword"] or ""), "audience": brief["target_audience"],
             "country_code": str(asset["country_code"] or "US"),
             "intent": semantic.get("intent", {}), "project_context": project_context, "writing_policy": writing_policy,
+            "topic_coverage": {
+                "required_topics": semantic.get("required_topics", semantic.get("must_cover", [])),
+                "bonus_topics": semantic.get("bonus_topics", []),
+                "long_tail_keywords": semantic.get("long_tail_keywords", []),
+            },
+            "content_strategy": semantic.get("content_strategy", {}),
+            "evidence_requirements": semantic.get("evidence_requirements", []),
             "angle": semantic.get("angle", ""), "competitor_learning": competitor_learning, "learning_memories": learning_memories,
             "outline": {"intro_brief": outline_payload.get("intro_brief", ""), "sections": full_article_sections, "conclusion_brief": outline_payload.get("conclusion_brief", "")},
             "overall_requirements": overall_requirements,
@@ -5543,7 +5790,9 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         """Give the full-article writer an H2-specific relevance floor, not a stuffing quota."""
         raw = section.get("keyword_requirements")
         supplied = raw.get("supporting_terms") if isinstance(raw, Mapping) else []
-        terms = [re.sub(r"\s+", " ", str(item)).strip() for item in supplied if isinstance(item, str)] if isinstance(supplied, list) else []
+        long_tail = section.get("long_tail_keywords")
+        raw_terms = [*(supplied if isinstance(supplied, list) else []), *(long_tail if isinstance(long_tail, list) else [])]
+        terms = [re.sub(r"\s+", " ", str(item)).strip() for item in raw_terms if isinstance(item, str)]
         terms = [item[:90] for item in terms if 2 <= len(item) <= 90]
         if not terms:
             stop_words = {"about", "after", "also", "and", "are", "best", "can", "for", "from", "guide", "how", "into", "its", "that", "the", "their", "this", "use", "what", "when", "which", "with", "your"}
@@ -6245,6 +6494,9 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
             "reader_question": section.get("reader_question") if isinstance(section.get("reader_question"), str) else "",
             "purpose": purpose.strip(), "key_points": strings("key_points"), "source_ids": strings("source_ids"),
             "evidence_gaps": strings("evidence_gaps"), "format": format_value,
+            "coverage_type": section.get("coverage_type") if section.get("coverage_type") in {"required", "bonus"} else "required",
+            "covered_topics": strings("covered_topics"),
+            "long_tail_keywords": strings("long_tail_keywords")[:6],
             "company_context_source_ids": strings("company_context_source_ids"),
             "company_context_role": section.get("company_context_role") if isinstance(section.get("company_context_role"), str) else "",
             "company_context_link_url": section.get("company_context_link_url") if isinstance(section.get("company_context_link_url"), str) else "",
@@ -7464,6 +7716,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                 writer_generator, writer_provider, writer_model = self._content_generator({
                     "provider": job_input.get("writer_provider", "openai"),
                     "model": job_input.get("writer_model"),
+                    "project_id": project_id,
                 })
                 if writer_generator is None:
                     raise ValueError(f"{writer_provider} must be configured before the content Agent can run")
@@ -7473,6 +7726,7 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                     writer_model=writer_model,
                     reviewer_provider=job_input.get("reviewer_provider"),
                     reviewer_model=job_input.get("reviewer_model"),
+                    project_id=project_id,
                 )
                 if reviewer_generator is None:
                     raise ValueError(f"{reviewer_provider} must be configured before Agent QA can run")
@@ -7707,9 +7961,56 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                         self._json(HTTPStatus.OK, self._agent_job_payload(self._agent_job_for_project(connection, job_id, project_id)))
                         return
 
-                # The normal content path is deliberately linear: draft, H2
-                # images, completion.  It does not spend additional calls on
-                # scoring, review or automatic rewrites.
+                if not checkpoint.get("automatic_quality_control_completed"):
+                    qa_history = checkpoint.get("qa_history")
+                    if not isinstance(qa_history, list):
+                        qa_history = []
+                    rewrite_count = int(checkpoint.get("rewrite_count") or 0)
+                    while True:
+                        review_result = invoke_node(
+                            "review_article", "review_article", {"content_asset_id": job["content_asset_id"]},
+                            reviewer_provider, reviewer_model,
+                        )
+                        reviewed_draft = review_result.get("draft") if isinstance(review_result.get("draft"), Mapping) else {}
+                        review = review_result.get("review") if isinstance(review_result.get("review"), Mapping) else {}
+                        if isinstance(reviewed_draft.get("id"), int):
+                            checkpoint["draft_id"] = reviewed_draft["id"]
+                        qa_history.append({
+                            "draft_id": checkpoint.get("draft_id"),
+                            "status": review.get("status"),
+                            "overall_score": review.get("overall_score"),
+                            "critical_blockers": review.get("critical_blockers", []),
+                            "unresolved_verify": review.get("unresolved_verify", []),
+                            "targeted_rewrite": review.get("targeted_rewrite", []),
+                        })
+                        checkpoint["qa_history"] = qa_history
+                        checkpoint["rewrite_count"] = rewrite_count
+                        persist_checkpoint("automatic_quality_control")
+                        rewrite_instructions = review.get("targeted_rewrite")
+                        if (
+                            review.get("status") != "needs_revision"
+                            or not isinstance(rewrite_instructions, list)
+                            or not rewrite_instructions
+                            or rewrite_count >= 2
+                        ):
+                            break
+                        rewrite_result = invoke_node(
+                            "generate_article", "targeted_rewrite",
+                            {"content_asset_id": job["content_asset_id"], "mode": "targeted_rewrite"},
+                            writer_provider, writer_model,
+                        )
+                        rewritten_draft = rewrite_result.get("draft") if isinstance(rewrite_result.get("draft"), Mapping) else {}
+                        if isinstance(rewritten_draft.get("id"), int):
+                            checkpoint["draft_id"] = rewritten_draft["id"]
+                        rewrite_count += 1
+                        checkpoint["rewrite_count"] = rewrite_count
+                        persist_checkpoint("automatic_quality_control")
+                        if control_state() in {"cancelled", "waiting_input"}:
+                            self._json(HTTPStatus.OK, self._agent_job_payload(self._agent_job_for_project(connection, job_id, project_id)))
+                            return
+                    checkpoint["automatic_quality_control_completed"] = True
+                    persist_checkpoint("generate_images")
+
                 generate_current_draft_images()
                 persist_checkpoint("generation_basis_report")
                 current_job = self._agent_job_for_project(connection, job_id, project_id)
@@ -8486,6 +8787,15 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
         if reviewer is None:
             self._json(HTTPStatus.SERVICE_UNAVAILABLE, {"error": "AI keyword reviewer is not configured."})
             return
+        raw_project_id = payload.get("project_id")
+        project_id = raw_project_id if isinstance(raw_project_id, int) and not isinstance(raw_project_id, bool) else None
+        if project_id is not None and isinstance(reviewer, OpenAICompatibleKeywordReviewer):
+            configuration = _ai_configuration(self.server.ai_settings_path, purpose="keyword_review")
+            if configuration is not None:
+                reviewer = OpenAICompatibleKeywordReviewer(
+                    *configuration,
+                    custom_instruction=self._project_prompt_instruction(project_id, "keyword_review"),
+                )
         local_review = RuleBasedKeywordReviewer().review(seed_keyword=seed_keyword, keyword=keyword, language=language)
         if mode == "fast" or not (local_review.is_seo_content_fit and local_review.same_topic_as_seed):
             response: dict[str, Any] = {"review": local_review.as_dict(), "provider": "rule", "mode": mode}
@@ -8549,8 +8859,16 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                         (project_id, keyword_id, json.dumps(request_data, ensure_ascii=False), provider, model, count),
                     )
                     job_id = int(cursor.lastrowid)
+                generator = self.server.title_generator
+                if isinstance(generator, OpenAICompatibleTitleGenerator):
+                    configuration = _ai_configuration(self.server.ai_settings_path, purpose="title_generation")
+                    if configuration is not None:
+                        generator = OpenAICompatibleTitleGenerator(
+                            *configuration,
+                            custom_instruction=self._project_prompt_instruction(project_id, "title_generation"),
+                        )
                 try:
-                    raw = self.server.title_generator.generate(**request_data)
+                    raw = generator.generate(**request_data)
                     candidates = self._title_candidates_from_response(raw, count)
                 except (ValueError, TypeError, TitleGenerationProtocolError, json.JSONDecodeError) as error:
                     summary = (str(error) or "Title generation failed.")[:500]
@@ -8604,7 +8922,10 @@ class KeywordDiscoveryRequestHandler(SimpleHTTPRequestHandler):
                         generator = getattr(self.server, "title_generators", {}).get(provider) if isinstance(getattr(self.server, "title_generators", {}), Mapping) else None
                         if generator is None:
                             configuration = _provider_configuration(self.server.ai_settings_path, provider)
-                            generator = OpenAICompatibleTitleGenerator(*configuration) if configuration else None
+                            generator = OpenAICompatibleTitleGenerator(
+                                *configuration,
+                                custom_instruction=self._project_prompt_instruction(project_id, "title_generation"),
+                            ) if configuration else None
                         if generator is None:
                             failures.append(f"{label} 未配置")
                             continue

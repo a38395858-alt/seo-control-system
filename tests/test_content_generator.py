@@ -218,7 +218,7 @@ class ContentGeneratorTests(unittest.TestCase):
         self.assertEqual("close", retry_request.get_header("Connection"))
 
     def test_stage_request_sends_the_versioned_instruction_and_json_contract(self) -> None:
-        generator = OpenAICompatibleContentGenerator("test-key", "https://example.test/v1", "gpt-5.4", provider="openai")
+        generator = OpenAICompatibleContentGenerator("test-key", "https://example.test/v1", "gpt-5.4", provider="openai", custom_instruction="Use a restrained engineering voice.")
         response = MagicMock()
         response.read.return_value = json.dumps({"choices": [{"message": {"content": '{"intro_brief":"","sections":[],"conclusion_brief":"","cta_placement":""}'}}]}).encode("utf-8")
         context = MagicMock()
@@ -236,10 +236,12 @@ class ContentGeneratorTests(unittest.TestCase):
         self.assertIn("source IDs", contract["instruction"])
         self.assertIn("reader-facing Source or Verification column", contract["instruction"])
         self.assertIn("sections", contract["output_schema"])
-        self.assertEqual("people_first_full_article_v26", PROMPT_VERSION)
+        self.assertEqual("people_first_full_article_v28", PROMPT_VERSION)
         self.assertIn("company_knowledge", contract["instruction"])
         self.assertIn("exact public product/company URL", contract["instruction"])
         self.assertIn("company_context_plan", contract["output_schema"])
+        self.assertEqual("Use a restrained engineering voice.", contract["project_supplemental_instruction"])
+        self.assertIn("does not conflict", contract["project_instruction_policy"])
 
     def test_deepseek_request_enables_high_effort_thinking_without_temperature(self) -> None:
         generator = OpenAICompatibleContentGenerator("test-key", "https://api.deepseek.com", "deepseek-v4-flash", provider="deepseek")

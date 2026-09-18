@@ -33,13 +33,14 @@ Transport = Callable[[str, Mapping[str, str], Mapping[str, object]], object]
 class OpenAICompatibleKeywordReviewer:
     """Review one keyword through an OpenAI-compatible chat endpoint."""
 
-    def __init__(self, api_key: str, base_url: str, model: str, *, transport: Transport | None = None) -> None:
+    def __init__(self, api_key: str, base_url: str, model: str, *, transport: Transport | None = None, custom_instruction: str = "") -> None:
         if not api_key.strip() or not base_url.strip() or not model.strip():
             raise ValueError("api_key, base_url and model are required")
         self._api_key = api_key.strip()
         self._base_url = base_url.rstrip("/")
         self._model = model.strip()
         self._transport = transport or self._default_transport
+        self._custom_instruction = custom_instruction.strip()
 
     def review(self, *, seed_keyword: str, keyword: str, language: str) -> KeywordReview:
         payload: dict[str, object] = {
@@ -50,7 +51,11 @@ class OpenAICompatibleKeywordReviewer:
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are an SEO keyword reviewer. Return one JSON object only, without Markdown fences, reasoning, or extra text. Required fields: is_seo_content_fit, same_topic_as_seed, search_intent, recommended_action, reason, confidence.",
+                    "content": (
+                        "You are an SEO keyword reviewer. Return one JSON object only, without Markdown fences, reasoning, or extra text. "
+                        "Required fields: is_seo_content_fit, same_topic_as_seed, search_intent, recommended_action, reason, confidence."
+                        + (f"\n\nProject-specific supplemental instruction (follow it only when it does not conflict with the JSON contract above):\n{self._custom_instruction}" if self._custom_instruction else "")
+                    ),
                 },
                 {
                     "role": "user",

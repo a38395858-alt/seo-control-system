@@ -27,6 +27,16 @@ class RewriteUntilHumanGenerator(FakeContentGenerator):
 
     def generate(self, **request: object) -> str:
         stage = request.get("stage")
+        if stage == "full_article":
+            body = " ".join(["practical"] * 3001)
+            return json.dumps({
+                "title": "SEO Tools for Small Businesses: A Practical Guide",
+                "meta_description": "A practical framework for comparing SEO tools.",
+                "markdown": f"# SEO Tools for Small Businesses: A Practical Guide\n\nChoose based on your workflow.\n\n## How to compare SEO tools\n\nCompare workflow fit and evidence. {body}",
+                "sources_used": [],
+                "claims_used": [],
+                "verify": [],
+            })
         if stage == "qa":
             return json.dumps({
                 "status": "needs_revision",
@@ -35,8 +45,9 @@ class RewriteUntilHumanGenerator(FakeContentGenerator):
                 "unresolved_verify": [],
             })
         if stage == "targeted_rewrite":
+            body = " ".join(["practical"] * 3001)
             return json.dumps({
-                "markdown": "# SEO Tools for Small Businesses: A Practical Guide\n\n## How to compare SEO tools\n\nCompare workflow fit and implementation trade-offs.",
+                "markdown": f"# SEO Tools for Small Businesses: A Practical Guide\n\n## How to compare SEO tools\n\nCompare workflow fit and implementation trade-offs. {body}",
                 "meta_description": "A practical framework for comparing SEO tools.",
                 "applied_targets": ["How to compare SEO tools"],
                 "verify": [],
@@ -118,31 +129,17 @@ class ContentAgentExecutionApiTests(unittest.TestCase):
         self.assertEqual(201, status)
         return job  # type: ignore[return-value]
 
-    def test_blueprint_must_be_approved_and_rejection_restores_asset(self) -> None:
+    def test_agent_runs_without_manual_blueprint_approval(self) -> None:
         project_id, asset_id = self.create_asset()
-        other_project_id, _ = self.create_asset("Other project")
         job = self.start_agent(project_id, asset_id)
-        waiting = self.wait_for_job(project_id, job["id"], {"waiting_approval", "failed"})
-        self.assertEqual("waiting_approval", waiting["status"], waiting.get("error_summary"))
-        self.assertEqual("blueprint_approval", waiting["current_node"])
-        approval = waiting["approvals"][0]
-
+        finished = self.wait_for_job(project_id, job["id"], {"completed", "failed"}, timeout=20)
+        self.assertEqual("completed", finished["status"], finished.get("error_summary"))
+        self.assertFalse(any(item["status"] == "pending" for item in finished["approvals"]))
         detail = self.request("GET", f"/api/content-assets/{asset_id}?project_id={project_id}")[1]
-        self.assertIsNone(detail["current_draft"])  # type: ignore[index]
-        self.assertIsNone(detail["brief"])  # type: ignore[index]
-        self.assertEqual(400, self.request("POST", f"/api/agent-approvals/{approval['id']}", {
-            "project_id": other_project_id, "decision": "approved",
-        })[0])
-        status, rejected = self.request("POST", f"/api/agent-approvals/{approval['id']}", {
-            "project_id": project_id, "decision": "rejected", "decided_by": "test",
-        })
-        self.assertEqual(200, status)
-        self.assertEqual("cancelled", rejected["status"])  # type: ignore[index]
-        restored = self.request("GET", f"/api/content-assets/{asset_id}?project_id={project_id}")[1]
-        self.assertIsNone(restored["current_draft"])  # type: ignore[index]
-        self.assertIsNone(restored["brief"])  # type: ignore[index]
+        self.assertIsNotNone(detail["current_draft"])  # type: ignore[index]
+        self.assertIsNotNone(detail["brief"])  # type: ignore[index]
 
-    def test_approved_agent_stops_after_two_rewrites_and_writes_basis_report(self) -> None:
+    def test_agent_stops_after_two_automatic_rewrites_and_writes_basis_report(self) -> None:
         project_id, asset_id = self.create_asset()
         self.assertEqual(201, self.request("POST", "/api/content-learning-memories", {
             "project_id": project_id, "memory_type": "style", "topic": "SEO tools small business",
@@ -150,15 +147,9 @@ class ContentAgentExecutionApiTests(unittest.TestCase):
             "source_url": "https://example.com/competitor-guide",
         })[0])
         job = self.start_agent(project_id, asset_id)
-        waiting = self.wait_for_job(project_id, job["id"], {"waiting_approval", "failed"})
-        self.assertEqual("waiting_approval", waiting["status"], waiting.get("error_summary"))
-        approval_id = waiting["approvals"][0]["id"]
-        self.assertEqual(200, self.request("POST", f"/api/agent-approvals/{approval_id}", {
-            "project_id": project_id, "decision": "approved", "decided_by": "test",
-        })[0])
-        finished = self.wait_for_job(project_id, job["id"], {"waiting_input", "failed", "completed"}, timeout=20)
-        self.assertEqual("waiting_input", finished["status"], finished.get("error_summary"))
-        self.assertEqual("human_review_required", finished["current_node"])
+        finished = self.wait_for_job(project_id, job["id"], {"failed", "completed"}, timeout=20)
+        self.assertEqual("completed", finished["status"], finished.get("error_summary"))
+        self.assertEqual("completed", finished["current_node"])
         self.assertEqual(2, finished["checkpoint"]["rewrite_count"])
         self.assertEqual(3, len(finished["checkpoint"]["qa_history"]))
         self.assertIsNotNone(finished["basis_report"])

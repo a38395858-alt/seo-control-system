@@ -47,10 +47,12 @@ class FakeContentGenerator:
             return {"title": data["metadata"]["selected_title"], "meta_description": data["metadata"]["meta_description"], "intro_markdown": "Choose based on your workflow before comparing options.", "conclusion_markdown": "Use the checklist to confirm the right fit.", "sources_used": [], "verify": ["No sources supplied"]}
         if stage == "full_article":
             body = " ".join(["practical"] * 3001)
-            return {"title": data["metadata"]["selected_title"], "meta_description": data["metadata"]["meta_description"], "markdown": f"# SEO Tools for Small Businesses: A Practical Guide\n\nChoose based on your workflow before comparing options.\n\n## How to compare options\n\nStart with your needs and use a practical comparison checklist. {body}", "sources_used": [], "claims_used": [], "verify": ["No sources supplied"]}
+            return {"title": data["metadata"]["selected_title"], "meta_description": data["metadata"]["meta_description"], "markdown": f"# SEO Tools for Small Businesses: A Practical Guide\n\nSEO tools for small business should be chosen by workflow before comparing options.\n\n## How to compare options\n\nStart with your needs and use a practical comparison checklist. {body}", "sources_used": [], "claims_used": [], "verify": ["No sources supplied"]}
         if stage == "content_tags":
             return {"tags": ["SEO Tools", "Product Comparison", "Buying Guide"]}
         if stage == "qa":
+            if "Practical verification:" in data["article"]["markdown"]:
+                return {"status": "approved", "overall_score": 90, "critical_blockers": [], "checks": [{"name": "factual support", "status": "pass", "note": "Unsupported specifics were removed."}], "targeted_rewrite": [], "unresolved_verify": [], "prepublication_audit": {"expertise": "pass", "credibility": "pass", "usefulness": "pass", "topic_coverage": "pass"}}
             return {"status": "needs_verification", "checks": [{"name": "factual support", "status": "verify", "note": "No sources supplied"}], "targeted_rewrite": [{"target": "How to compare options", "issue": "Add one practical check", "instruction": "Add one concise verification check without changing other sections."}], "final_markdown": data["article"]["markdown"], "unresolved_verify": ["No sources supplied"]}
         if stage == "targeted_rewrite":
             return {"markdown": data["article"]["markdown"] + "\n\nPractical verification: confirm the evidence before deciding.", "meta_description": data["article"]["meta_description"], "applied_targets": [item["target"] for item in data["instructions"]], "verify": ["No sources supplied"]}
@@ -131,11 +133,12 @@ class ContentGenerationApiTests(unittest.TestCase):
         status, generated = self.request("POST", f"/api/content-assets/{asset_id}/generate", {"project_id": project_id, "target_audience": "US small business owners", "business_goal": "commercial", "target_length": 900, "sources": [], "cta": "Compare your shortlist."})
 
         self.assertEqual(201, status)
-        self.assertEqual(["industry_rules", "semantic", "title", "outline", "full_article"], self.generator.stages)
-        self.assertEqual(1, generated["draft"]["version"])  # type: ignore[index]
+        self.assertEqual(["industry_rules", "semantic", "title", "outline", "full_article", "qa", "targeted_rewrite", "qa"], self.generator.stages)
+        self.assertEqual(2, generated["draft"]["version"])  # type: ignore[index]
         self.assertNotIn("[VERIFY]", generated["draft"]["markdown"])  # type: ignore[index]
-        self.assertEqual("not_run", generated["draft"]["qa_status"])  # type: ignore[index]
-        self.assertEqual(5, len(generated["runs"]))  # type: ignore[arg-type]
+        self.assertEqual("needs_verification", generated["draft"]["qa_status"])  # type: ignore[index]
+        self.assertEqual(1, generated["automatic_rewrite_count"])  # type: ignore[index]
+        self.assertEqual(8, len(generated["runs"]))  # type: ignore[arg-type]
         self.assertNotIn("target_length", self.generator.stage_inputs["outline"][0])
         article_request = self.generator.stage_inputs["full_article"][0]
         section_spec = article_request["outline"]["sections"][0]
@@ -145,11 +148,11 @@ class ContentGenerationApiTests(unittest.TestCase):
         self.assertGreaterEqual(section_spec["depth_requirements"]["minimum_non_overlapping_subtopics"], 3)
         self.assertGreaterEqual(section_spec["depth_requirements"]["minimum_words"], 180)
         self.assertIn("## How to compare options", generated["draft"]["markdown"])  # type: ignore[index]
-        self.assertEqual("people_first_full_article_v25", generated["runs"][0]["prompt_version"])  # type: ignore[index]
+        self.assertEqual("people_first_full_article_v28", generated["runs"][0]["prompt_version"])  # type: ignore[index]
 
         status, detail = self.request("GET", f"/api/content-assets/{asset_id}?project_id={project_id}")
         self.assertEqual(200, status)
-        self.assertEqual(1, len(detail["drafts"]))  # type: ignore[index]
+        self.assertEqual(2, len(detail["drafts"]))  # type: ignore[index]
         self.assertEqual(3, len(detail["tags"]))  # type: ignore[arg-type]
         self.assertNotIn("[VERIFY]", " ".join(detail["tags"]))  # type: ignore[arg-type]
         self.assertEqual("completed", detail["runs"][-1]["status"])  # type: ignore[index]
@@ -195,7 +198,7 @@ class ContentGenerationApiTests(unittest.TestCase):
         self.assertEqual(201, self.request("POST", f"/api/content-assets/{asset_id}/generate", request)[0])
         self.assertEqual(201, self.request("POST", f"/api/content-assets/{asset_id}/generate", request)[0])
         _, detail = self.request("GET", f"/api/content-assets/{asset_id}?project_id={project_id}")
-        self.assertEqual([1, 2], [draft["version"] for draft in detail["drafts"]])  # type: ignore[index]
+        self.assertEqual([1, 2, 3, 4], [draft["version"] for draft in detail["drafts"]])  # type: ignore[index]
         self.assertIsNone(detail["drafts"][0]["parent_draft_id"])  # type: ignore[index]
         self.assertEqual(detail["drafts"][0]["id"], detail["drafts"][1]["parent_draft_id"])  # type: ignore[index]
 
@@ -240,7 +243,7 @@ class ContentGenerationApiTests(unittest.TestCase):
         self.assertEqual("deepseek-review-v1", job["reviewer_model"])
         self.assertEqual("openai", generated["draft"]["provider"])  # type: ignore[index]
 
-    def test_auto_collaboration_generates_without_a_review_pass(self) -> None:
+    def test_auto_collaboration_runs_automatic_review_and_polish(self) -> None:
         project_id, asset_id = self.asset()
         status, generated = self.request(
             "POST",
@@ -261,8 +264,9 @@ class ContentGenerationApiTests(unittest.TestCase):
         self.assertEqual("deepseek", job["reviewer_provider"])
         self.assertIn("DeepSeek", job["routing_summary"])
         self.assertIn("ChatGPT", job["routing_summary"])
-        self.assertNotIn("qa", self.generator.stages)
-        self.assertEqual("not_run", generated["draft"]["qa_status"])  # type: ignore[index]
+        self.assertEqual(2, self.generator.stages.count("qa"))
+        self.assertEqual(1, self.generator.stages.count("targeted_rewrite"))
+        self.assertEqual("needs_verification", generated["draft"]["qa_status"])  # type: ignore[index]
 
     def test_generation_uses_only_relevant_project_learning_memory_and_records_the_link(self) -> None:
         project_id, asset_id = self.asset()
@@ -347,7 +351,7 @@ class ContentGenerationApiTests(unittest.TestCase):
         )
 
         self.assertEqual(200, status)
-        self.assertEqual("people_first_full_article_v25", preview["prompt_version"])  # type: ignore[index]
+        self.assertEqual("people_first_full_article_v28", preview["prompt_version"])  # type: ignore[index]
         self.assertEqual("generate", preview["requested_action"])  # type: ignore[index]
         self.assertIn("evidence-grounded", preview["system_prompt"])  # type: ignore[index]
         self.assertEqual(
@@ -426,13 +430,13 @@ class ContentGenerationApiTests(unittest.TestCase):
         )
 
         self.assertEqual(201, status)
-        self.assertEqual(["industry_rules", "title", "outline", "industry_rules", "full_article"], self.generator.stages)
+        self.assertEqual(["industry_rules", "title", "outline", "industry_rules", "full_article", "qa", "targeted_rewrite", "qa"], self.generator.stages)
         self.assertNotIn("brief", generated)  # type: ignore[operator]
         _, detail = self.request("GET", f"/api/content-assets/{asset_id}?project_id={project_id}")
         self.assertEqual(brief["id"], detail["brief"]["id"])  # type: ignore[index]
         self.assertIsNotNone(detail["current_draft"])  # type: ignore[index]
 
-    def test_full_generation_uses_one_full_article_call_without_calling_a_qa_model_stage(self) -> None:
+    def test_full_generation_runs_bounded_automatic_quality_control(self) -> None:
         project_id, asset_id = self.asset(title_text="Best SEO Tools for Small Businesses: Pricing and Features Compared")
         status, generated = self.request(
             "POST",
@@ -441,8 +445,11 @@ class ContentGenerationApiTests(unittest.TestCase):
         )
 
         self.assertEqual(201, status)
-        self.assertNotIn("qa", self.generator.stages)
-        self.assertEqual("not_run", generated["draft"]["qa_status"])  # type: ignore[index]
+        self.assertEqual(1, self.generator.stages.count("full_article"))
+        self.assertEqual(2, self.generator.stages.count("qa"))
+        self.assertEqual(1, self.generator.stages.count("targeted_rewrite"))
+        self.assertEqual(1, generated["automatic_rewrite_count"])  # type: ignore[index]
+        self.assertEqual("needs_verification", generated["draft"]["qa_status"])  # type: ignore[index]
         self.assertEqual("openai", generated["draft"]["provider"])  # type: ignore[index]
 
     def test_quality_review_uses_the_selected_reviewer_route_and_keeps_draft_version(self) -> None:
@@ -459,18 +466,27 @@ class ContentGenerationApiTests(unittest.TestCase):
 
         self.assertEqual(201, status)
         self.assertEqual(["qa"], self.generator.stages)
-        self.assertEqual("needs_revision", reviewed["draft"]["qa_status"])  # type: ignore[index]
+        self.assertEqual("needs_verification", reviewed["draft"]["qa_status"])  # type: ignore[index]
         self.assertEqual("openai", reviewed["quality_review"]["review"]["reviewer"]["provider"])  # type: ignore[index]
         self.assertEqual("fake-content-model", reviewed["quality_review"]["review"]["reviewer"]["model"])  # type: ignore[index]
         _, detail = self.request("GET", f"/api/content-assets/{asset_id}?project_id={project_id}")
-        self.assertEqual(1, len(detail["drafts"]))  # type: ignore[index]
-        self.assertEqual("needs_revision", detail["current_draft"]["qa_status"])  # type: ignore[index]
+        self.assertEqual(2, len(detail["drafts"]))  # type: ignore[index]
+        self.assertEqual("needs_verification", detail["current_draft"]["qa_status"])  # type: ignore[index]
         self.assertTrue(any(run["stage"] == "qa" for run in detail["generation_runs"]))  # type: ignore[index]
 
     def test_targeted_rewrite_creates_a_linked_new_version_and_preserves_the_previous_draft(self) -> None:
         project_id, asset_id = self.asset()
         request = {"project_id": project_id, "provider": "openai", "target_audience": "US buyers", "business_goal": "commercial", "sources": []}
         self.assertEqual(201, self.request("POST", f"/api/content-assets/{asset_id}/generate", request)[0])
+        connection = sqlite3.connect(self.server.database_path)
+        try:
+            connection.execute(
+                "UPDATE content_drafts SET markdown=REPLACE(markdown, 'Practical verification:', 'Verification needed:') WHERE id=(SELECT current_draft_id FROM content_assets WHERE id=?)",
+                (asset_id,),
+            )
+            connection.commit()
+        finally:
+            connection.close()
         self.assertEqual(201, self.request("POST", f"/api/content-assets/{asset_id}/review-quality", request)[0])
         self.generator.stages.clear()
 
@@ -478,8 +494,8 @@ class ContentGenerationApiTests(unittest.TestCase):
 
         self.assertEqual(201, status)
         self.assertEqual(["targeted_rewrite"], self.generator.stages)
-        self.assertEqual(2, rewritten["draft"]["version"])  # type: ignore[index]
+        self.assertEqual(3, rewritten["draft"]["version"])  # type: ignore[index]
         self.assertIn("Practical verification", rewritten["draft"]["markdown"])  # type: ignore[index]
         _, detail = self.request("GET", f"/api/content-assets/{asset_id}?project_id={project_id}")
-        self.assertEqual(2, len(detail["drafts"]))  # type: ignore[index]
-        self.assertEqual(detail["drafts"][0]["id"], detail["drafts"][1]["parent_draft_id"])  # type: ignore[index]
+        self.assertEqual(3, len(detail["drafts"]))  # type: ignore[index]
+        self.assertEqual(detail["drafts"][1]["id"], detail["drafts"][2]["parent_draft_id"])  # type: ignore[index]

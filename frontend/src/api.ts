@@ -1,4 +1,4 @@
-import type { AgentJob, AuthoritySource, CollectedCompetitorContentLearningRun, CompetitorCatalogCollectionRun, CompetitorResearch, CompetitorUrlArchiveItem, CompetitorUrlCatalogItem, ContentAsset, ContentAssetDetail, ContentBrief, ContentGenerationResult, ContentMemoryItem, ContentOutline, ContentPromptPreview, ExpansionResult, LibraryKeyword, Review, Score, SerpTitle, SerpTitleMemory, SystemTask, TitleCandidate, TitleGenerationJob } from "./types";
+import type { AgentJob, AuthoritySource, CollectedCompetitorContentLearningRun, CompetitorCatalogCollectionRun, CompetitorResearch, CompetitorUrlArchiveItem, CompetitorUrlCatalogItem, ContentAsset, ContentAssetDetail, ContentBrief, ContentGenerationResult, ContentMemoryItem, ContentOutline, ContentPromptPreview, ExpansionResult, LibraryKeyword, ProjectPromptKey, ProjectPromptSetting, Review, Score, SerpTitle, SerpTitleMemory, SystemTask, TitleCandidate, TitleGenerationJob } from "./types";
 
 async function request<T>(url: string, options?: RequestInit): Promise<T> {
   const response = await fetch(url, options);
@@ -26,6 +26,9 @@ export const api = {
   listProjectSummaries: () => request<Array<{ id: number; name: string; site_url?: string | null; industry: string; default_country: string; default_language: string; keyword_count: number; selected_title_count: number; content_count: number; knowledge_count: number; latest_content_status?: string | null }>>("/api/projects/summary"),
   updateProject: (projectId: number, body: object) => request<{ id: number; name: string; site_url?: string | null; industry: string; default_country: string; default_language: string }>(`/api/projects/${projectId}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
   deleteProject: (projectId: number) => request<{ deleted: number }>(`/api/projects/${projectId}`, { method: "DELETE" }),
+  listProjectPrompts: (projectId: number) => request<{ project_id: number; prompts: ProjectPromptSetting[] }>(`/api/projects/${projectId}/prompts`),
+  saveProjectPrompt: (projectId: number, key: ProjectPromptKey, customInstruction: string) => request<Pick<ProjectPromptSetting, "key" | "custom_instruction" | "customized" | "updated_at">>(`/api/projects/${projectId}/prompts/${key}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ custom_instruction: customInstruction }) }),
+  resetProjectPrompt: (projectId: number, key: ProjectPromptKey) => request<Pick<ProjectPromptSetting, "key" | "custom_instruction" | "customized" | "updated_at">>(`/api/projects/${projectId}/prompts/${key}`, { method: "DELETE" }),
   listSystemTasks: () => request<SystemTask[]>("/api/system-tasks"),
   listAgentJobs: (projectId: number) => request<AgentJob[]>(`/api/agent-jobs?project_id=${projectId}`),
   createAgentJob: (body: object) => request<AgentJob>("/api/agent-jobs", json(body)),

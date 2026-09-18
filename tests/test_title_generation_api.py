@@ -231,6 +231,19 @@ class TitleGenerationApiTests(unittest.TestCase):
         self.assertIn("Recovered title", result)
         self.assertEqual(2, request_mock.call_count)
 
+    def test_title_generator_appends_project_instruction_and_keeps_json_contract(self) -> None:
+        generator = OpenAICompatibleTitleGenerator("hidden-key", "https://example.test/v1", "test-model", custom_instruction="Prefer practical maintenance angles.")
+        response = MagicMock()
+        response.read.return_value = json.dumps({"choices": [{"message": {"content": '{"candidates":[{"title":"Maintenance guide"}]}'}}]}).encode("utf-8")
+        context = MagicMock(); context.__enter__.return_value = response; context.__exit__.return_value = False
+        with patch("seo_control.application.ai_title_generator.urlopen", return_value=context) as request_mock:
+            generator.generate(keyword="warehouse lighting", locale="en-US", count=1)
+        request = request_mock.call_args.args[0]
+        payload = json.loads(request.data.decode("utf-8"))
+        system_prompt = payload["messages"][0]["content"]
+        self.assertIn("Prefer practical maintenance angles.", system_prompt)
+        self.assertIn("Return JSON only", system_prompt)
+
     def test_failed_provider_request_keeps_a_durable_title_job_log(self) -> None:
         project_id, keyword_id = self.create_project_and_keyword()
         self.server.title_generator = FailingOpenAITitleGenerator()

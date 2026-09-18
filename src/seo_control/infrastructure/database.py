@@ -1446,6 +1446,27 @@ _MIGRATIONS: tuple[Migration, ...] = (
             "CREATE UNIQUE INDEX IF NOT EXISTS uq_durable_task_queue_active_dedup ON durable_task_queue(dedup_key) WHERE status IN ('queued','running','retry_wait')",
         ),
     ),
+    (
+        44,
+        "project scoped AI prompt settings",
+        (
+            """
+            CREATE TABLE IF NOT EXISTS project_prompt_settings (
+                id INTEGER PRIMARY KEY,
+                project_id INTEGER NOT NULL,
+                prompt_key TEXT NOT NULL CHECK(prompt_key IN (
+                    'keyword_review','title_generation','content_generation'
+                )),
+                custom_instruction TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(project_id) REFERENCES projects(id) ON DELETE CASCADE,
+                UNIQUE(project_id,prompt_key)
+            )
+            """,
+            "CREATE INDEX IF NOT EXISTS idx_project_prompt_settings_project ON project_prompt_settings(project_id,prompt_key)",
+        ),
+    ),
 )
 
 

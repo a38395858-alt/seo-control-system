@@ -40,6 +40,15 @@ class AiKeywordReviewerTests(unittest.TestCase):
         self.assertTrue(review.same_topic_as_seed)
         self.assertEqual("create_article", review.recommended_action)
 
+    def test_reviewer_appends_project_instruction_without_removing_json_contract(self) -> None:
+        captured: dict[str, object] = {}
+        response = {"choices": [{"message": {"content": json.dumps({"is_seo_content_fit": True, "same_topic_as_seed": True, "search_intent": "informational", "recommended_action": "create_article", "reason": "Relevant.", "confidence": 0.9})}}]}
+        reviewer = OpenAICompatibleKeywordReviewer("key", "https://example.test", "model", custom_instruction="Reject consumer-only searches.", transport=lambda _u, _h, payload: captured.setdefault("payload", payload) and response)
+        reviewer.review(seed_keyword="lighting", keyword="commercial lighting", language="en")
+        system_prompt = captured["payload"]["messages"][0]["content"]  # type: ignore[index]
+        self.assertIn("Reject consumer-only searches.", system_prompt)
+        self.assertIn("Return one JSON object only", system_prompt)
+
     def test_reviewer_rejects_invalid_model_json(self) -> None:
         reviewer = OpenAICompatibleKeywordReviewer("test-key", "https://ai.example.test", "test-model", transport=lambda *_: {"choices": [{"message": {"content": "not json"}}]})
         with self.assertRaises(KeywordReviewProtocolError):

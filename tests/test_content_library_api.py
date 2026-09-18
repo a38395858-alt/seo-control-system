@@ -70,8 +70,18 @@ class ContentLibraryApiTests(unittest.TestCase):
         self.assertEqual(200, status)
         self.assertEqual([complete["id"]], [row["id"] for row in library])  # type: ignore[index]
         self.assertNotIn(incomplete_asset_id, [row["id"] for row in library])  # type: ignore[index]
-        self.assertEqual("needs_sources", library[0]["content_status"])  # type: ignore[index]
-        self.assertEqual("缺少权威引用 · 不可发布", library[0]["content_status_label"])  # type: ignore[index]
+        self.assertEqual("completed", library[0]["content_status"])  # type: ignore[index]
+        self.assertEqual("内容完成", library[0]["content_status_label"])  # type: ignore[index]
+
+    def test_content_library_exposes_current_draft_generation_time(self) -> None:
+        project_id, _title_id, asset_id = self.asset()
+        self.mark_complete(project_id, asset_id)
+
+        status, library = self.request("GET", f"/api/content-library?project_id={project_id}")
+
+        self.assertEqual(200, status)
+        self.assertEqual(asset_id, library[0]["id"])  # type: ignore[index]
+        self.assertTrue(library[0]["generated_at"])  # type: ignore[index]
 
     def test_title_library_and_content_assets_expose_outline_and_content_status_markers(self) -> None:
         project_id, title_id, asset_id = self.asset()
@@ -79,11 +89,11 @@ class ContentLibraryApiTests(unittest.TestCase):
 
         _, titles = self.request("GET", f"/api/title-library?project_id={project_id}")
         title = next(row for row in titles if row["id"] == title_id)  # type: ignore[union-attr]
-        self.assertEqual("needs_sources", title["content_status"])
-        self.assertEqual("缺少权威引用 · 不可发布", title["content_status_label"])
+        self.assertEqual("completed", title["content_status"])
+        self.assertEqual("内容完成", title["content_status_label"])
         _, assets = self.request("GET", f"/api/content-assets?project_id={project_id}")
-        self.assertEqual("needs_sources", assets[0]["content_status"])  # type: ignore[index]
-        self.assertEqual("缺少权威引用 · 不可发布", assets[0]["content_status_label"])  # type: ignore[index]
+        self.assertEqual("completed", assets[0]["content_status"])  # type: ignore[index]
+        self.assertEqual("内容完成", assets[0]["content_status_label"])  # type: ignore[index]
         self.assertEqual("待大纲", assets[0]["outline_status_label"])  # type: ignore[index]
 
     def test_assets_can_be_soft_deleted_singly_or_in_a_confirmed_batch(self) -> None:

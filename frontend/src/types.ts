@@ -52,7 +52,7 @@ export type TitleGenerationJob = {
 export type SerpTitle = { rank: number; title: string; source: string | null };
 export type SerpTitleMemory = SerpTitle & { source_type: "browser" | "ai"; locale: string; captured_at: string };
 
-export type ContentAsset = { id: number; project_id: number; keyword_id: number; selected_title_candidate_id: number; title_snapshot: string; keyword?: string; locale: string; country_code: string; content_type: string; status: string; tags?: string[]; current_brief_id: number | null; current_outline_id: number | null; current_draft_id?: number | null; outline_status?: string; outline_status_label?: string; content_status?: string; content_status_label?: string; };
+export type ContentAsset = { id: number; project_id: number; keyword_id: number; selected_title_candidate_id: number; title_snapshot: string; keyword?: string; locale: string; country_code: string; content_type: string; status: string; tags?: string[]; current_brief_id: number | null; current_outline_id: number | null; current_draft_id?: number | null; generated_at?: string | null; outline_status?: string; outline_status_label?: string; content_status?: string; content_status_label?: string; };
 export type ContentBrief = { id: number; target_audience: string; business_goal: string; target_length: number; sources: unknown[]; brief: Record<string, unknown> };
 export type AuthoritySource = { id: number; project_id: number; title: string; source_type: "first_party" | "standard" | "certification" | "government" | "industry_research"; url?: string | null; publisher?: string | null; published_at?: string | null; content: string; authority_level: "primary" | "authoritative" | "supporting" | "needs_review"; tags: string[]; classification: Record<string, unknown>; summary?: string | null; created_at: string; updated_at: string };
 export type ContentOutline = { id: number; status: string; sections: Array<{ id: number; heading: string; purpose: string; word_budget: number; keyword_requirements?: { supporting_terms?: string[]; minimum_supporting_terms?: number }; depth_requirements?: { minimum_subtopics?: number; reader_outcome?: string; practical_detail?: string } }> };
@@ -85,7 +85,7 @@ export type CompetitorResearchPreview = { query: string; discovered_count: numbe
 export type CompetitorOutlinePreview = { source_count: number; persisted: false; analysis: { search_intent?: string; missing_gaps?: string[]; dynamic_outline: Array<{ heading: string; reader_question?: string; purpose?: string; key_points?: string[]; format?: string }> } };
 export type ContentAssetDetail = ContentAsset & { brief: ContentBrief | null; outline: ContentOutline | null; current_draft?: ContentDraft | null; drafts?: ContentDraft[]; generation_runs?: ContentGenerationRun[]; generation_jobs?: ContentGenerationJob[]; competitor_research?: CompetitorResearch | null; production_readiness?: ContentProductionReadiness; learning_memories?: ContentLearningMemory[]; authority_sources?: ArticleAuthoritySource[]; authority_search_results?: AuthoritySearchResult[]; section_images?: SectionImage[]; wordpress_publications?: WordPressPublication[] };
 export type ContentImageGenerationResult = { generated: SectionImage[]; failed: Array<{ id: string; error: string }>; images: SectionImage[]; total: number; ready: number };
-export type ContentGenerationResult = { brief?: ContentBrief | null; outline?: ContentOutline | null; draft?: ContentDraft | null; current_draft?: ContentDraft | null; quality_review?: { draft: ContentDraft; review: ContentDraft["qa"] }; competitor_research?: CompetitorResearch; image_generation?: ContentImageGenerationResult; generation_runs?: ContentAssetDetail["generation_runs"]; runs?: ContentAssetDetail["generation_runs"]; generation_job?: ContentGenerationJob | null; asset?: ContentAsset };
+export type ContentGenerationResult = { brief?: ContentBrief | null; outline?: ContentOutline | null; draft?: ContentDraft | null; current_draft?: ContentDraft | null; quality_review?: { draft: ContentDraft; review: ContentDraft["qa"] }; automatic_rewrite_count?: number; quality_review_history?: Array<{ draft_id?: number; status?: string; overall_score?: number; critical_blockers?: string[]; unresolved_verify?: string[] }>; competitor_research?: CompetitorResearch; image_generation?: ContentImageGenerationResult; generation_runs?: ContentAssetDetail["generation_runs"]; runs?: ContentAssetDetail["generation_runs"]; generation_job?: ContentGenerationJob | null; asset?: ContentAsset };
 export type ContentPromptPreview = {
   prompt_version: string;
   requested_action: string;
@@ -94,6 +94,17 @@ export type ContentPromptPreview = {
   full_article_requirements?: { sections: Array<{ heading: string; keyword_requirements: { primary_keyword: string; primary_keyword_rule: string; supporting_terms: string[]; minimum_supporting_terms: number }; depth_requirements: { minimum_non_overlapping_subtopics: number; minimum_words: number; reader_outcome: string; required_practical_detail: string } }>; overall: { minimum_total_words: number; required_h2_count: number; depth_rule: string; keyword_rule: string } | null };
   system_prompt: string;
   stages: Array<{ stage: string; instruction: string }>;
+};
+export type ProjectPromptKey = "keyword_review" | "title_generation" | "content_generation";
+export type ProjectPromptSetting = {
+  key: ProjectPromptKey;
+  label: string;
+  description: string;
+  base_prompt: string;
+  custom_instruction: string;
+  variables: string[];
+  customized: boolean;
+  updated_at?: string | null;
 };
 export type SystemTask = {
   task_type: string;

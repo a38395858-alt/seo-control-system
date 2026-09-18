@@ -118,11 +118,12 @@ class FakeContentGenerator:
                 }
             )
         if stage == "full_article":
+            body = " ".join(["practical"] * 3001)
             return json.dumps(
                 {
                     "title": "SEO Tools for Small Businesses: A Practical Guide",
                     "meta_description": "A practical framework for comparing SEO tools.",
-                    "markdown": "# SEO Tools for Small Businesses: A Practical Guide\n\nChoose tools by the work you need to complete.\n\n## How to compare SEO tools\n\nCompare the workflow, practical checks, and evidence boundary before choosing.\n\n## Questions to ask before you buy\n\nConfirm fit before committing.",
+                    "markdown": f"# SEO Tools for Small Businesses: A Practical Guide\n\nSEO tools for small business should be chosen by the work you need to complete.\n\n## How to compare SEO tools\n\nCompare the workflow, practical checks, and evidence boundary before choosing.\n\n## Questions to ask before you buy\n\nConfirm fit before committing. {body}",
                     "sources_used": [],
                     "claims_used": [],
                     "verify": ["Current vendor pricing requires first-party confirmation"],
@@ -262,14 +263,14 @@ class ContentGenerationWorkflowApiTests(unittest.TestCase):
 
         status, detail = self.request_json("GET", f"/api/content-assets/{asset_id}?project_id={project_id}")
         self.assertEqual(200, status)
-        # A generated draft without an authoritative source stays available
-        # for review, but must not be represented as publish-ready.
+        # The content workflow is complete even when factual verification keeps
+        # the asset itself out of the publish-ready state.
         self.assertEqual("needs_revision", detail["status"])  # type: ignore[index]
-        self.assertEqual("needs_sources", detail["content_status"])  # type: ignore[index]
+        self.assertEqual("completed", detail["content_status"])  # type: ignore[index]
         self.assertEqual(draft["draft"]["id"], detail["current_draft"]["id"])  # type: ignore[index]
         self.assertEqual(1, len(detail["drafts"]))  # type: ignore[index]
         runs = detail["generation_runs"]  # type: ignore[index]
-        self.assertEqual(["industry_rules", "title", "outline", "full_article"], [run["stage"] for run in runs])
+        self.assertEqual(["industry_rules", "semantic", "title", "outline", "full_article", "qa"], [run["stage"] for run in runs])
         self.assertTrue(all(run["status"] == "completed" for run in runs))
         self.assertTrue(all(run["provider"] == "gemini" for run in runs))
         self.assertTrue(all(run["prompt_version"] == PROMPT_VERSION for run in runs))
@@ -278,7 +279,7 @@ class ContentGenerationWorkflowApiTests(unittest.TestCase):
             if run["stage"] in policy_stages:
                 self.assertEqual("SEO software", run["input"]["writing_policy"]["industry_rules"]["industry"])
                 self.assertTrue(run["input"]["writing_policy"]["fixed_safety_rules"])
-        self.assertEqual("not_run", detail["current_draft"]["qa_status"])  # type: ignore[index]
+        self.assertEqual("needs_verification", detail["current_draft"]["qa_status"])  # type: ignore[index]
         self.assertNotIn("secret", json.dumps(detail).lower())
 
     def test_generating_a_draft_automatically_creates_and_binds_h2_images(self) -> None:
@@ -311,7 +312,6 @@ class ContentGenerationWorkflowApiTests(unittest.TestCase):
 
         test_web_root = Path(self.temp.name) / "web"
         with (
-            patch("seo_control.web.MINIMUM_ARTICLE_BODY_WORDS", 5),
             patch("seo_control.web.WEB_ROOT", test_web_root),
             patch.object(KeywordDiscoveryRequestHandler, "_designer_image_prompt", return_value="A matching section illustration without text."),
             patch.object(KeywordDiscoveryRequestHandler, "_generate_image_with_local_proxy", side_effect=create_test_image),

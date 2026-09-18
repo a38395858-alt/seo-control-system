@@ -79,7 +79,7 @@ class ContentPromptQualityTests(unittest.TestCase):
     def test_full_article_prompt_enforces_h2_depth_without_word_count_padding(self) -> None:
         from seo_control.application.content_generator import PROMPT_VERSION, _schema_for  # noqa: E402
 
-        self.assertEqual("people_first_full_article_v27", PROMPT_VERSION)
+        self.assertEqual("people_first_full_article_v28", PROMPT_VERSION)
         for stage in ("outline", "full_article", "qa", "targeted_rewrite"):
             instruction = _stage_instruction(stage)
             for text in ("new reader value", "unique information gain", "four to six non-overlapping", "never pad", "one concise statement"):
@@ -111,8 +111,23 @@ class ContentPromptQualityTests(unittest.TestCase):
 
     def test_editorial_voice_policy_rejects_canned_ai_prose(self) -> None:
         instruction = _stage_instruction("full_article")
-        for text in ("Natural editorial-voice policy", "not like an AI assistant", "In today's fast-paced world", "Aim for clarity and credible reader value"):
+        for text in ("Natural editorial-voice policy", "not like an AI assistant", "In today's fast-paced world", "Aim for clarity and credible reader value", "Information-density policy", "every paragraph must earn its place"):
             self.assertIn(text, instruction)
+
+    def test_semantic_outline_and_qa_follow_the_required_content_workflow(self) -> None:
+        from seo_control.application.content_generator import _schema_for  # noqa: E402
+
+        semantic_schema = _schema_for("semantic")
+        for field in ("required_topics", "bonus_topics", "long_tail_keywords", "content_strategy", "evidence_requirements"):
+            self.assertIn(field, semantic_schema)
+        outline_schema = _schema_for("outline")
+        for field in ("h1_title", "required_h2_titles", "coverage_type", "covered_topics", "long_tail_keywords"):
+            self.assertIn(field, outline_schema)
+        qa_schema = _schema_for("qa")
+        for field in ("factual_verification", "editorial_polish", "prepublication_audit", "boilerplate_and_repetition_control"):
+            self.assertIn(field, qa_schema)
+        self.assertIn("unsupported facts must be removed or qualified", _stage_instruction("qa"))
+        self.assertIn("boilerplate and filler", _stage_instruction("targeted_rewrite"))
 
     def test_full_article_prompt_keeps_a_closed_outline_and_safe_source_free_mode(self) -> None:
         instruction = _stage_instruction("full_article")

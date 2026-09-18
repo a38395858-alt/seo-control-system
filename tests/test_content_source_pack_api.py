@@ -52,6 +52,17 @@ class CapturingSemanticGenerator:
         if stage == "outline":
             self.stage_sources["outline"] = request["sources"]  # type: ignore[assignment]
             return {"intro_brief": "Answer first.", "sections": [{"id": "s1", "heading": "Evaluation criteria", "level": "h2", "reader_question": "What matters?", "purpose": "Explain a decision.", "key_points": [], "source_ids": ["official-pricing"], "evidence_gaps": [], "word_budget": 300, "format": "paragraphs"}], "conclusion_brief": "Next steps.", "cta_placement": "end", "estimated_total_words": 300}
+        if stage == "full_article":
+            self.stage_sources["full_article"] = request["sources"]  # type: ignore[assignment]
+            body = " ".join(["practical"] * 3001)
+            return {
+                "title": "SEO Tools for Small Businesses: A Practical Guide",
+                "meta_description": "Evidence-led guide.",
+                "markdown": f"# SEO Tools for Small Businesses: A Practical Guide\n\nSEO tools for small business should be evaluated against the work they must support.\n\n## Evaluation criteria\n\nUse the available evidence and confirm time-sensitive details. {body}",
+                "sources_used": ["official-pricing"],
+                "claims_used": [],
+                "verify": ["Unavailable source requires verification."],
+            }
         if stage == "chapter_plan":
             return {"section_id": "s1", "writing_goal": "Explain the criteria.", "subtopics": [{"reader_question": "What matters?", "points": ["Use the available source"], "source_ids": ["official-pricing"]}], "must_include": [], "must_avoid_repeating": [], "format": "paragraphs"}
         if stage == "section":
@@ -133,14 +144,14 @@ class ContentSourcePackApiTests(unittest.TestCase):
         status, generated = self.request(
             "POST",
             f"/api/content-assets/{asset_id}/generate",
-            {"project_id": project_id, "target_audience": "US buyers", "business_goal": "commercial", "target_length": 1200, "sources": source_pack},
+            {"project_id": project_id, "target_audience": "US buyers", "business_goal": "commercial", "target_length": 1200, "sources": source_pack, "auto_generate_images": False},
         )
         self.assertEqual(201, status)
         persisted = generated["brief"]["sources"]  # type: ignore[index]
         self.assertEqual(source_pack, persisted)
         self.assertEqual(source_pack, self.generator.semantic_sources)
         self.assertEqual(source_pack, self.generator.stage_sources["outline"])
-        self.assertEqual([source_pack[0]], self.generator.stage_sources["section"])
+        self.assertEqual([source_pack[0]], self.generator.stage_sources["full_article"])
 
         status, detail = self.request("GET", f"/api/content-assets/{asset_id}?project_id={project_id}")
         self.assertEqual(200, status)
